@@ -34,11 +34,14 @@ enum {
 /* HD scene passes (see Dkc2SdlPresenterPresentHd). */
 enum {
   kDkc2HdPassUpscale = 0,   /* a 1x input to the output scale */
-  kDkc2HdPassQuad = 1,      /* an art or sprite image over a rectangle */
+  kDkc2HdPassQuad = 1,      /* an art, tile or sprite image over a rectangle */
   kDkc2HdPassComposite = 2, /* the BG1 layer over the output */
   kDkc2HdPassCount = 3,
-  /* Uploaded HD images kept; a scene uses far fewer. */
-  kDkc2HdImageMax = 512,
+  /* Uploaded HD images kept (a scene draws up to ~2900 tiles, sprites and
+   * art quads), in an open-addressed table of a power-of-two size kept at
+   * most three quarters full. */
+  kDkc2HdImageSlots = 8192,
+  kDkc2HdImageMax = kDkc2HdImageSlots / 4 * 3,
 };
 
 typedef struct Dkc2HdScene Dkc2HdScene;
@@ -102,16 +105,17 @@ typedef struct Dkc2SdlPresenter {
   int capture_height;
   bool capture_done;
   /* HD scenes drawn on the GPU. hd_program[0] is 0 when unavailable, with
-   * the reason in hd_error. The 1x inputs (base, occlusion, BG1 layer) are
-   * uploaded per scene; hd_output holds the composed frame of scene
-   * hd_serial, which the display chain then shows like an uploaded frame. */
+   * the reason in hd_error. The 1x inputs (base, occlusion, BG1 layer, tile
+   * mask) are uploaded per scene; hd_output holds the composed frame of
+   * scene hd_serial, which the display chain then shows like an uploaded
+   * frame. */
   unsigned int hd_program[kDkc2HdPassCount];
-  unsigned int hd_input[3];
+  unsigned int hd_input[4];
   int hd_input_width;
   Dkc2GlTarget hd_layer;
   Dkc2GlTarget hd_output;
   uint64_t hd_serial;
-  Dkc2GlHdImage hd_images[kDkc2HdImageMax];
+  Dkc2GlHdImage hd_images[kDkc2HdImageSlots]; /* id 0: free slot */
   unsigned int hd_image_count;
   char hd_error[160];
 } Dkc2SdlPresenter;

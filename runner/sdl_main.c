@@ -158,11 +158,13 @@ static void DrawFrame(SdlHost *host) {
   const size_t pitch = (size_t)Dkc2VideoWidth() * kBytesPerPixel;
   if (host->hd_gpu) {
     host->hd_scene =
-        Dkc2HdEndFrameScene(host->hd, g_ppu, g_ram, host->pixels, pitch);
+        Dkc2HdEndFrameScene(host->hd, g_ppu, g_ram, Dkc2GetFrameLines(),
+                            host->pixels, pitch);
     return;
   }
-  host->hd_pixels = Dkc2HdEndFrame(host->hd, g_ppu, g_ram, host->pixels,
-                                   pitch, &host->hd_width, &host->hd_height);
+  host->hd_pixels = Dkc2HdEndFrame(host->hd, g_ppu, g_ram, Dkc2GetFrameLines(),
+                                   host->pixels, pitch, &host->hd_width,
+                                   &host->hd_height);
 }
 
 typedef struct SdlControls {

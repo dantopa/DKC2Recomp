@@ -73,6 +73,10 @@ void Dkc2GetGeyserStats(Dkc2GeyserStats *out);
 /* Scanline bands read from the cartridge's HDMA tables for the last
  * rendered frame (host-only diagnostics). */
 int Dkc2GetHdmaBandCount(void);
+/* The background registers each scanline of the last rendered frame was
+ * drawn with. */
+struct Dkc2HdmaLines;
+const struct Dkc2HdmaLines *Dkc2GetFrameLines(void);
 /* Bands of a wide layer presented as a static plane (the map's own wrap)
  * in the last rendered frame (host-only diagnostics). */
 int Dkc2GetPlaneBandCount(int layer);

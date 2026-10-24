@@ -40,6 +40,14 @@
 - Fixed GPU HD frames hiding objects on frames that introduce new sprite
   images outside layered scenes (the first new image overwrote the
   occlusion map).
+- HD packs can replace BG2 and BG3 one 8x8 cell at a time: each cell the
+  frame shows is read from VRAM with the scroll each scanline was drawn with,
+  keyed by its colors (`b_<key>.rgba`) and drawn where that background is the
+  visible, unblended pixel. A pack enables this with a `backgrounds.txt`
+  file; `DKC2_HD_DUMP` writes the cells it sees. Other packs render and cost
+  exactly as before.
+- The GPU presenter keeps up to 6144 HD images in a hash table (was 512 in a
+  list), enough for a frame of background cells.
 
 ## 0.0.8 (alpha) - 2026-09-13
 

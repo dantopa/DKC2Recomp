@@ -369,12 +369,18 @@ static const char kHdUpscaleFragmentSource[] =
     "                      min(sum.a, 1.0));\n"
     "}\n";
 
-/* Occlusion (from the scene's ARGB words): r the background rank, g an
- * object rank, b a sprite-table owner + 1, a the BG1 layer in front. */
+/* Quad kinds: art replaces the BG1 layer's pixels, a sprite blends where
+ * the occlusion map does not hide it, a tile where the tile mask holds its
+ * rank (layer + 1). Occlusion (from the scene's ARGB words): r the
+ * background rank, g an object rank, b a sprite-table owner + 1, a the BG1
+ * layer in front. */
+enum { kHdQuadArt = 0, kHdQuadSprite = 1, kHdQuadTile = 2 };
+
 static const char kHdQuadFragmentSource[] =
     "#version 120\n"
     "uniform sampler2D image;\n"
     "uniform sampler2D occlusion;\n"
+    "uniform sampler2D tile_mask;\n"
     "uniform vec2 image_size;\n"
     "uniform vec2 native_size;\n"
     "uniform vec4 rect;\n"
@@ -383,19 +389,23 @@ static const char kHdQuadFragmentSource[] =
     "uniform float brightness;\n"
     "uniform float rank;\n"
     "uniform float index;\n"
-    "uniform bool sprite;\n"
+    "uniform int kind;\n"
     "void main() {\n"
     "  vec2 o = floor(gl_FragCoord.xy);\n"
     "  vec2 local = mix(o - rect.xy, rect.xy + rect.zw - 1.0 - o, flip);\n"
     "  vec2 cell = floor((local * image_size + 0.5) / rect.zw);\n"
     "  vec4 color = texture2D(image, (cell + 0.5) / image_size);\n"
-    "  if (sprite) {\n"
+    "  if (kind != 0) {\n"
     "    if (color.a == 0.0) discard;\n"
     "    vec2 pixel = floor((o + 0.5) / scale);\n"
-    "    vec4 hide = floor(texture2D(occlusion, (pixel + 0.5) / native_size)\n"
-    "                      * 255.0 + 0.5);\n"
-    "    if (rank <= hide.r || (hide.g > 0.0 && hide.g >= rank) ||\n"
-    "        (hide.b > 0.0 && hide.b - 1.0 > index)) discard;\n"
+    "    vec2 at = (pixel + 0.5) / native_size;\n"
+    "    if (kind == 1) {\n"
+    "      vec4 hide = floor(texture2D(occlusion, at) * 255.0 + 0.5);\n"
+    "      if (rank <= hide.r || (hide.g > 0.0 && hide.g >= rank) ||\n"
+    "          (hide.b > 0.0 && hide.b - 1.0 > index)) discard;\n"
+    "    } else if (floor(texture2D(tile_mask, at).r * 255.0 + 0.5) != rank) {\n"
+    "      discard;\n"
+    "    }\n"
     "  }\n"
     "  if (brightness < 255.0)\n"
     "    color.rgb = floor((floor(color.rgb * 255.0 + 0.5) * brightness\n"
@@ -540,8 +550,8 @@ static void BuildHdPrograms(Dkc2SdlPresenter *presenter) {
       return;
     }
   }
-  glGenTextures(3, presenter->hd_input);
-  for (int input = 0; input < 3; input++) {
+  glGenTextures(4, presenter->hd_input);
+  for (int input = 0; input < 4; input++) {
     glBindTexture(GL_TEXTURE_2D, presenter->hd_input[input]);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -1205,29 +1215,50 @@ static void UploadHdInput(GLuint texture, const uint32_t *pixels, int width,
                   GL_UNSIGNED_BYTE, pixels);
 }
 
+/* The slot holding an image id, or the free slot where it goes. Image ids
+ * are never 0. */
+static unsigned HdImageSlot(const Dkc2SdlPresenter *presenter, uint64_t id) {
+  unsigned slot = (unsigned)((id * 0x9e3779b97f4a7c15ull) >> 51) &
+                  (kDkc2HdImageSlots - 1u);
+  while (presenter->hd_images[slot].id && presenter->hd_images[slot].id != id)
+    slot = (slot + 1u) & (kDkc2HdImageSlots - 1u);
+  return slot;
+}
+
+/* Deletes the uploads the scene being drawn has not used and reinserts the
+ * rest into a cleared table so every probe sequence stays unbroken. */
+static void DropUnusedHdImages(Dkc2SdlPresenter *presenter) {
+  static Dkc2GlHdImage kept[kDkc2HdImageMax];
+  unsigned kept_count = 0;
+  for (unsigned i = 0; i < kDkc2HdImageSlots; i++) {
+    const Dkc2GlHdImage *entry = &presenter->hd_images[i];
+    if (!entry->id) continue;
+    if (entry->serial == presenter->hd_serial)
+      kept[kept_count++] = *entry;
+    else
+      glDeleteTextures(1, &entry->texture);
+  }
+  memset(presenter->hd_images, 0, sizeof presenter->hd_images);
+  for (unsigned i = 0; i < kept_count; i++)
+    presenter->hd_images[HdImageSlot(presenter, kept[i].id)] = kept[i];
+  presenter->hd_image_count = kept_count;
+}
+
 /* The uploaded texture of a scene image, 0 when none can be made. Uploads
  * live under the image id; when the table is full, those the scene being
  * drawn has not used are dropped. */
 static GLuint HdImageTexture(Dkc2SdlPresenter *presenter,
                              const Dkc2HdImage *image) {
-  for (unsigned i = 0; i < presenter->hd_image_count; i++) {
-    Dkc2GlHdImage *entry = &presenter->hd_images[i];
-    if (entry->id == image->id) {
-      entry->serial = presenter->hd_serial;
-      return entry->texture;
-    }
+  unsigned slot = HdImageSlot(presenter, image->id);
+  Dkc2GlHdImage *found = &presenter->hd_images[slot];
+  if (found->id) {
+    found->serial = presenter->hd_serial;
+    return found->texture;
   }
   if (presenter->hd_image_count == kDkc2HdImageMax) {
-    unsigned kept = 0;
-    for (unsigned i = 0; i < presenter->hd_image_count; i++) {
-      Dkc2GlHdImage *entry = &presenter->hd_images[i];
-      if (entry->serial == presenter->hd_serial)
-        presenter->hd_images[kept++] = *entry;
-      else
-        glDeleteTextures(1, &entry->texture);
-    }
-    presenter->hd_image_count = kept;
-    if (kept == kDkc2HdImageMax) return 0;
+    DropUnusedHdImages(presenter);
+    if (presenter->hd_image_count == kDkc2HdImageMax) return 0;
+    slot = HdImageSlot(presenter, image->id);
   }
   GLuint texture = 0;
   glGenTextures(1, &texture);
@@ -1240,24 +1271,26 @@ static GLuint HdImageTexture(Dkc2SdlPresenter *presenter,
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, image->width, image->height, 0,
                GL_BGRA, GL_UNSIGNED_BYTE, image->pixels);
-  presenter->hd_images[presenter->hd_image_count++] =
+  presenter->hd_images[slot] =
       (Dkc2GlHdImage){image->id, texture, presenter->hd_serial};
+  presenter->hd_image_count++;
   return texture;
 }
 
 /* Draws quads with the quad program into the bound target (width by
  * height output pixels). */
 static void DrawHdQuads(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene,
-                        const Dkc2HdQuad *quads, unsigned count, bool sprite,
+                        const Dkc2HdQuad *quads, unsigned count, int kind,
                         int width, int height) {
   const GLuint program = presenter->hd_program[kDkc2HdPassQuad];
   s_gl.UseProgram(program);
   Uniform1i(program, "image", 0);
   Uniform1i(program, "occlusion", 1);
+  Uniform1i(program, "tile_mask", 2);
   Uniform2f(program, "native_size", (float)scene->width,
             (float)scene->height);
   Uniform1f(program, "scale", (float)scene->scale);
-  Uniform1i(program, "sprite", sprite);
+  Uniform1i(program, "kind", kind);
   const GLint rect = s_gl.GetUniformLocation(program, "rect");
   for (unsigned q = 0; q < count; q++) {
     const Dkc2HdQuad *quad = &quads[q];
@@ -1297,14 +1330,17 @@ static bool ComposeHd(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene) {
   if (!PrepareHdTargets(presenter, width, height, scene->layer != NULL))
     return false;
   presenter->hd_serial = scene->serial;
-  /* All three inputs get storage together, so a later scene with a layer
-   * finds its texture sized even when earlier ones had none. */
+  /* All inputs get storage together, so a later scene with a layer or
+   * tiles finds its texture sized even when earlier ones had none. */
   if (presenter->hd_input_width != scene->width) {
     for (int input = 0; input < 3; input++) {
       glBindTexture(GL_TEXTURE_2D, presenter->hd_input[input]);
       glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, scene->width, scene->height,
                    0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
     }
+    glBindTexture(GL_TEXTURE_2D, presenter->hd_input[3]);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE8, scene->width,
+                 scene->height, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
     presenter->hd_input_width = scene->width;
   }
   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
@@ -1315,6 +1351,14 @@ static bool ComposeHd(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene) {
   if (scene->layer)
     UploadHdInput(presenter->hd_input[2], scene->layer, scene->width,
                   scene->height);
+  if (scene->tile_count) {
+    /* One byte per pixel: rows are not 4-byte aligned. */
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glBindTexture(GL_TEXTURE_2D, presenter->hd_input[3]);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, scene->width, scene->height,
+                    GL_LUMINANCE, GL_UNSIGNED_BYTE, scene->tile_mask);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+  }
   glDisable(GL_DEPTH_TEST);
   glDisable(GL_BLEND);
   glEnable(GL_TEXTURE_2D);
@@ -1333,12 +1377,19 @@ static bool ComposeHd(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene) {
   /* Blended passes keep the output opaque, as the CPU blend does. */
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+  if (scene->tile_count) {
+    BindTextureUnit(2, presenter->hd_input[3]);
+    glEnable(GL_BLEND);
+    DrawHdQuads(presenter, scene, scene->tiles, scene->tile_count,
+                kHdQuadTile, width, height);
+    glDisable(GL_BLEND);
+  }
   if (scene->layer) {
     BindTextureUnit(0, presenter->hd_input[2]);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     DrawIntoTarget(upscale, &presenter->hd_layer);
-    DrawHdQuads(presenter, scene, scene->art, scene->art_count, false, width,
-                height);
+    DrawHdQuads(presenter, scene, scene->art, scene->art_count, kHdQuadArt,
+                width, height);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
     const GLuint composite = presenter->hd_program[kDkc2HdPassComposite];
     BindTextureUnit(0, presenter->hd_layer.texture);
@@ -1356,11 +1407,12 @@ static bool ComposeHd(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene) {
     glViewport(0, 0, width, height);
   }
   glEnable(GL_BLEND);
-  DrawHdQuads(presenter, scene, scene->sprites, scene->sprite_count, true,
-              width, height);
+  DrawHdQuads(presenter, scene, scene->sprites, scene->sprite_count,
+              kHdQuadSprite, width, height);
   glDisable(GL_BLEND);
   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
   s_gl.UseProgram(0);
+  BindTextureUnit(2, 0);
   BindTextureUnit(1, 0);
   BindTextureUnit(0, 0);
   s_gl.BindFramebuffer(GL_FRAMEBUFFER_EXT, 0);
@@ -1447,10 +1499,12 @@ void Dkc2GlPipelineDestroy(Dkc2SdlPresenter *presenter) {
       s_gl.DeleteProgram(presenter->hd_program[pass]);
     presenter->hd_program[pass] = 0;
   }
-  if (presenter->hd_input[0]) glDeleteTextures(3, presenter->hd_input);
+  if (presenter->hd_input[0]) glDeleteTextures(4, presenter->hd_input);
   memset(presenter->hd_input, 0, sizeof presenter->hd_input);
-  for (unsigned i = 0; i < presenter->hd_image_count; i++)
-    glDeleteTextures(1, &presenter->hd_images[i].texture);
+  for (unsigned i = 0; i < kDkc2HdImageSlots; i++)
+    if (presenter->hd_images[i].id)
+      glDeleteTextures(1, &presenter->hd_images[i].texture);
+  memset(presenter->hd_images, 0, sizeof presenter->hd_images);
   presenter->hd_image_count = 0;
   DestroyTarget(&presenter->hd_output);
   DestroyTarget(&presenter->hd_layer);

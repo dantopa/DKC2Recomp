@@ -51,6 +51,18 @@ enum {
   kQuadMax = kDkc2NativeSpriteMax + kDkc2NativeOamEntries,
   /* Character type the dump gives loose objects in index.txt. */
   kLooseType = 0x0ffe,
+  /* Backgrounds with tile art: BG2 and BG3 (BG1 has terrain blocks). */
+  kTileFirstLayer = 1,
+  kTile = 8,
+  kTilePixels = kTile * kTile,
+  kTileColumns = kMaxWidth / kTile + 2,
+  kTileRows = kHeight / kTile + 2,
+  /* Tile quads of one frame: every cell of each tiled layer. */
+  kTileMax = (kBgLayers - kTileFirstLayer) * kTileColumns * kTileRows,
+  /* Distinct background tiles remembered (art and dump state). */
+  kTileArtSlots = 16384,
+  /* Verified cells of one layer, looked up by their captured pixels. */
+  kTileSeenSlots = 4096,
 };
 
 /* Pixels each learned pattern reads, as (row, column) offsets from the top
@@ -116,6 +128,25 @@ typedef struct DrawItem {
   uint8_t item;
 } DrawItem;
 
+/* A background cell VRAM reproduced, keyed by its captured pixels. */
+typedef struct TileSeen {
+  uint64_t content;  /* 0: free slot */
+  uint64_t key;
+  uint16_t entry;
+} TileSeen;
+
+/* A whole cell VRAM did not reproduce (widescreen margins), left for the
+ * cells that were. */
+typedef struct TilePending {
+  int x, y;
+} TilePending;
+
+typedef enum QuadKind {
+  kQuadArt,     /* replaces the BG1 layer's pixels */
+  kQuadSprite,  /* blends where the occlusion map does not hide it */
+  kQuadTile,    /* blends where the tile mask shows its layer */
+} QuadKind;
+
 typedef struct SpriteState {
   Dkc2NativeSprite sprite;
   bool decoded;
@@ -164,6 +195,9 @@ struct Dkc2Hd {
    * rendered frame and is composed here, art where the pack has it and the
    * background filter elsewhere. */
   bool layer_pack;
+  /* BG2/BG3 cells are reproduced: the pack has backgrounds.txt or a dump
+   * collects them. */
+  bool tile_pass;
   /* This frame composes BG1 here: the pack has BG1 art, BG1 is drawn on
    * the main screen only (captures see the main screen; scenes such as
    * Mainbrace Mayhem draw BG1 on the subscreen through color math) and
@@ -214,6 +248,14 @@ struct Dkc2Hd {
   char quad_name[kQuadMax][24];
   bool quad_art[kQuadMax];
   unsigned quad_count;
+  /* Background tile art (see ProcessTiles). */
+  PackEntry tile_art[kTileArtSlots];
+  unsigned tile_art_count;
+  TileSeen tile_seen[kTileSeenSlots];
+  TilePending tile_pending[kTileColumns * kTileRows];
+  Dkc2HdQuad tiles[kTileMax];
+  unsigned tile_count;
+  uint8_t tile_mask[kMaxPixels];
   Dkc2HdScene scene;
   uint32_t *output;
 };
@@ -374,7 +416,13 @@ Dkc2Hd *Dkc2HdCreate(const Dkc2HdConfig *config, const uint8_t *rom,
       fclose(index);
     LoadScreens(hd);
     hd->layer_pack |= hd->screen_count > 0;
+    snprintf(path, sizeof path, "%s/backgrounds.txt", hd->pack_dir);
+    index = fopen(path, "r");
+    hd->tile_pass = index != NULL;
+    if (index)
+      fclose(index);
   }
+  hd->tile_pass |= hd->dump_dir[0] != '\0';
   if (hd->layer_pack)
     hd->layer = (uint32_t *)malloc(sizeof(uint32_t) * output_pixels);
   if (hd->background == kDkc2HdFilterSmooth)
@@ -409,6 +457,8 @@ void Dkc2HdDestroy(Dkc2Hd *hd) {
     free(hd->terrain[i].image);
   for (unsigned i = 0; i < kSpriteArtSlots; i++)
     free(hd->sprite_art[i].image);
+  for (unsigned i = 0; i < kTileArtSlots; i++)
+    free(hd->tile_art[i].image);
   for (unsigned i = 0; i < hd->screen_count; i++) {
     free(hd->screens[i].reference);
     free(hd->screens[i].art);
@@ -1225,10 +1275,9 @@ static bool SpriteHidden(const Dkc2Hd *hd, const Dkc2HdQuad *quad, size_t i) {
          (owner && owner - 1u > quad->index);
 }
 
-/* Draws a quad into target (output pixels): a sprite blends where it is not
- * hidden, art replaces the layer's pixels. */
+/* Draws a quad of a kind into target (output pixels). */
 static void DrawQuad(Dkc2Hd *hd, uint32_t *target, const Dkc2HdQuad *quad,
-                     bool sprite) {
+                     QuadKind kind) {
   const HdImage *image = quad->image;
   const int scale = hd->scale;
   const int out_width = hd->width * scale, out_height = kHeight * scale;
@@ -1247,11 +1296,11 @@ static void DrawQuad(Dkc2Hd *hd, uint32_t *target, const Dkc2HdQuad *quad,
         continue;
       uint32_t pixel = source[hx * image->width / quad->width];
       const unsigned alpha = pixel >> 24;
-      if (sprite &&
-          (!alpha ||
-           SpriteHidden(hd, quad,
-                        (size_t)(y / scale) * (size_t)hd->width +
-                            (size_t)(x / scale))))
+      const size_t i =
+          (size_t)(y / scale) * (size_t)hd->width + (size_t)(x / scale);
+      if (kind == kQuadSprite && (!alpha || SpriteHidden(hd, quad, i)))
+        continue;
+      if (kind == kQuadTile && (!alpha || hd->tile_mask[i] != quad->rank))
         continue;
       if (quad->brightness != 255u) {
         uint32_t scaled = pixel & 0xff000000u;
@@ -1261,7 +1310,8 @@ static void DrawQuad(Dkc2Hd *hd, uint32_t *target, const Dkc2HdQuad *quad,
         pixel = scaled;
       }
       uint32_t *destination = &target[(size_t)y * (size_t)out_width + x];
-      *destination = sprite ? Blend(*destination, pixel, alpha) : pixel;
+      *destination =
+          kind == kQuadArt ? pixel : Blend(*destination, pixel, alpha);
     }
   }
 }
@@ -1567,6 +1617,197 @@ static void ProcessTerrain(Dkc2Hd *hd, const Ppu *ppu, const uint8_t *ram) {
     fprintf(stderr, "warning: DKC2_HD_DUMP could not update %s\n", path);
 }
 
+/* A CGRAM color with the screen brightness, as captures hold it. */
+static uint32_t CgramRgb(const Ppu *ppu, uint8_t index) {
+  const uint16_t color = ppu->cgram[index];
+  return (uint32_t)ppu->brightnessMult[color & 0x1f] << 16 |
+         (uint32_t)ppu->brightnessMult[(color >> 5) & 0x1f] << 8 |
+         ppu->brightnessMult[(color >> 10) & 0x1f];
+}
+
+/* Identifies an unflipped background character by the raw color of every
+ * pixel, so it holds through fades and palette numbers. Never 0. */
+static uint64_t TileKey(const Ppu *ppu, const uint8_t indices[kTilePixels]) {
+  uint64_t hash = 14695981039346656037ull;
+  for (unsigned i = 0; i < kTilePixels; i++) {
+    hash ^= indices[i] ? ppu->cgram[indices[i]] & 0x7fffu : 0x8000u;
+    hash *= 1099511628211ull;
+  }
+  return hash ? hash : 1;
+}
+
+/* Hash of a whole cell's captured pixels (frame position x, y), 0 when any
+ * pixel lies outside the frame. */
+static uint64_t TileContent(const Dkc2Hd *hd, unsigned layer, int x, int y) {
+  if (x < 0 || y < 0 || x + kTile > hd->width || y + kTile > kHeight)
+    return 0;
+  uint64_t hash = 14695981039346656037ull;
+  for (int ty = 0; ty < kTile; ty++) {
+    for (int tx = 0; tx < kTile; tx++) {
+      hash ^= Opaque(hd->bg[layer][(size_t)(y + ty) * hd->width + x + tx]);
+      hash *= 1099511628211ull;
+    }
+  }
+  return hash ? hash : 1;
+}
+
+static TileSeen *TileSeenFind(Dkc2Hd *hd, uint64_t content) {
+  unsigned slot = (unsigned)((content * 0x9e3779b97f4a7c15ull) >> 52);
+  for (;; slot = (slot + 1) % kTileSeenSlots) {
+    TileSeen *seen = &hd->tile_seen[slot];
+    if (!seen->content || seen->content == content)
+      return seen;
+  }
+}
+
+/* Records a cell's art (pack file "b_<key>.rgba") as a tile quad, and with
+ * DKC2_HD_DUMP writes a new character seen at full brightness. */
+static void AddTile(Dkc2Hd *hd, const Ppu *ppu, unsigned layer, int x, int y,
+                    uint64_t key, uint16_t entry, const uint8_t *indices) {
+  PackEntry *art =
+      PackFind(hd->tile_art, kTileArtSlots, &hd->tile_art_count, key);
+  if (!art)
+    return;
+  if (indices && hd->dump_dir[0] && !art->dumped &&
+      ppu->brightnessMult[31] == 255u) {
+    uint32_t pixels[kTilePixels];
+    for (unsigned i = 0; i < kTilePixels; i++)
+      pixels[i] = indices[i] ? 0xff000000u | CgramRgb(ppu, indices[i]) : 0;
+    char path[kPathMax + 32];
+    snprintf(path, sizeof path, "%s/b_%016llx.rgba", hd->dump_dir,
+             (unsigned long long)key);
+    art->dumped = WriteCaptureImage(path, pixels, kTile, kTile, kTile);
+  }
+  if (art->state == kPackUnknown && hd->pack_dir[0]) {
+    char path[kPathMax + 32];
+    snprintf(path, sizeof path, "%s/b_%016llx.rgba", hd->pack_dir,
+             (unsigned long long)key);
+    art->image = LoadImage(path);
+    art->state = art->image ? kPackLoaded : kPackMissing;
+  }
+  if (!art->image || hd->tile_count >= kTileMax)
+    return;
+  const int scale = hd->scale;
+  Dkc2HdQuad *quad = &hd->tiles[hd->tile_count++];
+  memset(quad, 0, sizeof *quad);
+  quad->image = art->image;
+  quad->x = x * scale;
+  quad->y = y * scale;
+  quad->width = kTile * scale;
+  quad->height = kTile * scale;
+  quad->flip_x = (entry & 0x4000u) != 0;
+  quad->flip_y = (entry & 0x8000u) != 0;
+  quad->brightness = ppu->brightnessMult[31];
+  quad->rank = (uint8_t)(layer + 1);
+}
+
+/* Whether two lines draw a layer with the same registers. */
+static bool SameTileLine(const Dkc2HdmaLineState *a,
+                         const Dkc2HdmaLineState *b, unsigned layer) {
+  return a->h_scroll[layer] == b->h_scroll[layer] &&
+         a->v_scroll[layer] == b->v_scroll[layer] &&
+         a->bg_sc[layer] == b->bg_sc[layer] &&
+         ((a->tile_base ^ b->tile_base) >> (layer * 4) & 0xfu) == 0 &&
+         a->bgmode == b->bgmode && a->mosaic == b->mosaic;
+}
+
+/* One row of cells of a layer whose top lies at frame row top; frame rows
+ * first..end (past) show it, drawn with the registers of state. Cells VRAM
+ * reproduces (7/8 of the pixels either shows) are added and remembered by
+ * their captured pixels; other whole cells are left pending. */
+static void ProcessTileRow(Dkc2Hd *hd, const Ppu *ppu,
+                           const Dkc2HdmaLineState *state, unsigned layer,
+                           int top, int first, int end, unsigned *pending) {
+  const unsigned bpp = layer == 2 ? 2u : 4u;
+  const int extra = (hd->width - kNativeWidth) / 2;
+  const unsigned h_scroll = state->h_scroll[layer];
+  /* Captured row 0 is scanline 1. */
+  const unsigned map_y = (unsigned)(top + 1) + state->v_scroll[layer];
+  const uint16_t character_base =
+      (uint16_t)(((state->tile_base >> (layer * 4)) & 0xfu) << 12);
+  uint8_t indices[kTilePixels];
+  for (int x = -(int)((h_scroll - (unsigned)extra) & 7u); x < hd->width;
+       x += kTile) {
+    const uint16_t entry = Dkc2NativeBgMapEntry(
+        ppu, state->bg_sc[layer], (unsigned)(x - extra) + h_scroll, map_y);
+    Dkc2NativeDecodeBgCharacter(ppu, bpp, character_base, entry, indices);
+    size_t compared = 0, wrong = 0;
+    for (int ty = 0; ty < kTile; ty++) {
+      const int y = top + ty;
+      if (y < first || y >= end)
+        continue;
+      const int sy = (entry & 0x8000u) ? kTile - 1 - ty : ty;
+      for (int tx = 0; tx < kTile; tx++) {
+        if (x + tx < 0 || x + tx >= hd->width)
+          continue;
+        const int sx = (entry & 0x4000u) ? kTile - 1 - tx : tx;
+        const uint8_t index = indices[sy * kTile + sx];
+        const uint32_t captured =
+            hd->bg[layer][(size_t)y * hd->width + x + tx];
+        if (!index && !captured)
+          continue;
+        compared++;
+        wrong += !index || !captured ||
+                 Rgb(captured) != CgramRgb(ppu, index);
+      }
+    }
+    const uint64_t content = TileContent(hd, layer, x, top);
+    if (compared == 0 || wrong * 8 > compared) {
+      if (content && *pending < kTileColumns * kTileRows)
+        hd->tile_pending[(*pending)++] = (TilePending){x, top};
+      continue;
+    }
+    const uint64_t key = TileKey(ppu, indices);
+    if (content) {
+      TileSeen *seen = TileSeenFind(hd, content);
+      *seen = (TileSeen){content, key, entry};
+    }
+    AddTile(hd, ppu, layer, x, top, key, entry, indices);
+  }
+}
+
+/* Background tile art for BG2 and BG3. Each layer is split into rows of
+ * cells drawn with the same registers (scroll can change every scanline);
+ * cells cut by a register change are skipped. A whole cell VRAM does not
+ * reproduce takes the character of a reproduced cell with the same captured
+ * pixels: widescreen margins are drawn from a world store, not VRAM. */
+static void ProcessTiles(Dkc2Hd *hd, const Ppu *ppu,
+                         const Dkc2HdmaLines *lines) {
+  hd->tile_count = 0;
+  if (!lines || !hd->tile_pass)
+    return;
+  for (unsigned layer = kTileFirstLayer; layer < kBgLayers; layer++) {
+    memset(hd->tile_seen, 0, sizeof hd->tile_seen);
+    unsigned pending = 0;
+    int row = 0;
+    while (row < kHeight) {
+      const Dkc2HdmaLineState *state = &lines->line[row + 1];
+      const int phase =
+          (int)((unsigned)(row + 1) + state->v_scroll[layer]) & (kTile - 1);
+      int end = row + 1;
+      while (end < kHeight && end - row < kTile - phase &&
+             SameTileLine(state, &lines->line[end + 1], layer))
+        end++;
+      const int top = row - phase;
+      const bool whole =
+          (phase == 0 || row == 0) && (end - top == kTile || end == kHeight);
+      const bool readable = (state->bgmode & 7) == 1 &&
+                            !(state->bgmode >> (layer + 4) & 1) &&
+                            !(state->mosaic >> layer & 1);
+      if (whole && readable)
+        ProcessTileRow(hd, ppu, state, layer, top, row, end, &pending);
+      row = end;
+    }
+    for (unsigned p = 0; p < pending; p++) {
+      const TilePending cell = hd->tile_pending[p];
+      const TileSeen *seen =
+          TileSeenFind(hd, TileContent(hd, layer, cell.x, cell.y));
+      if (seen->content)
+        AddTile(hd, ppu, layer, cell.x, cell.y, seen->key, seen->entry, NULL);
+    }
+  }
+}
+
 /* Whether the native 256 columns lie inside the frame (the presentation
  * bias can shift them). */
 static bool NativeAreaInFrame(const Dkc2Hd *hd) {
@@ -1699,6 +1940,7 @@ static void BuildBg1Rank(Dkc2Hd *hd) {
 
 const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
                                        const uint8_t *ram,
+                                       const Dkc2HdmaLines *lines,
                                        const uint8_t *frame,
                                        size_t frame_pitch) {
   static uint64_t last_serial;
@@ -1750,6 +1992,16 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
        * fade into BG1 itself instead of into the layers it hides. */
       if (layered && hd->bg[0][i] && (uint8_t)(hd->bg[0][i] >> 24) > rank)
         pixel = 0xff000000u | Rgb(hd->bg[0][i]);
+      /* A tiled layer shows here when the base pixel is its own, untouched
+       * by color math. */
+      uint8_t tile_layer = 0;
+      for (unsigned layer = kTileFirstLayer; layer < kBgLayers; layer++) {
+        const uint32_t captured = hd->bg[layer][i];
+        if (captured && (uint8_t)(captured >> 24) == rank &&
+            Rgb(captured) == Rgb(pixel))
+          tile_layer = (uint8_t)(layer + 1);
+      }
+      hd->tile_mask[i] = tile_layer;
       hd->base[i] = pixel;
       hd->base_rank[i] = rank;
       hd->occlusion[i] = occlusion;
@@ -1772,6 +2024,7 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
       if (hd->bg1_rank[i] > hd->base_rank[i])
         hd->occlusion[i] |= 0xff000000u;
   }
+  ProcessTiles(hd, ppu, lines);
   hd->quad_count = 0;
   for (unsigned position = 0; position < hd->order_count; position++) {
     const DrawItem item = hd->order[position];
@@ -1789,6 +2042,9 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
       .scale = hd->scale,
       .background = hd->background,
       .base = hd->base,
+      .tiles = hd->tiles,
+      .tile_count = hd->tile_count,
+      .tile_mask = hd->tile_mask,
       .occlusion = hd->occlusion,
       .layer = layered ? hd->layer_source : NULL,
       .art = hd->art,
@@ -1800,21 +2056,24 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
 }
 
 const uint32_t *Dkc2HdEndFrame(Dkc2Hd *hd, const Ppu *ppu, const uint8_t *ram,
+                               const Dkc2HdmaLines *lines,
                                const uint8_t *frame, size_t frame_pitch,
                                int *width, int *height) {
   const Dkc2HdScene *scene =
-      Dkc2HdEndFrameScene(hd, ppu, ram, frame, frame_pitch);
+      Dkc2HdEndFrameScene(hd, ppu, ram, lines, frame, frame_pitch);
   if (!scene)
     return NULL;
   Upscale(hd, scene->base, hd->output);
+  for (unsigned t = 0; t < scene->tile_count; t++)
+    DrawQuad(hd, hd->output, &scene->tiles[t], kQuadTile);
   if (scene->layer) {
     Upscale(hd, scene->layer, hd->layer);
     for (unsigned a = 0; a < scene->art_count; a++)
-      DrawQuad(hd, hd->layer, &scene->art[a], false);
+      DrawQuad(hd, hd->layer, &scene->art[a], kQuadArt);
     CompositeTerrain(hd);
   }
   for (unsigned s = 0; s < scene->sprite_count; s++)
-    DrawQuad(hd, hd->output, &scene->sprites[s], true);
+    DrawQuad(hd, hd->output, &scene->sprites[s], kQuadSprite);
   *width = scene->width * scene->scale;
   *height = scene->height * scene->scale;
   return hd->output;

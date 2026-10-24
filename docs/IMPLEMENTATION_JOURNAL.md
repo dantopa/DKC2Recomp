@@ -6454,3 +6454,33 @@ rest of the frame. Layered frames end with unit 0 active, which hid it until
 the map stopped being layered. Uploads now bind unit 0. GPU and CPU match on
 all four frames and the goldens were regenerated (menu and map changes).
 
+Phase 2 of the HD work replaces backgrounds by tiles. The runner records the
+registers each scanline was drawn with (scroll, BGnSC, character base, mode,
+mosaic) after HDMA, the widescreen band policies and the presentation bias.
+For BG2 and BG3 in Mode 1 the compositor splits each layer into runs of lines
+with the same registers, decodes every whole 8x8 cell from VRAM, and accepts
+it when at least 7 of its 8 rows match the layer capture; widescreen margin
+cells (built by the shadow store, not the tilemap) are resolved from a
+dictionary of cells already verified by content. The key is FNV-1a over the
+raw CGRAM color of the 64 pixels, so it follows palette changes but not
+brightness. A cell is drawn only on pixels where its layer is the visible one
+and the base pixel equals the capture (no color math), after the layered BG1
+override. With identity art (each cell's own dump) the HD frame equals the 1x
+frame except the map fog, an object-math case the compositor already did not
+reproduce; with no `b_` art it is byte-identical to before. In the level
+about a third of BG2's visible pixels carry additive math and keep the native
+filter; an art-plus-offset blend is the natural next step. Cells cut by a
+per-line scroll change (the map) are skipped.
+
+The GPU parity with identity art then failed on the menu: the presenter kept
+512 images in a list and silently skipped quads once a frame needed more (the
+menu draws over 800 distinct cells). The cache is now an open-addressed table
+of 8192 slots kept at most three quarters full, evicting images the current
+scene did not use; GPU and CPU match on the menu, level and map frames.
+Eviction rebuilds the table from a copy of the kept entries: reinserting in
+place broke probe runs that wrapped around the end of the table, which a
+simulation with forced evictions caught.
+
+Decoding and verifying the cells costs about 0.8 ms per frame on the CPU
+(4600-frame route, 71 s against 74.5 s), so it runs only when the pack has
+backgrounds.txt or a dump is being written.

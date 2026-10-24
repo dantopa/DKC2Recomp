@@ -52,6 +52,7 @@ enum {
   kDkc2BandPolicyPlane = 2,
 };
 static Dkc2HdmaBands s_frame_bands;
+static Dkc2HdmaLines s_frame_lines;
 static uint8_t s_band_policy[2][kDkc2HdmaMaxBands];
 /* The terrain layer's rendered scroll phase for the frame
  * (Dkc2VideoSelectTerrainPhase): the key for the world store, the prefill's
@@ -267,6 +268,10 @@ void Dkc2GetTerrainPrefillStats(Dkc2TerrainPrefillStats *out) {
 
 int Dkc2GetHdmaBandCount(void) {
   return s_frame_bands.count;
+}
+
+const Dkc2HdmaLines *Dkc2GetFrameLines(void) {
+  return &s_frame_lines;
 }
 
 typedef struct Dkc2HostSnapshot {
@@ -2389,6 +2394,13 @@ void Dkc2DrawPpuFrame(void) {
             (uint16_t)(g_ppu->hScroll[layer] + presentation_bias);
     }
     Dkc2KongsBeginLine(g_ppu);
+    Dkc2HdmaLineState *state = &s_frame_lines.line[line];
+    memcpy(state->h_scroll, g_ppu->hScroll, sizeof state->h_scroll);
+    memcpy(state->v_scroll, g_ppu->vScroll, sizeof state->v_scroll);
+    memcpy(state->bg_sc, g_ppu->bgXsc, sizeof state->bg_sc);
+    state->tile_base = g_ppu->bgTileAdr;
+    state->bgmode = g_ppu->bgmode;
+    state->mosaic = g_ppu->mosaic;
     ppu_runLine(g_ppu, line);
     Dkc2KongsEndLine(g_ppu);
     if (presentation_bias != 0) {

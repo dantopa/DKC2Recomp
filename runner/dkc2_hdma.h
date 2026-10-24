@@ -40,6 +40,22 @@ typedef struct Dkc2HdmaBands {
   uint8_t band_for_line[kDkc2HdmaLastLine + 1];
 } Dkc2HdmaBands;
 
+/* The background registers the PPU drew one scanline with, recorded while
+ * rendering (after HDMA, the widescreen band policies and the presentation
+ * bias) for host layers that rebuild backgrounds from VRAM. */
+typedef struct Dkc2HdmaLineState {
+  uint16_t h_scroll[4];
+  uint16_t v_scroll[4];
+  uint8_t bg_sc[4];
+  uint16_t tile_base; /* BG12NBA, BG34NBA << 8 */
+  uint8_t bgmode;
+  uint8_t mosaic;
+} Dkc2HdmaLineState;
+
+typedef struct Dkc2HdmaLines {
+  Dkc2HdmaLineState line[kDkc2HdmaLastLine + 1];
+} Dkc2HdmaLines;
+
 typedef struct Dkc2HdmaChannelConfig {
   bool active;
   bool indirect;
