@@ -36,6 +36,11 @@ DKC2_HD=4 DKC2_ASPECT=16:9 DKC2_HD_PACK=private/hdpack \
   build-release/dkc2_snesrecomp_headless /path/to/dkc2.sfc 1500
 ```
 
+On macOS, GPU composition is checked against the CPU compositor (and
+optional private golden captures) by `supplied_rom_macos_hd_gpu_parity`;
+configure with `-DDKC2_PIRATE_PANIC_INPUT=<route>`, optionally
+`-DDKC2_HD_PACK_DIR=<pack>` and `-DDKC2_HD_GOLDEN_DIR=<private dir>`.
+
 Known: the six `supplied_rom_coop_*` integration tests currently fail on this
 fork's base and are unrelated to HD.
 

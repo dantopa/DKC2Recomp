@@ -6389,3 +6389,18 @@ runner, which is how these scenes are reached without a window. Mainbrace
 Mayhem (BG1 through the subscreen) was not captured; it takes the non-layered
 path, covered by the art-free runs. The Windows host still uses the CPU
 executor.
+
+The GPU/CPU comparison is now a test. `scripts/hd_gpu_parity.py` replays the
+Pirate Panic route hidden twice (`DKC2_HD_CPU=1` and GPU, 4x smooth, nearest
+presentation) and captures the title, the title fade-out, the level fade-in
+and the level start in one run each; `DKC2_DESKTOP_SCREENSHOT_FRAME` accepts
+up to eight comma-separated frames for this. A capture passes when no channel
+differs by more than 16 and at most 0.01% of pixels differ by more than 2.
+With `DKC2_HD_GOLDEN_DIR` both runs are also compared with golden captures
+kept outside the repository (`--update-golden` writes them from the CPU run).
+CTest registers it as `supplied_rom_macos_hd_gpu_parity` when
+`DKC2_PIRATE_PANIC_INPUT` is set (`DKC2_HD_PACK_DIR` adds the art pack); the
+tolerance rules have synthetic unit tests. Measured at the HD output size, the
+GPU and CPU frames differ in 2 of 1.2 million pixels by one level; the larger
+differences seen earlier came from the Reconstruct upscaler amplifying them.
+A corrupted golden made the test fail as expected.

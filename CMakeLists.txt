@@ -24,6 +24,10 @@ set(DKC2_PIRATE_PANIC_INPUT "" CACHE FILEPATH
     "Private deterministic input recording for the Pirate Panic entrance-to-goal gate")
 set(DKC2_PIRATE_PANIC_SRAM "" CACHE FILEPATH
     "Private starting SRAM paired with DKC2_PIRATE_PANIC_INPUT")
+set(DKC2_HD_PACK_DIR "" CACHE PATH
+    "Private HD art pack used by the GPU/CPU HD parity test")
+set(DKC2_HD_GOLDEN_DIR "" CACHE PATH
+    "Private golden captures for the HD parity test (outside the repository)")
 set(DKC2_PIRATE_PANIC_LATE_INPUT "" CACHE FILEPATH
     "Private late Pirate Panic recording for widescreen margin regression")
 set(DKC2_PIRATE_PANIC_LATE_SRAM "" CACHE FILEPATH
@@ -504,6 +508,30 @@ if(DKC2_BUILD_SNESRECOMP)
             PASS_REGULAR_EXPRESSION
                 "result=desktop_completed frames=90.*save_load=passed.*host=sdl2"
             TIMEOUT 30)
+
+        find_package(Python3 QUIET COMPONENTS Interpreter)
+        if(DKC2_PIRATE_PANIC_INPUT AND Python3_Interpreter_FOUND)
+            set(dkc2_hd_parity_options)
+            if(DKC2_HD_PACK_DIR)
+                list(APPEND dkc2_hd_parity_options --pack "${DKC2_HD_PACK_DIR}")
+            endif()
+            if(DKC2_HD_GOLDEN_DIR)
+                list(APPEND dkc2_hd_parity_options
+                    --golden "${DKC2_HD_GOLDEN_DIR}")
+            endif()
+            add_test(NAME supplied_rom_macos_hd_gpu_parity
+                COMMAND ${Python3_EXECUTABLE} -I
+                    "${CMAKE_CURRENT_SOURCE_DIR}/scripts/hd_gpu_parity.py"
+                    --app "$<TARGET_FILE:dkc2_snesrecomp_sdl>"
+                    --rom "${DKC2_ROM}"
+                    --input "${DKC2_PIRATE_PANIC_INPUT}"
+                    --work "${CMAKE_CURRENT_BINARY_DIR}/macos-test-hd-parity"
+                    ${dkc2_hd_parity_options})
+            set_tests_properties(supplied_rom_macos_hd_gpu_parity PROPERTIES
+                LABELS "private;integration;native;desktop;macos;gpu;hd"
+                PASS_REGULAR_EXPRESSION "hd gpu parity: passed"
+                TIMEOUT 180)
+        endif()
     endif()
 
     if(BUILD_TESTING AND WIN32 AND DKC2_ROM)
@@ -694,6 +722,11 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_hd_pack.py)
         set_tests_properties(hd_pack_tool PROPERTIES LABELS "unit;tooling;hd")
+        add_test(NAME hd_gpu_parity_tool
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_hd_gpu_parity.py)
+        set_tests_properties(hd_gpu_parity_tool PROPERTIES
+            LABELS "unit;tooling;hd")
         add_test(NAME audio_pcm_compare
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_compare_audio_pcm.py)
