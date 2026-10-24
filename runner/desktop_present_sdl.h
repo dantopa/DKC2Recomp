@@ -31,6 +31,24 @@ enum {
 };
 
 /* A half-float render target: a texture with its framebuffer object. */
+/* HD scene passes (see Dkc2SdlPresenterPresentHd). */
+enum {
+  kDkc2HdPassUpscale = 0,   /* a 1x input to the output scale */
+  kDkc2HdPassQuad = 1,      /* an art or sprite image over a rectangle */
+  kDkc2HdPassComposite = 2, /* the BG1 layer over the output */
+  kDkc2HdPassCount = 3,
+  /* Uploaded HD images kept; a scene uses far fewer. */
+  kDkc2HdImageMax = 512,
+};
+
+typedef struct Dkc2HdScene Dkc2HdScene;
+
+typedef struct Dkc2GlHdImage {
+  uint64_t id;
+  unsigned int texture;
+  uint64_t serial; /* last scene that used it */
+} Dkc2GlHdImage;
+
 typedef struct Dkc2GlTarget {
   unsigned int texture;
   unsigned int fbo;
@@ -83,6 +101,19 @@ typedef struct Dkc2SdlPresenter {
   int capture_width;
   int capture_height;
   bool capture_done;
+  /* HD scenes drawn on the GPU. hd_program[0] is 0 when unavailable, with
+   * the reason in hd_error. The 1x inputs (base, occlusion, BG1 layer) are
+   * uploaded per scene; hd_output holds the composed frame of scene
+   * hd_serial, which the display chain then shows like an uploaded frame. */
+  unsigned int hd_program[kDkc2HdPassCount];
+  unsigned int hd_input[3];
+  int hd_input_width;
+  Dkc2GlTarget hd_layer;
+  Dkc2GlTarget hd_output;
+  uint64_t hd_serial;
+  Dkc2GlHdImage hd_images[kDkc2HdImageMax];
+  unsigned int hd_image_count;
+  char hd_error[160];
 } Dkc2SdlPresenter;
 
 typedef void (*Dkc2SdlOverlayDraw)(void *user, int width, int height);
@@ -94,7 +125,8 @@ void Dkc2GlPipelineInitialize(Dkc2SdlPresenter *presenter, Dkc2GlProcLoader load
 void Dkc2GlPipelineDestroy(Dkc2SdlPresenter *presenter);
 bool Dkc2GlPipelineCrtAvailable(const Dkc2SdlPresenter *presenter);
 void Dkc2GlPipelineRender(Dkc2SdlPresenter *presenter, unsigned int final_fbo,
-                          int source_width, int source_height,
+                          unsigned int source, int source_width,
+                          int source_height,
                           int output_width, int output_height,
                           const Dkc2DesktopViewport *viewport);
 
@@ -107,6 +139,14 @@ bool Dkc2SdlPresenterPresent(Dkc2SdlPresenter *presenter,
                              int source_height,
                              Dkc2SdlOverlayDraw overlay_draw,
                              void *overlay_user);
+/* Whether Dkc2SdlPresenterPresentHd can draw HD scenes. */
+bool Dkc2SdlPresenterHdAvailable(const Dkc2SdlPresenter *presenter);
+/* Presents an HD scene drawn on the GPU at its output scale, composing it
+ * only when it is a new scene. */
+bool Dkc2SdlPresenterPresentHd(Dkc2SdlPresenter *presenter,
+                               const Dkc2HdScene *scene,
+                               Dkc2SdlOverlayDraw overlay_draw,
+                               void *overlay_user);
 void Dkc2SdlPresenterSetTitle(Dkc2SdlPresenter *presenter,
                               const char *title);
 /* Select the upscaler; Reconstruct silently falls back to the sampler

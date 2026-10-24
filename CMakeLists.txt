@@ -335,6 +335,7 @@ if(DKC2_BUILD_SNESRECOMP)
         runner/desktop_crt.c
         runner/desktop_fps.c
         runner/desktop_input.c
+        runner/input_playback.c
         runner/input_recording.c
         runner/desktop_launcher.c
         runner/desktop_overlay.cpp

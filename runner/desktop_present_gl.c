@@ -203,7 +203,8 @@ bool Dkc2DesktopGlPresent(Dkc2DesktopGlPresenter *presenter,
   glLoadIdentity();
   glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
   state->pipeline.linear_filter = linear_filter;
-  Dkc2GlPipelineRender(&state->pipeline, 0, source_width, source_height,
+  Dkc2GlPipelineRender(&state->pipeline, 0, state->texture, source_width,
+                       source_height,
                        client_width, client_height, &viewport);
   glBindTexture(GL_TEXTURE_2D, 0);
   glDisable(GL_TEXTURE_2D);
