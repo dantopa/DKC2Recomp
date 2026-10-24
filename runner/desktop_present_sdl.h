@@ -42,6 +42,9 @@ enum {
    * most three quarters full. */
   kDkc2HdImageSlots = 8192,
   kDkc2HdImageMax = kDkc2HdImageSlots / 4 * 3,
+  /* Sets of 1x input textures used in turn, so a scene never rewrites
+   * textures the GPU may still be reading for an earlier one. */
+  kDkc2HdInputSets = 3,
 };
 
 typedef struct Dkc2HdScene Dkc2HdScene;
@@ -110,8 +113,9 @@ typedef struct Dkc2SdlPresenter {
    * scene hd_serial, which the display chain then shows like an uploaded
    * frame. */
   unsigned int hd_program[kDkc2HdPassCount];
-  unsigned int hd_input[4];
-  int hd_input_width;
+  unsigned int hd_input[kDkc2HdInputSets][4];
+  int hd_input_width[kDkc2HdInputSets];
+  unsigned int hd_input_set; /* the set the next scene fills */
   Dkc2GlTarget hd_layer;
   Dkc2GlTarget hd_output;
   uint64_t hd_serial;
