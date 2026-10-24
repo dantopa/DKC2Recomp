@@ -493,3 +493,15 @@ Exit criterion: reach and render the title screen with correct audio and input.
 - [x] Verify drop/throw and both players walking/jumping afterward.
 - [x] Verify Diddy/Dixie and imported Donkey/Kiddy with real input replays.
 - [ ] Full-game team-throw terrain/enemy and unusual animal-transition coverage.
+
+## HD presentation (fork)
+
+- [x] HD compositor with pack art, loose objects and the learned filter.
+- [x] Tile backgrounds (BG2/BG3 cells) and the GPU presenter.
+- [x] Sprite verification that accounts for objects drawn over a record.
+- [x] SDL3 desktop host on macOS (SDL2 kept as a fallback and on Windows/Linux).
+- [ ] Larger learned filter (cascade, wider tables or a small distilled CNN).
+- [ ] Taller view: draw rows above and below the 224-line camera from the
+  level map, as widescreen does for the sides. Needs enemy activation past
+  the native camera (or objects pop in at the edges) and per-level checks
+  where the extra rows reveal what the design hides.

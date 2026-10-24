@@ -54,6 +54,11 @@
   frame on the world map).
 - The GPU HD presenter no longer stalls rewriting textures the GPU is still
   reading: composition peaked at 27 ms on some frames, now 3.6 ms.
+- The SDL host builds against SDL3 on macOS (SDL2 stays available with
+  `-DSNESRECOMP_SDL_BACKEND=SDL2`, and is still what Windows and Linux use).
+  `build_macos.sh` now needs SDL3 and bundles `libSDL3.0.dylib`; before it
+  bundled the Homebrew `sdl2-compat` shim, which loads SDL3 from Homebrew
+  at run time and so did not work on a Mac without it.
 
 ## 0.0.8 (alpha) - 2026-09-13
 

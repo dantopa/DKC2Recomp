@@ -11,9 +11,14 @@
 
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
+#include "desktop/sdl_compat.h"
+#if SNESRECOMP_SDL3
+#include "imgui_impl_sdl3.h"
+#define EVENT_SCANCODE(event) ((event)->key.scancode)
+#else
 #include "imgui_impl_sdl2.h"
-
-#include <SDL.h>
+#define EVENT_SCANCODE(event) ((event)->key.keysym.scancode)
+#endif
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -267,8 +272,13 @@ extern "C" bool Dkc2DesktopOverlayInitSdl(Dkc2DesktopOverlay *overlay,
 #else
       "#version 130";
 #endif
+#if SNESRECOMP_SDL3
+  if (!ImGui_ImplSDL3_InitForOpenGL(static_cast<SDL_Window *>(window),
+                                    gl_context) ||
+#else
   if (!ImGui_ImplSDL2_InitForOpenGL(static_cast<SDL_Window *>(window),
                                     gl_context) ||
+#endif
       !ImGui_ImplOpenGL3_Init(glsl_version)) {
     if (ImGui::GetCurrentContext()) ImGui::DestroyContext();
     return false;
@@ -345,8 +355,13 @@ extern "C" void Dkc2DesktopOverlayDestroy(Dkc2DesktopOverlay *overlay) {
     } else
 #endif
       ImGui_ImplOpenGL3_Shutdown();
-    if (overlay->platform == kDkc2OverlayPlatformSdl)
+    if (overlay->platform == kDkc2OverlayPlatformSdl) {
+#if SNESRECOMP_SDL3
+      ImGui_ImplSDL3_Shutdown();
+#else
       ImGui_ImplSDL2_Shutdown();
+#endif
+    }
     ImGui::DestroyContext();
   }
   delete overlay;
@@ -360,25 +375,29 @@ extern "C" bool Dkc2DesktopOverlayProcessSdlEvent(
   const SDL_Event *event = static_cast<const SDL_Event *>(event_pointer);
   if (overlay->model.open && IsKeyboardCapture(overlay) &&
       event->type == SDL_KEYDOWN && event->key.repeat == 0) {
-    if (event->key.keysym.scancode == SDL_SCANCODE_ESCAPE)
+    if (EVENT_SCANCODE(event) == SDL_SCANCODE_ESCAPE)
       Dkc2DesktopOverlayModelCancelBindingCapture(&overlay->model);
     else
-      AcceptKeyBinding(overlay, event->key.keysym.scancode);
+      AcceptKeyBinding(overlay, EVENT_SCANCODE(event));
     return true;
   }
   if (event->type == SDL_KEYDOWN && event->key.repeat == 0 &&
-      event->key.keysym.scancode == SDL_SCANCODE_ESCAPE) {
+      EVENT_SCANCODE(event) == SDL_SCANCODE_ESCAPE) {
     Dkc2DesktopOverlayModelToggle(&overlay->model);
     return true;
   }
   if (event->type == SDL_CONTROLLERBUTTONDOWN &&
-      event->cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE) {
+      SNESRECOMP_SDL_EVENT_BUTTON(*event) == SDL_CONTROLLER_BUTTON_GUIDE) {
     if (overlay->model.open && IsPadCapture(overlay)) return true;
     Dkc2DesktopOverlayModelToggle(&overlay->model);
     return true;
   }
   if (overlay->model.open) {
+#if SNESRECOMP_SDL3
+    ImGui_ImplSDL3_ProcessEvent(event);
+#else
     ImGui_ImplSDL2_ProcessEvent(event);
+#endif
     return true;
   }
   return false;
@@ -1339,7 +1358,11 @@ static void RenderOverlayFrame(Dkc2DesktopOverlay *overlay, int width, int heigh
 #endif
     ImGui_ImplOpenGL3_NewFrame();
   if (overlay->platform == kDkc2OverlayPlatformSdl) {
+#if SNESRECOMP_SDL3
+    ImGui_ImplSDL3_NewFrame();
+#else
     ImGui_ImplSDL2_NewFrame();
+#endif
     ImGui::NewFrame();
   } else {
     ImGuiIO &io = ImGui::GetIO();

@@ -145,27 +145,39 @@ if(DKC2_BUILD_SNESRECOMP)
         message(FATAL_ERROR
             "snesrecomp is not initialized; run git submodule update --init --recursive")
     endif()
+    # The SDL host defaults to SDL3 on macOS; elsewhere it stays on SDL2 until
+    # the Windows input and menu code is ported. This must be set before
+    # runner.cmake, which caches its own SDL3 default.
+    if(NOT APPLE)
+        set(SNESRECOMP_SDL_BACKEND SDL2 CACHE STRING
+            "Desktop SDL backend (SDL3 or SDL2)")
+    endif()
     include(${SNESRECOMP_ROOT}/runner/runner.cmake)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ProjectKongsPpu.cmake)
-    # SDL2 and recomp-ui are portable dependencies shared by the launcher and
-    # the gameplay host on Windows, Linux, and macOS. Prefer a package config
-    # (vcpkg/Homebrew commonly provide one), then accept a distribution module.
-    find_package(SDL2 CONFIG QUIET)
-    if(NOT TARGET SDL2::SDL2)
-        if(NOT DKC2_FETCH_SDL2)
-            message(FATAL_ERROR
-                "SDL2 was not found. Install SDL2 or configure with DKC2_FETCH_SDL2=ON")
-        endif()
-        include(FetchContent)
-        set(SDL2_DISABLE_INSTALL ON CACHE BOOL "" FORCE)
-        set(SDL_TEST OFF CACHE BOOL "" FORCE)
-        FetchContent_Declare(SDL2
-            GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-            GIT_TAG release-2.30.9
-            GIT_SHALLOW TRUE)
-        FetchContent_MakeAvailable(SDL2)
+    if(WIN32 AND SNESRECOMP_SDL_BACKEND STREQUAL "SDL3")
+        message(FATAL_ERROR "The Windows hosts support SNESRECOMP_SDL_BACKEND=SDL2 only")
     endif()
-    set(SNESRECOMP_SDL_BACKEND SDL2)
+    # SDL and recomp-ui are portable dependencies shared by the launcher and
+    # the gameplay host on Windows, Linux, and macOS. SDL3 is found by
+    # snesrecomp_target_sdl(); for SDL2 prefer a package config
+    # (vcpkg/Homebrew commonly provide one), then accept a distribution module.
+    if(SNESRECOMP_SDL_BACKEND STREQUAL "SDL2")
+        find_package(SDL2 CONFIG QUIET)
+        if(NOT TARGET SDL2::SDL2)
+            if(NOT DKC2_FETCH_SDL2)
+                message(FATAL_ERROR
+                    "SDL2 was not found. Install SDL2 or configure with DKC2_FETCH_SDL2=ON")
+            endif()
+            include(FetchContent)
+            set(SDL2_DISABLE_INSTALL ON CACHE BOOL "" FORCE)
+            set(SDL_TEST OFF CACHE BOOL "" FORCE)
+            FetchContent_Declare(SDL2
+                GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+                GIT_TAG release-2.30.9
+                GIT_SHALLOW TRUE)
+            FetchContent_MakeAvailable(SDL2)
+        endif()
+    endif()
     include(${CMAKE_CURRENT_SOURCE_DIR}/recomp-ui/recomp_ui.cmake)
     file(GLOB DKC2_SNESRECOMP_GEN_SOURCES CONFIGURE_DEPENDS
         "${DKC2_SNESRECOMP_GEN_DIR}/*.c")
@@ -321,7 +333,7 @@ if(DKC2_BUILD_SNESRECOMP)
     endif()
 
     # Cross-platform playable host. The established Win32 executable remains
-    # available while this SDL2 host is validated on each native platform.
+    # available while this SDL host is validated on each native platform.
     add_executable(dkc2_snesrecomp_sdl
         ${SNESRECOMP_RUNNER_SOURCES}
         ${DKC2_SNESRECOMP_GEN_SOURCES}
@@ -377,11 +389,10 @@ if(DKC2_BUILD_SNESRECOMP)
         SNESRECOMP_REVERSE_DEBUG=0
         SNESRECOMP_EXTERNAL_RAM_ROUTINE_GUARDS=1
         SYSTEM_VOLUME_MIXER_AVAILABLE=0
-        SDL_MAIN_HANDLED
         DKC2_REAL_HOST_REPORT=1)
     target_link_libraries(dkc2_snesrecomp_sdl PRIVATE
-        ${SNESRECOMP_RUNNER_LIBRARIES}
-        SDL2::SDL2)
+        ${SNESRECOMP_RUNNER_LIBRARIES})
+    snesrecomp_target_sdl(dkc2_snesrecomp_sdl)
     if(APPLE)
         target_link_libraries(dkc2_snesrecomp_sdl PRIVATE
             "-framework AppKit"

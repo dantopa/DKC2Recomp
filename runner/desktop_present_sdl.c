@@ -4,9 +4,13 @@
 #include "dkc2_hd.h"
 #include "desktop_viewport.h"
 
-#include <SDL.h>
+#include "desktop/sdl_compat.h"
+#if SNESRECOMP_SDL3
+#include <SDL3/SDL_opengl.h>
+#else
 #include <SDL_opengl.h>
 #include <SDL_syswm.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -576,7 +580,24 @@ static void SetError(char *error, size_t capacity, const char *message) {
 
 static bool SetSdlSwapInterval(void *user, int interval) {
   (void)user;
+#if SNESRECOMP_SDL3
+  return SDL_GL_SetSwapInterval(interval);
+#else
   return SDL_GL_SetSwapInterval(interval) == 0;
+#endif
+}
+
+static bool MakeSdlContextCurrent(SDL_Window *window, SDL_GLContext context) {
+#if SNESRECOMP_SDL3
+  return SDL_GL_MakeCurrent(window, context);
+#else
+  return SDL_GL_MakeCurrent(window, context) == 0;
+#endif
+}
+
+/* SDL3 returns SDL_FunctionPointer; the shared pipeline loader takes void *. */
+static void *LoadSdlGlProcedure(const char *name) {
+  return (void *)SDL_GL_GetProcAddress(name);
 }
 
 static bool EnvironmentEnabled(const char *name) {
@@ -704,22 +725,22 @@ bool Dkc2SdlPresenterInit(Dkc2SdlPresenter *presenter, int window_scale,
   (void)SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
                             SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
   (void)SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-  Uint32 flags =
+  SDL_WindowFlags flags =
       SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_OPENGL;
-  flags |= hidden ? SDL_WINDOW_HIDDEN : SDL_WINDOW_SHOWN;
-  if (fullscreen) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+  if (hidden) flags |= SDL_WINDOW_HIDDEN;
+  if (fullscreen) flags |= SNESRECOMP_SDL_WINDOW_FULLSCREEN_DESKTOP;
   int base_height = 240;
   int base_width =
       source_width * 7 * base_height / (source_height * 6);
-  SDL_Window *window = SDL_CreateWindow(
-      DKC2_PRODUCT_TITLE, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-      base_width * window_scale, base_height * window_scale, flags);
+  SDL_Window *window = snesrecomp_sdl_create_window(
+      DKC2_PRODUCT_TITLE, base_width * window_scale,
+      base_height * window_scale, flags);
   if (!window) {
     SetError(error, error_capacity, SDL_GetError());
     return false;
   }
   SDL_GLContext context = SDL_GL_CreateContext(window);
-  if (!context || SDL_GL_MakeCurrent(window, context) != 0) {
+  if (!context || !MakeSdlContextCurrent(window, context)) {
     SetError(error, error_capacity, SDL_GetError());
     if (context) SDL_GL_DeleteContext(context);
     SDL_DestroyWindow(window);
@@ -760,7 +781,8 @@ bool Dkc2SdlPresenterInit(Dkc2SdlPresenter *presenter, int window_scale,
   glBindTexture(GL_TEXTURE_2D, 0);
   const GLubyte *version = glGetString(GL_VERSION);
   (void)snprintf(presenter->backend, sizeof presenter->backend,
-                 "SDL2/OpenGL %s; vsync=%s; pacing=%s",
+                 "%s/OpenGL %s; vsync=%s; pacing=%s",
+                 SNESRECOMP_SDL3 ? "SDL3" : "SDL2",
                  version ? (const char *)version : "unknown",
                  Dkc2DesktopVsyncStatusName(presenter->vsync_status),
                  presenter->software_paced ? "mach" : "swap");
@@ -776,7 +798,7 @@ bool Dkc2SdlPresenterInit(Dkc2SdlPresenter *presenter, int window_scale,
   presenter->reconstruct_shading = 0.6f;
   presenter->display = kDkc2DisplayFlat;
   Dkc2CrtSettingsDefault(&presenter->crt);
-  Dkc2GlPipelineInitialize(presenter, SDL_GL_GetProcAddress);
+  Dkc2GlPipelineInitialize(presenter, LoadSdlGlProcedure);
   return true;
 }
 
@@ -854,7 +876,8 @@ void Dkc2SdlPresenterDrawableSize(Dkc2SdlPresenter *presenter, int *width,
   if (width) *width = 0;
   if (height) *height = 0;
   if (!presenter || !presenter->window) return;
-  SDL_GL_GetDrawableSize((SDL_Window *)presenter->window, width, height);
+  snesrecomp_sdl_get_drawable_size((SDL_Window *)presenter->window, width,
+                                   height);
 }
 
 void Dkc2SdlPresenterArmCapture(Dkc2SdlPresenter *presenter, uint8_t *rgb,
@@ -1086,7 +1109,7 @@ static void ShowFrame(Dkc2SdlPresenter *presenter, GLuint source,
   SDL_Window *window = (SDL_Window *)presenter->window;
   int output_width = 0;
   int output_height = 0;
-  SDL_GL_GetDrawableSize(window, &output_width, &output_height);
+  snesrecomp_sdl_get_drawable_size(window, &output_width, &output_height);
   Dkc2DesktopViewport viewport;
   if (!Dkc2DesktopComputeViewport(output_width, output_height,
                                   source_width, source_height, &viewport))
@@ -1167,8 +1190,8 @@ bool Dkc2SdlPresenterPresent(Dkc2SdlPresenter *presenter,
       !presenter->texture || !pixels || source_width <= 0 ||
       source_height <= 0)
     return false;
-  if (SDL_GL_MakeCurrent((SDL_Window *)presenter->window,
-                         (SDL_GLContext)presenter->gl_context) != 0)
+  if (!MakeSdlContextCurrent((SDL_Window *)presenter->window,
+                             (SDL_GLContext)presenter->gl_context))
     return false;
   glBindTexture(GL_TEXTURE_2D, presenter->texture);
   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
@@ -1432,8 +1455,8 @@ bool Dkc2SdlPresenterPresentHd(Dkc2SdlPresenter *presenter,
   if (!Dkc2SdlPresenterHdAvailable(presenter) || !presenter->window ||
       !presenter->gl_context || !scene)
     return false;
-  if (SDL_GL_MakeCurrent((SDL_Window *)presenter->window,
-                         (SDL_GLContext)presenter->gl_context) != 0)
+  if (!MakeSdlContextCurrent((SDL_Window *)presenter->window,
+                             (SDL_GLContext)presenter->gl_context))
     return false;
   if (scene->serial != presenter->hd_serial && !ComposeHd(presenter, scene))
     return false;
@@ -1453,19 +1476,24 @@ bool Dkc2SdlPresenterSetFullscreen(Dkc2SdlPresenter *presenter,
                                    bool fullscreen) {
   if (!presenter || !presenter->window)
     return false;
+#if SNESRECOMP_SDL3
+  return SDL_SetWindowFullscreen((SDL_Window *)presenter->window, fullscreen);
+#else
   Uint32 flags = fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0;
   return SDL_SetWindowFullscreen((SDL_Window *)presenter->window, flags) == 0;
+#endif
 }
 
 bool Dkc2SdlPresenterIsFullscreen(const Dkc2SdlPresenter *presenter) {
   if (!presenter || !presenter->window)
     return false;
   return (SDL_GetWindowFlags((SDL_Window *)presenter->window) &
-          (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0;
+          (SDL_WINDOW_FULLSCREEN | SNESRECOMP_SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0;
 }
 
 const char *Dkc2SdlPresenterBackend(const Dkc2SdlPresenter *presenter) {
-  return presenter && presenter->backend[0] ? presenter->backend : "SDL2";
+  return presenter && presenter->backend[0] ? presenter->backend
+                                            : SNESRECOMP_SDL3 ? "SDL3" : "SDL2";
 }
 
 Dkc2DesktopVsyncStatus Dkc2SdlPresenterVsyncStatus(
@@ -1476,6 +1504,11 @@ Dkc2DesktopVsyncStatus Dkc2SdlPresenterVsyncStatus(
 
 void *Dkc2SdlPresenterNativeWindow(const Dkc2SdlPresenter *presenter) {
   if (!presenter || !presenter->window) return NULL;
+#if SNESRECOMP_SDL3
+  return SDL_GetPointerProperty(
+      SDL_GetWindowProperties((SDL_Window *)presenter->window),
+      SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, NULL);
+#else
   SDL_SysWMinfo info;
   SDL_VERSION(&info.version);
   if (!SDL_GetWindowWMInfo((SDL_Window *)presenter->window, &info))
@@ -1484,6 +1517,7 @@ void *Dkc2SdlPresenterNativeWindow(const Dkc2SdlPresenter *presenter) {
   if (info.subsystem == SDL_SYSWM_COCOA) return (void *)info.info.cocoa.window;
 #endif
   return NULL;
+#endif
 }
 
 bool Dkc2SdlPresenterUsesSoftwarePacing(
@@ -1521,8 +1555,8 @@ void Dkc2GlPipelineDestroy(Dkc2SdlPresenter *presenter) {
 void Dkc2SdlPresenterDestroy(Dkc2SdlPresenter *presenter) {
   if (!presenter) return;
   if (presenter->window && presenter->gl_context)
-    (void)SDL_GL_MakeCurrent((SDL_Window *)presenter->window,
-                            (SDL_GLContext)presenter->gl_context);
+    (void)MakeSdlContextCurrent((SDL_Window *)presenter->window,
+                                (SDL_GLContext)presenter->gl_context);
   if (presenter->gl_context) Dkc2GlPipelineDestroy(presenter);
   if (presenter->texture) glDeleteTextures(1, &presenter->texture);
   if (presenter->gl_context)

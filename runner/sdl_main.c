@@ -3,7 +3,7 @@
 #ifndef SDL_MAIN_HANDLED
 #define SDL_MAIN_HANDLED
 #endif
-#include <SDL.h>
+#include "desktop/sdl_compat.h"
 
 #include "dkc2_game.h"
 #include "dkc2_coop.h"
@@ -91,6 +91,9 @@ static const double kDisplayTickTimeoutSeconds = 0.05;
 typedef struct SdlHost {
   Dkc2SdlPresenter presenter;
   Dkc2DesktopColorFilter color_filter;
+#if SNESRECOMP_SDL3
+  SDL_AudioStream *audio_stream;
+#endif
   SDL_AudioDeviceID audio_device;
   SDL_GameController *controllers[kMaximumControllers];
   bool haptic_pulse_active;
@@ -229,6 +232,30 @@ static bool WriteFramePpm(const char *path, const uint8_t *pixels) {
   return ok;
 }
 
+#if SNESRECOMP_SDL3
+#define EVENT_SCANCODE(event) ((event).key.scancode)
+#else
+#define EVENT_SCANCODE(event) ((event).key.keysym.scancode)
+#endif
+
+static bool ControllerHasRumble(SDL_GameController *controller) {
+#if SNESRECOMP_SDL3
+  return SDL_GetBooleanProperty(SDL_GetGamepadProperties(controller),
+                                SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
+#else
+  return SDL_GameControllerHasRumble(controller);
+#endif
+}
+
+static bool RumbleController(SDL_GameController *controller, Uint16 low,
+                             Uint16 high, Uint32 milliseconds) {
+#if SNESRECOMP_SDL3
+  return SDL_RumbleGamepad(controller, low, high, milliseconds);
+#else
+  return SDL_GameControllerRumble(controller, low, high, milliseconds) == 0;
+#endif
+}
+
 static SDL_GameController *HapticController(SdlHost *host, int player) {
   int target = Dkc2GamepadIndexForPlayer(host->player_source, player);
   if (target < 0) return NULL;
@@ -244,9 +271,9 @@ static void PulseHaptics(SdlHost *host, unsigned players, bool test) {
   if (!Dkc2LauncherHaptics() || !(SDL_GetWindowFlags((SDL_Window *)host->presenter.window) & SDL_WINDOW_INPUT_FOCUS)) return;
   for (int player = 0; player < 2; ++player) {
     SDL_GameController *controller = HapticController(host, player);
-    if ((players & (1u << player)) && controller && SDL_GameControllerHasRumble(controller)) {
-      if (SDL_GameControllerRumble(controller, test ? 0x5000 : 0x2800,
-                                  test ? 0x7000 : 0x5000, test ? 500 : 55) == 0)
+    if ((players & (1u << player)) && controller && ControllerHasRumble(controller)) {
+      if (RumbleController(controller, test ? 0x5000 : 0x2800,
+                           test ? 0x7000 : 0x5000, test ? 500 : 55))
         host->haptic_pulse_active = true;
     }
   }
@@ -255,11 +282,11 @@ static void PulseHaptics(SdlHost *host, unsigned players, bool test) {
 static void UpdateHaptics(SdlHost *host) {
   bool stop = !Dkc2LauncherHaptics() || !(SDL_GetWindowFlags((SDL_Window *)host->presenter.window) & SDL_WINDOW_INPUT_FOCUS);
   for (int i = 0; stop && host->haptic_pulse_active && i < kMaximumControllers; ++i)
-    if (host->controllers[i]) (void)SDL_GameControllerRumble(host->controllers[i], 0, 0, 0);
+    if (host->controllers[i]) (void)RumbleController(host->controllers[i], 0, 0, 0);
   if (stop) host->haptic_pulse_active = false;
   for (int player = 0; player < 2; ++player) {
     SDL_GameController *controller = HapticController(host, player);
-    bool supported = controller && SDL_GameControllerHasRumble(controller);
+    bool supported = controller && ControllerHasRumble(controller);
     Dkc2DesktopOverlaySetHapticsDevice(host->overlay, player,
         controller ? (supported ? SDL_GameControllerName(controller) : "Gamepad has no rumble") : NULL, supported);
   }
@@ -268,7 +295,7 @@ static void UpdateHaptics(SdlHost *host) {
 static void CloseControllers(SdlHost *host) {
   for (int i = 0; i < kMaximumControllers; i++) {
     if (host->controllers[i]) {
-      (void)SDL_GameControllerRumble(host->controllers[i], 0, 0, 0);
+      (void)RumbleController(host->controllers[i], 0, 0, 0);
       SDL_GameControllerClose(host->controllers[i]);
     }
     host->controllers[i] = NULL;
@@ -278,6 +305,15 @@ static void CloseControllers(SdlHost *host) {
 static void RefreshControllers(SdlHost *host) {
   CloseControllers(host);
   int opened = 0;
+#if SNESRECOMP_SDL3
+  int count = 0;
+  SDL_JoystickID *gamepads = SDL_GetGamepads(&count);
+  for (int i = 0; gamepads && i < count && opened < kMaximumControllers; i++) {
+    SDL_Gamepad *controller = SDL_OpenGamepad(gamepads[i]);
+    if (controller) host->controllers[opened++] = controller;
+  }
+  SDL_free(gamepads);
+#else
   for (int device = 0;
        device < SDL_NumJoysticks() && opened < kMaximumControllers;
        device++) {
@@ -285,13 +321,14 @@ static void RefreshControllers(SdlHost *host) {
     SDL_GameController *controller = SDL_GameControllerOpen(device);
     if (controller) host->controllers[opened++] = controller;
   }
+#endif
 }
 
 static void PumpEvents(SdlHost *host) {
   SDL_Event event;
   while (SDL_PollEvent(&event)) {
     if (event.type == SDL_KEYDOWN && event.key.repeat == 0 &&
-        event.key.keysym.scancode == SDL_SCANCODE_ESCAPE &&
+        EVENT_SCANCODE(event) == SDL_SCANCODE_ESCAPE &&
         Dkc2DesktopEscapeExitsFullscreen(
             Dkc2SdlPresenterIsFullscreen(&host->presenter),
             Dkc2DesktopOverlayIsOpen(host->overlay))) {
@@ -314,7 +351,7 @@ static void PumpEvents(SdlHost *host) {
         Dkc2DesktopOverlayProcessSdlEvent(host->overlay, &event);
     if (consumed) continue;
     if (event.type == SDL_KEYDOWN && !event.key.repeat) {
-      const SDL_Scancode key = event.key.keysym.scancode;
+      const SDL_Scancode key = EVENT_SCANCODE(event);
       if (key == SDL_SCANCODE_F5) host->hd_reload = true;
       if (key == SDL_SCANCODE_F6) host->hd_inspector = !host->hd_inspector;
       if (key == SDL_SCANCODE_F7) host->hd_copy_name = true;
@@ -323,11 +360,15 @@ static void PumpEvents(SdlHost *host) {
         continue;
     }
     if (event.type == SDL_KEYDOWN && !event.key.repeat &&
-        event.key.keysym.scancode > SDL_SCANCODE_UNKNOWN &&
-        event.key.keysym.scancode < SDL_NUM_SCANCODES)
-      host->key_taps[event.key.keysym.scancode] = 1;
+        EVENT_SCANCODE(event) > SDL_SCANCODE_UNKNOWN &&
+        EVENT_SCANCODE(event) < SDL_NUM_SCANCODES)
+      host->key_taps[EVENT_SCANCODE(event)] = 1;
+#if SNESRECOMP_SDL3
+    if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST)
+#else
     if (event.type == SDL_WINDOWEVENT &&
         event.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+#endif
       memset(host->key_taps, 0, sizeof host->key_taps);
     if (event.type == SDL_QUIT) host->running = false;
     if (event.type == SDL_CONTROLLERDEVICEADDED ||
@@ -373,7 +414,7 @@ static uint8_t ReadTrigger(SDL_GameController *controller,
 
 static bool IsSdlScancodePressed(int scancode, void *context) {
   const SdlHost *host = (const SdlHost *)context;
-  const Uint8 *keys = SDL_GetKeyboardState(NULL);
+  const Uint8 *keys = snesrecomp_sdl_get_keyboard_state();
   return host && scancode > SDL_SCANCODE_UNKNOWN && scancode < SDL_NUM_SCANCODES &&
       (keys[scancode] || host->key_taps[scancode]);
 }
@@ -391,7 +432,7 @@ static SdlControls ReadControlsImpl(SdlHost *host) {
     host->menu_chord_previous = false;
     return controls;
   }
-  const Uint8 *keys = SDL_GetKeyboardState(NULL);
+  const Uint8 *keys = snesrecomp_sdl_get_keyboard_state();
   if (keys[SDL_SCANCODE_LALT] || keys[SDL_SCANCODE_RALT]) return controls;
   uint32_t keyboard[kDkc2DesktopPlayerCount];
   for (int player = 0; player < kDkc2DesktopPlayerCount; player++)
@@ -447,6 +488,31 @@ static SdlControls ReadControls(SdlHost *host) {
 }
 
 static bool InitializeAudio(SdlHost *host) {
+#if SNESRECOMP_SDL3
+  const SDL_AudioSpec spec = {SDL_AUDIO_S16, kAudioChannels, kAudioRate};
+  /* The same 1024-frame pull as SDL2; SDL may round it for the device. */
+  (void)SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "1024");
+  host->audio_stream = SDL_OpenAudioDeviceStream(
+      SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+  if (!host->audio_stream) return false;
+  host->audio_device = SDL_GetAudioStreamDevice(host->audio_stream);
+  SDL_AudioSpec device_spec;
+  int device_frames = 0;
+  if (!SDL_GetAudioDeviceFormat(host->audio_device, &device_spec,
+                                &device_frames) ||
+      device_frames <= 0 || device_spec.freq <= 0) {
+    SDL_DestroyAudioStream(host->audio_stream);
+    host->audio_stream = NULL;
+    host->audio_device = 0;
+    return false;
+  }
+  snesrecomp_sdl_pause_audio_device(host->audio_device, false);
+  host->audio_available = true;
+  /* The stream queues cartridge-rate frames; express the device pull in
+   * them so the fill target keeps its SDL2 meaning. */
+  host->audio_device_frames =
+      (int)((int64_t)device_frames * kAudioRate / device_spec.freq);
+#else
   SDL_AudioSpec desired;
   SDL_AudioSpec obtained;
   SDL_zero(desired);
@@ -469,6 +535,7 @@ static bool InitializeAudio(SdlHost *host) {
   SDL_PauseAudioDevice(host->audio_device, 0);
   host->audio_available = true;
   host->audio_device_frames = (int)obtained.samples;
+#endif
   host->audio_fill_average = -1.0;
   host->audio_primed = false;
   Dkc2AudioStretchReset(&host->audio_stretch);
@@ -477,8 +544,14 @@ static bool InitializeAudio(SdlHost *host) {
 
 static double AudioQueuedFrames(const SdlHost *host) {
   if (!host->audio_available) return 0.0;
+#if SNESRECOMP_SDL3
+  const int queued = SDL_GetAudioStreamQueued(host->audio_stream);
+  if (queued <= 0) return 0.0;
+  return (double)((size_t)queued / (kAudioChannels * sizeof(int16_t)));
+#else
   return (double)(SDL_GetQueuedAudioSize(host->audio_device) /
                   (kAudioChannels * sizeof(int16_t)));
+#endif
 }
 
 /* The queue fill rate control aims for: half a device pull, so the queue
@@ -504,12 +577,21 @@ static bool QueueAudio(SdlHost *host, const int16_t *samples, int frames,
           (int16_t)(((int)output[i] * host->audio_volume) / 100);
     output = host->scaled_audio;
   }
+#if SNESRECOMP_SDL3
+  return SDL_PutAudioStreamData(host->audio_stream, output,
+                                (int)(sample_count * sizeof output[0]));
+#else
   return SDL_QueueAudio(host->audio_device, output,
                         (Uint32)(sample_count * sizeof output[0])) == 0;
+#endif
 }
 
 static void ResetAudio(SdlHost *host) {
+#if SNESRECOMP_SDL3
+  if (host->audio_stream) (void)SDL_ClearAudioStream(host->audio_stream);
+#else
   if (host->audio_device) SDL_ClearQueuedAudio(host->audio_device);
+#endif
   host->audio_fill_average = -1.0;
   host->audio_primed = false;
   Dkc2AudioStretchReset(&host->audio_stretch);
@@ -521,7 +603,12 @@ static void ShutdownHost(SdlHost *host) {
   host->menu = NULL;
 #endif
   CloseControllers(host);
+#if SNESRECOMP_SDL3
+  /* Destroying a device stream also closes its device. */
+  if (host->audio_stream) SDL_DestroyAudioStream(host->audio_stream);
+#else
   if (host->audio_device) SDL_CloseAudioDevice(host->audio_device);
+#endif
   Dkc2DesktopOverlayDestroy(host->overlay);
   host->overlay = NULL;
   Dkc2SdlPresenterDestroy(&host->presenter);
@@ -740,7 +827,14 @@ static void UpdateHdInspector(SdlHost *host) {
   SDL_Window *window = (SDL_Window *)host->presenter.window;
   int mouse_x = 0, mouse_y = 0, window_width = 0, window_height = 0;
   int drawable_width = 0, drawable_height = 0;
+#if SNESRECOMP_SDL3
+  float mouse_fx = 0.0f, mouse_fy = 0.0f;
+  (void)SDL_GetMouseState(&mouse_fx, &mouse_fy);
+  mouse_x = (int)mouse_fx;
+  mouse_y = (int)mouse_fy;
+#else
   SDL_GetMouseState(&mouse_x, &mouse_y);
+#endif
   SDL_GetWindowSize(window, &window_width, &window_height);
   Dkc2SdlPresenterDrawableSize(&host->presenter, &drawable_width,
                                &drawable_height);
@@ -1035,8 +1129,14 @@ static int RunGame(const char *rom_path,
     ShowError("Unable to initialize the selected screen-color filter");
     return 4;
   }
-  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER |
-               SDL_INIT_TIMER) != 0) {
+#if SNESRECOMP_SDL3
+  const Uint32 sdl_subsystems =
+      SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD;
+#else
+  const Uint32 sdl_subsystems = SDL_INIT_VIDEO | SDL_INIT_AUDIO |
+                                SDL_INIT_GAMECONTROLLER | SDL_INIT_TIMER;
+#endif
+  if (!snesrecomp_sdl_init(sdl_subsystems)) {
     free(rom);
     Dkc2DesktopColorFilterDestroy(&host.color_filter);
     ShowError(SDL_GetError());
@@ -1435,7 +1535,7 @@ static int RunGame(const char *rom_path,
     if (overlay_open != previous_overlay_open) {
       ResetAudio(&host);
       if (host.audio_device)
-        SDL_PauseAudioDevice(host.audio_device, overlay_open ? 1 : 0);
+        snesrecomp_sdl_pause_audio_device(host.audio_device, overlay_open);
       audio_fraction = 0.0;
       deadline = SDL_GetPerformanceCounter();
       deadline_fraction = 0.0;
