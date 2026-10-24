@@ -6518,3 +6518,15 @@ per-record counts instead of one pass per record: preparing sprites and
 loose objects went from 651 to 146 microseconds per frame on the map and
 from 269 to 102 on Pirate Panic. The goldens were regenerated (the torches,
 and the bee art replaced in the pack).
+
+Performance pass, first measurements on an M4 (60 Hz, windowed, HD 4x with
+the learned filter, the user's pack and save). The host presented one frame
+per display refresh in over 6000 frames of both routes; emulation plus scene
+building took 2.4 ms per frame typically and 8.5 ms at worst, and the
+headless CPU compositor (12.4 ms) is not used by the desktop host. The one
+stall found was in the presenter: the 1x input textures were rewritten every
+scene while the GPU could still be reading them, and the driver blocked for
+up to 27 ms. They now rotate across three sets (worst composition 3.6 ms).
+A/B pacing runs were too noisy to show a visible difference. The quad pass
+also sampled an unbound tile-mask unit in scenes without tiles; it is now
+always bound.

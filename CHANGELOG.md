@@ -52,6 +52,8 @@
   title words) are drawn with their art instead of falling back to the 1x
   frame, and verifying sprites is cheaper (0.15 ms instead of 0.65 ms per
   frame on the world map).
+- The GPU HD presenter no longer stalls rewriting textures the GPU is still
+  reading: composition peaked at 27 ms on some frames, now 3.6 ms.
 
 ## 0.0.8 (alpha) - 2026-09-13
 
