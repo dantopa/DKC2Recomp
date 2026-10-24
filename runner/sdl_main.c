@@ -1548,12 +1548,25 @@ static int RunGame(const char *rom_path,
                                        dh);
         }
       }
-      const bool presented =
-          host.hd_scene
-              ? Dkc2SdlPresenterPresentHd(&host.presenter, host.hd_scene,
-                                          Dkc2DesktopOverlayRenderOpenGl,
-                                          host.overlay)
-              : present_pixels &&
+      bool presented = false;
+      if (host.hd_scene) {
+        presented = Dkc2SdlPresenterPresentHd(&host.presenter, host.hd_scene,
+                                              Dkc2DesktopOverlayRenderOpenGl,
+                                              host.overlay);
+        if (!presented) {
+          /* Show the authentic frame now and compose on the CPU from the
+           * next frame on. */
+          fprintf(stderr, "warning: GPU HD composition failed; using the "
+                          "CPU compositor\n");
+          host.hd_gpu = false;
+          host.hd_scene = NULL;
+          present_pixels = Dkc2DesktopColorFilterApply(
+              &host.color_filter, host.pixels, host.filtered_pixels,
+              Dkc2VideoPixelCount());
+        }
+      }
+      if (!host.hd_scene)
+        presented = present_pixels &&
                     Dkc2SdlPresenterPresent(&host.presenter, present_pixels,
                                             present_width, present_height,
                                             Dkc2DesktopOverlayRenderOpenGl,

@@ -58,7 +58,7 @@ next, lighting and depth effects possible.
 | Kongs and objects | Original pixels | Full-resolution redraws (with a local pack) |
 | Title screen | Original | Redrawn HD art (with a local pack) |
 | Edges when scaled | Blocky or blurred | Smooth without ringing halos |
-| CPU per frame at 4x (Apple M4, whole game, in level) | n/a | ~4 ms with GPU composition (~9 ms on the CPU) |
+| CPU per frame at 4x (Apple M4, whole game, recorded Pirate Panic route) | n/a | ~4.7 ms with GPU composition (~9.5 ms on the CPU) |
 
 ## Status
 

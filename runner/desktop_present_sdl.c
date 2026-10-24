@@ -1199,14 +1199,10 @@ static bool PrepareHdTargets(Dkc2SdlPresenter *presenter, int width,
 }
 
 static void UploadHdInput(GLuint texture, const uint32_t *pixels, int width,
-                          int height, bool resize) {
+                          int height) {
   glBindTexture(GL_TEXTURE_2D, texture);
-  if (resize)
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_BGRA,
-                 GL_UNSIGNED_BYTE, pixels);
-  else
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_BGRA,
-                    GL_UNSIGNED_BYTE, pixels);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_BGRA,
+                  GL_UNSIGNED_BYTE, pixels);
 }
 
 /* The uploaded texture of a scene image, 0 when none can be made. Uploads
@@ -1300,16 +1296,24 @@ static bool ComposeHd(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene) {
   if (!PrepareHdTargets(presenter, width, height, scene->layer != NULL))
     return false;
   presenter->hd_serial = scene->serial;
-  const bool resize = presenter->hd_input_width != scene->width;
-  presenter->hd_input_width = scene->width;
+  /* All three inputs get storage together, so a later scene with a layer
+   * finds its texture sized even when earlier ones had none. */
+  if (presenter->hd_input_width != scene->width) {
+    for (int input = 0; input < 3; input++) {
+      glBindTexture(GL_TEXTURE_2D, presenter->hd_input[input]);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, scene->width, scene->height,
+                   0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
+    }
+    presenter->hd_input_width = scene->width;
+  }
   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
   UploadHdInput(presenter->hd_input[0], scene->base, scene->width,
-                scene->height, resize);
+                scene->height);
   UploadHdInput(presenter->hd_input[1], scene->occlusion, scene->width,
-                scene->height, resize);
+                scene->height);
   if (scene->layer)
     UploadHdInput(presenter->hd_input[2], scene->layer, scene->width,
-                  scene->height, resize);
+                  scene->height);
   glDisable(GL_DEPTH_TEST);
   glDisable(GL_BLEND);
   glEnable(GL_TEXTURE_2D);
