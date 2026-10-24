@@ -31,12 +31,12 @@ enum {
   kScreenSlots = 16,
   /* Frames BG1 must stay unchanged before the dump records it as a screen. */
   kScreenStableFrames = 60,
+  /* Art quads of one frame: every terrain block the frame can overlap, or a
+   * screen. */
+  kArtMax = (kHeight / kBlock + 2) * (kMaxWidth / kBlock + 2) + 1,
 };
 
-typedef struct HdImage {
-  int width, height;
-  uint32_t pixels[];  /* straight-alpha ARGB */
-} HdImage;
+typedef Dkc2HdImage HdImage;
 
 typedef enum PackState {
   kPackUnknown = 0,
@@ -132,6 +132,14 @@ struct Dkc2Hd {
   uint32_t range_high[kMaxPixels];
   /* One premultiplied source line, padded by kTapReach on each side. */
   float premultiplied[(kMaxWidth + 2 * kTapReach) * 4];
+  /* The scene of the last frame (see Dkc2HdScene). */
+  uint32_t occlusion[kMaxPixels];
+  uint32_t layer_source[kMaxPixels];
+  Dkc2HdQuad art[kArtMax];
+  unsigned art_count;
+  Dkc2HdQuad quads[kDkc2NativeSpriteMax];
+  unsigned quad_count;
+  Dkc2HdScene scene;
   uint32_t *output;
 };
 
@@ -335,9 +343,11 @@ void Dkc2HdBeginFrame(Dkc2Hd *hd, Ppu *ppu, int frame_width) {
 }
 
 static HdImage *NewImage(int width, int height) {
+  static uint64_t last_id;
   HdImage *image = (HdImage *)malloc(
       sizeof(HdImage) + sizeof(uint32_t) * (size_t)width * (size_t)height);
   if (image) {
+    image->id = ++last_id;
     image->width = width;
     image->height = height;
   }
@@ -459,6 +469,17 @@ static HdImage *SmoothImage(const Dkc2NativeSpriteFrame *frame, int scale) {
   return image;
 }
 
+/* The decoded frame itself, opaque where it has color. */
+static HdImage *FrameImage(const Dkc2NativeSpriteFrame *frame) {
+  HdImage *image = NewImage(frame->width, frame->height);
+  if (!image)
+    return NULL;
+  for (int i = 0; i < frame->width * frame->height; i++)
+    image->pixels[i] =
+        frame->pixels[i] ? 0xff000000u | Rgb(frame->pixels[i]) : 0;
+  return image;
+}
+
 static uint64_t PaletteKey(const Ppu *ppu, const SpriteState *state) {
   const unsigned palette = (state->sprite.properties >> 9) & 7u;
   uint32_t hash = 2166136261u ^ ppu->brightnessMult[31];
@@ -470,8 +491,11 @@ static uint64_t PaletteKey(const Ppu *ppu, const SpriteState *state) {
          state->sprite.graphic_id;
 }
 
-static const HdImage *SmoothCached(Dkc2Hd *hd, const Ppu *ppu,
-                                   const SpriteState *state) {
+/* The filtered image of the frame in hd->frame. A full cache is flushed at
+ * the start of a frame (the last scene may still use its images), so a
+ * probe here always meets a free slot. */
+static const HdImage *FilteredCached(Dkc2Hd *hd, const Ppu *ppu,
+                                     const SpriteState *state) {
   const uint64_t key = PaletteKey(ppu, state);
   unsigned slot = (unsigned)((key ^ key >> 29) * 0x9e3779b97f4a7c15ull >> 54);
   for (;; slot = (slot + 1) % kCacheSlots) {
@@ -480,11 +504,9 @@ static const HdImage *SmoothCached(Dkc2Hd *hd, const Ppu *ppu,
     if (hd->cache[slot].key == key)
       return hd->cache[slot].image;
   }
-  if (hd->cache_count >= kCacheFlush) {
-    FlushCache(hd);
-    return SmoothCached(hd, ppu, state);
-  }
-  HdImage *image = SmoothImage(&hd->frame, hd->scale);
+  HdImage *image = hd->filter == kDkc2HdFilterSmooth
+                       ? SmoothImage(&hd->frame, hd->scale)
+                       : FrameImage(&hd->frame);
   if (image) {
     hd->cache[slot].key = key;
     hd->cache[slot].image = image;
@@ -582,16 +604,6 @@ static uint32_t Blend(uint32_t under, uint32_t over, unsigned alpha) {
   return result;
 }
 
-static uint8_t BackgroundRank(const Dkc2Hd *hd, size_t i) {
-  uint8_t rank = 0;
-  for (unsigned layer = 0; layer < kBgLayers; layer++) {
-    const uint8_t layer_rank = (uint8_t)(hd->bg[layer][i] >> 24);
-    if (layer_rank > rank)
-      rank = layer_rank;
-  }
-  return rank;
-}
-
 /* Whether the authentic object pixel at i belongs to a replaced record. */
 static bool ReplacedPixel(const Dkc2Hd *hd, size_t i) {
   const unsigned owner = hd->owner[i];
@@ -599,67 +611,84 @@ static bool ReplacedPixel(const Dkc2Hd *hd, size_t i) {
          Rgb(hd->obj[i]) == Rgb(hd->native[i]);
 }
 
-static void DrawSprite(Dkc2Hd *hd, const Ppu *ppu, unsigned k) {
+/* Records sprite-table record k as a quad of its high-resolution image:
+ * pack art, else the filtered ROM frame. */
+static void AddSprite(Dkc2Hd *hd, const Ppu *ppu, unsigned k) {
   const SpriteState *state = &hd->sprites[k];
   const unsigned slot = state->sprite.graphic_id / 4u;
   const unsigned palette = (state->sprite.properties >> 9) & 7u;
   const HdImage *image = PackImage(hd, slot, palette);
   const unsigned brightness = image ? ppu->brightnessMult[31] : 255u;
-  if (!image && hd->filter == kDkc2HdFilterSmooth) {
+  if (!image) {
     if (!Dkc2NativeDecodeSpriteFrame(ppu, &state->sprite, &hd->frame))
       return;
-    image = SmoothCached(hd, ppu, state);
+    image = FilteredCached(hd, ppu, state);
+    if (!image)
+      return;
   }
-  if (!image && !Dkc2NativeDecodeSpriteFrame(ppu, &state->sprite, &hd->frame))
-    return;
-
   const int scale = hd->scale;
-  const int width = state->width * scale, height = state->height * scale;
-  const bool flip_x = (state->sprite.properties & 0x4000u) != 0;
-  const bool flip_y = (state->sprite.properties & 0x8000u) != 0;
+  Dkc2HdQuad *quad = &hd->quads[hd->quad_count++];
+  quad->image = image;
+  quad->width = state->width * scale;
+  quad->height = state->height * scale;
+  quad->flip_x = (state->sprite.properties & 0x4000u) != 0;
+  quad->flip_y = (state->sprite.properties & 0x8000u) != 0;
+  quad->x = quad->flip_x ? (state->sprite.x - state->left) * scale - quad->width
+                         : (state->sprite.x + state->left) * scale;
+  quad->y = quad->flip_y ? (state->sprite.y - state->top) * scale - quad->height
+                         : (state->sprite.y + state->top) * scale;
+  quad->brightness = (uint8_t)brightness;
+  quad->rank = state->rank;
+  quad->index = (uint8_t)k;
+}
+
+/* The occlusion rules of Dkc2HdScene for a sprite quad at 1x pixel i. */
+static bool SpriteHidden(const Dkc2Hd *hd, const Dkc2HdQuad *quad, size_t i) {
+  const uint32_t occlusion = hd->occlusion[i];
+  const unsigned background = (occlusion >> 16) & 0xffu;
+  const unsigned object = (occlusion >> 8) & 0xffu;
+  const unsigned owner = occlusion & 0xffu;
+  return quad->rank <= background || (object && object >= quad->rank) ||
+         (owner && owner - 1u > quad->index);
+}
+
+/* Draws a quad into target (output pixels): a sprite blends where it is not
+ * hidden, art replaces the layer's pixels. */
+static void DrawQuad(Dkc2Hd *hd, uint32_t *target, const Dkc2HdQuad *quad,
+                     bool sprite) {
+  const HdImage *image = quad->image;
+  const int scale = hd->scale;
   const int out_width = hd->width * scale, out_height = kHeight * scale;
-  for (int hy = 0; hy < height; hy++) {
-    const int y = flip_y ? (state->sprite.y - state->top) * scale - 1 - hy
-                         : (state->sprite.y + state->top) * scale + hy;
+  for (int hy = 0; hy < quad->height; hy++) {
+    const int y = quad->flip_y ? quad->y + quad->height - 1 - hy
+                               : quad->y + hy;
     if (y < 0 || y >= out_height)
       continue;
-    for (int hx = 0; hx < width; hx++) {
-      const int x = flip_x ? (state->sprite.x - state->left) * scale - 1 - hx
-                           : (state->sprite.x + state->left) * scale + hx;
+    const uint32_t *source =
+        image->pixels +
+        (size_t)(hy * image->height / quad->height) * (size_t)image->width;
+    for (int hx = 0; hx < quad->width; hx++) {
+      const int x = quad->flip_x ? quad->x + quad->width - 1 - hx
+                                 : quad->x + hx;
       if (x < 0 || x >= out_width)
         continue;
-      uint32_t pixel;
-      if (image) {
-        pixel = image->pixels[(size_t)(hy * image->height / height) *
-                                  (size_t)image->width +
-                              (size_t)(hx * image->width / width)];
-      } else {
-        pixel = hd->frame.pixels[(hy / scale) * hd->frame.width + hx / scale];
-        pixel = pixel ? 0xff000000u | Rgb(pixel) : 0;
-      }
+      uint32_t pixel = source[hx * image->width / quad->width];
       const unsigned alpha = pixel >> 24;
-      if (!alpha)
+      if (sprite &&
+          (!alpha ||
+           SpriteHidden(hd, quad,
+                        (size_t)(y / scale) * (size_t)hd->width +
+                            (size_t)(x / scale))))
         continue;
-      const size_t i =
-          (size_t)(y / scale) * (size_t)hd->width + (size_t)(x / scale);
-      if (state->rank <= BackgroundRank(hd, i))
-        continue;
-      const uint32_t object = hd->obj[i];
-      if (object && !ReplacedPixel(hd, i)) {
-        const bool from_table = hd->owner[i] &&
-                                Rgb(object) == Rgb(hd->native[i]);
-        if (from_table ? hd->owner[i] - 1u > k
-                       : (uint8_t)(object >> 24) >= state->rank)
-          continue;
-      }
-      if (brightness != 255u) {
-        uint32_t scaled = 0;
+      if (quad->brightness != 255u) {
+        uint32_t scaled = pixel & 0xff000000u;
         for (int shift = 0; shift < 24; shift += 8)
-          scaled |= (((pixel >> shift) & 0xff) * brightness / 255u) << shift;
+          scaled |= (((pixel >> shift) & 0xff) * quad->brightness / 255u)
+                    << shift;
         pixel = scaled;
       }
-      uint32_t *destination = &hd->output[(size_t)y * (size_t)out_width + x];
-      *destination = Blend(*destination, pixel, alpha);
+      uint32_t *destination = &target[(size_t)y * (size_t)out_width + x];
+      *destination = sprite ? Blend(*destination, pixel, alpha) : pixel;
     }
   }
 }
@@ -897,33 +926,20 @@ static bool TerrainBlockMatches(Dkc2Hd *hd, const Ppu *ppu,
   return compared > 0 && wrong * 8 <= compared;
 }
 
-/* Draws art over the frame area (x, y, width, height) of the BG1 layer. */
-static void DrawLayerArt(Dkc2Hd *hd, const HdImage *image, int x, int y,
-                         int width, int height, unsigned brightness) {
+/* Records art over the frame area (x, y, width, height) of the BG1 layer. */
+static void AddArt(Dkc2Hd *hd, const HdImage *image, int x, int y, int width,
+                   int height, unsigned brightness) {
+  if (hd->art_count >= kArtMax)
+    return;
   const int scale = hd->scale;
-  const int size_x = width * scale, size_y = height * scale;
-  const int out_width = hd->width * scale, out_height = kHeight * scale;
-  for (int hy = 0; hy < size_y; hy++) {
-    const int oy = y * scale + hy;
-    if (oy < 0 || oy >= out_height)
-      continue;
-    const uint32_t *source =
-        image->pixels + (size_t)(hy * image->height / size_y) * image->width;
-    uint32_t *row = hd->layer + (size_t)oy * (size_t)out_width;
-    for (int hx = 0; hx < size_x; hx++) {
-      const int ox = x * scale + hx;
-      if (ox < 0 || ox >= out_width)
-        continue;
-      uint32_t pixel = source[hx * image->width / size_x];
-      if (brightness != 255u) {
-        uint32_t scaled = pixel & 0xff000000u;
-        for (int shift = 0; shift < 24; shift += 8)
-          scaled |= (((pixel >> shift) & 0xff) * brightness / 255u) << shift;
-        pixel = scaled;
-      }
-      row[ox] = pixel;
-    }
-  }
+  Dkc2HdQuad *quad = &hd->art[hd->art_count++];
+  memset(quad, 0, sizeof *quad);
+  quad->image = image;
+  quad->x = x * scale;
+  quad->y = y * scale;
+  quad->width = width * scale;
+  quad->height = height * scale;
+  quad->brightness = (uint8_t)brightness;
 }
 
 /* Visits every terrain block overlapping the frame, margins included: art
@@ -960,7 +976,7 @@ static void ProcessTerrain(Dkc2Hd *hd, const Ppu *ppu, const uint8_t *ram) {
       if (hd->layer_frame) {
         const HdImage *image = TerrainArt(hd, entry);
         if (image)
-          DrawLayerArt(hd, image, x, y, kBlock, kBlock, brightness);
+          AddArt(hd, image, x, y, kBlock, kBlock, brightness);
       }
       if (!dump)
         continue;
@@ -1032,10 +1048,9 @@ static const ScreenEntry *MatchScreen(const Dkc2Hd *hd) {
 /* Screen art replaces the whole native area of BG1: its clear pixels take
  * the lowest BG1 rank so the art also covers the backdrop, below any layer
  * or object that was in front of it. */
-static void DrawScreenArt(Dkc2Hd *hd, const ScreenEntry *screen,
-                          unsigned brightness) {
-  DrawLayerArt(hd, screen->art, hd->origin, 0, kNativeWidth, kHeight,
-               brightness);
+static void AddScreenArt(Dkc2Hd *hd, const ScreenEntry *screen,
+                         unsigned brightness) {
+  AddArt(hd, screen->art, hd->origin, 0, kNativeWidth, kHeight, brightness);
   for (int y = 0; y < kHeight; y++) {
     uint8_t *rank = hd->bg1_rank + (size_t)y * (size_t)hd->width +
                     (size_t)hd->origin;
@@ -1095,7 +1110,7 @@ static void CompositeTerrain(Dkc2Hd *hd) {
     for (int x = 0; x < out_width; x++) {
       const unsigned alpha = layer[x] >> 24;
       const size_t i = line + (size_t)(x / scale);
-      if (alpha && hd->bg1_rank[i] > hd->base_rank[i])
+      if (alpha && hd->occlusion[i] >> 24)
         out[x] = Blend(out[x], layer[x], alpha);
     }
   }
@@ -1125,13 +1140,17 @@ static void BuildBg1Rank(Dkc2Hd *hd) {
   }
 }
 
-const uint32_t *Dkc2HdEndFrame(Dkc2Hd *hd, const Ppu *ppu, const uint8_t *ram,
-                               const uint8_t *frame, size_t frame_pitch,
-                               int *width, int *height) {
+const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
+                                       const uint8_t *ram,
+                                       const uint8_t *frame,
+                                       size_t frame_pitch) {
+  static uint64_t last_serial;
   if (!hd || !hd->active || !ppu || !ram || !frame ||
       frame_pitch < (size_t)hd->width * 4u)
     return NULL;
   hd->origin = (hd->width - kNativeWidth) / 2 - ppu->wsPresentationXBias;
+  if (hd->cache_count >= kCacheFlush)
+    FlushCache(hd);
   /* The displayed OAM was built from the previous game update. */
   PrepareSprites(hd, ppu, hd->has_previous ? hd->previous_wram : ram);
   memcpy(hd->previous_wram, ram, sizeof hd->previous_wram);
@@ -1146,16 +1165,27 @@ const uint32_t *Dkc2HdEndFrame(Dkc2Hd *hd, const Ppu *ppu, const uint8_t *ram,
       const uint8_t *bgra = frame + (size_t)y * frame_pitch + (size_t)x * 4u;
       uint32_t pixel = 0xff000000u | (uint32_t)bgra[2] << 16 |
                        (uint32_t)bgra[1] << 8 | bgra[0];
-      uint8_t rank = 0;
-      for (unsigned layer = layered ? 1u : 0u; layer < kBgLayers; layer++) {
+      /* Sprites meet every background layer; the base, BG1 only when it
+       * stays in the frame. */
+      uint8_t background = 0, rank = 0;
+      for (unsigned layer = 0; layer < kBgLayers; layer++) {
         const uint8_t layer_rank = (uint8_t)(hd->bg[layer][i] >> 24);
-        if (layer_rank > rank)
+        if (layer_rank > background)
+          background = layer_rank;
+        if ((layer > 0 || !layered) && layer_rank > rank)
           rank = layer_rank;
       }
+      uint32_t occlusion = (uint32_t)background << 16;
       const uint32_t object = hd->obj[i];
-      if (object && !ReplacedPixel(hd, i) && (uint8_t)(object >> 24) > rank) {
-        pixel = 0xff000000u | Rgb(object);
-        rank = (uint8_t)(object >> 24);
+      if (object && !ReplacedPixel(hd, i)) {
+        if (hd->owner[i] && Rgb(object) == Rgb(hd->native[i]))
+          occlusion |= hd->owner[i];
+        else
+          occlusion |= (object >> 24) << 8;
+        if ((uint8_t)(object >> 24) > rank) {
+          pixel = 0xff000000u | Rgb(object);
+          rank = (uint8_t)(object >> 24);
+        }
       }
       /* The HD BG1 layer is composed over this base by rank alone, but the
        * base still shows BG1 where it is on top: the layer's soft edges then
@@ -1164,29 +1194,67 @@ const uint32_t *Dkc2HdEndFrame(Dkc2Hd *hd, const Ppu *ppu, const uint8_t *ram,
         pixel = 0xff000000u | Rgb(hd->bg[0][i]);
       hd->base[i] = pixel;
       hd->base_rank[i] = rank;
+      hd->occlusion[i] = occlusion;
+      if (layered)
+        hd->layer_source[i] = Opaque(hd->bg[0][i]);
     }
   }
-  Upscale(hd, hd->base, hd->output);
+  hd->art_count = 0;
   const ScreenEntry *screen = layered ? MatchScreen(hd) : NULL;
-  if (layered) {
-    Upscale(hd, hd->bg[0], hd->layer);
+  if (layered)
     BuildBg1Rank(hd);
-  }
   if (screen)
-    DrawScreenArt(hd, screen, ppu->brightnessMult[31]);
+    AddScreenArt(hd, screen, ppu->brightnessMult[31]);
   else if (layered || hd->dump_dir[0])
     ProcessTerrain(hd, ppu, ram);
   if (hd->dump_dir[0])
     DumpScreen(hd, ppu, ram);
-  if (layered)
-    CompositeTerrain(hd);
+  if (layered) {
+    for (size_t i = 0; i < (size_t)hd->width * kHeight; i++)
+      if (hd->bg1_rank[i] > hd->base_rank[i])
+        hd->occlusion[i] |= 0xff000000u;
+  }
+  hd->quad_count = 0;
   for (unsigned k = 0; k < hd->sprite_count; k++) {
     if (!hd->sprites[k].replaced)
       continue;
     DumpSprite(hd, ppu, &hd->sprites[k]);
-    DrawSprite(hd, ppu, k);
+    AddSprite(hd, ppu, k);
   }
-  *width = hd->width * hd->scale;
-  *height = kHeight * hd->scale;
+  hd->scene = (Dkc2HdScene){
+      .serial = ++last_serial,
+      .width = hd->width,
+      .height = kHeight,
+      .scale = hd->scale,
+      .background = hd->background,
+      .base = hd->base,
+      .occlusion = hd->occlusion,
+      .layer = layered ? hd->layer_source : NULL,
+      .art = hd->art,
+      .art_count = hd->art_count,
+      .sprites = hd->quads,
+      .sprite_count = hd->quad_count,
+  };
+  return &hd->scene;
+}
+
+const uint32_t *Dkc2HdEndFrame(Dkc2Hd *hd, const Ppu *ppu, const uint8_t *ram,
+                               const uint8_t *frame, size_t frame_pitch,
+                               int *width, int *height) {
+  const Dkc2HdScene *scene =
+      Dkc2HdEndFrameScene(hd, ppu, ram, frame, frame_pitch);
+  if (!scene)
+    return NULL;
+  Upscale(hd, scene->base, hd->output);
+  if (scene->layer) {
+    Upscale(hd, scene->layer, hd->layer);
+    for (unsigned a = 0; a < scene->art_count; a++)
+      DrawQuad(hd, hd->layer, &scene->art[a], false);
+    CompositeTerrain(hd);
+  }
+  for (unsigned s = 0; s < scene->sprite_count; s++)
+    DrawQuad(hd, hd->output, &scene->sprites[s], true);
+  *width = scene->width * scene->scale;
+  *height = scene->height * scene->scale;
   return hd->output;
 }
