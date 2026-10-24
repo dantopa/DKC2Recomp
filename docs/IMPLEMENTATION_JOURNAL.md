@@ -6484,3 +6484,37 @@ simulation with forced evictions caught.
 Decoding and verifying the cells costs about 0.8 ms per frame on the CPU
 (4600-frame route, 71 s against 74.5 s), so it runs only when the pack has
 backgrounds.txt or a dump is being written.
+
+Phase 3 started as a native scene: take the sprite records the displayed OAM
+was built from instead of verifying each against the PPU. Two route
+measurements (Pirate Panic, 4600 frames; the Gloomy Gulch map from a 100%
+save) settled it differently. A host hook on the return of the world sprite
+renderer (B5:9F40), latched at the next NMI, failed more records than the
+existing snapshot (1391 against 346 on Pirate Panic): the frame ends at the
+game's WAI, so the WRAM left then is exactly what the NMI uploads (its OAM
+shadow matched PPU OAM on 3580 of 3815 frames), and anything written between
+the renderer and the NMI shows in the picture. The hook was dropped.
+
+The remaining rejections split in two. The Kongs on Pirate Panic (about 80
+frames each) have none of their pixels on screen: blinking after a hit or
+hidden in a transition, so rejecting them is correct and dropping the check
+would draw a solid Kong. The torches on the map (every frame, 40-50% of
+pixels wrong) were decoded exactly: their VRAM tiles match the frame from
+ROM, but the title words, loose OAM entries with lower slots, are drawn over
+them, and those pixels counted as wrong. A record now skips pixels whose
+top-most OAM entry has another palette: a record's own entries all carry its
+palette, so a misdecoded record is still compared on all of them. A first
+version judged entries by how much they agreed with the decoded frame
+instead, and a forced misdecode (every record decoded from the next graphic)
+showed why that is weaker: a misdecoded tile looked like a foreign object.
+A record with under a quarter of its pixels left to compare is not verified.
+With the forced misdecode the new check accepts 50 of about 33000 records
+on the map against 1 before; 48 are bees whose next graphic differs in about 11% of
+their pixels, inside the 7/8 tolerance. On the real routes rejections on the
+map fell from 7430 to the blinking Kongs and a few records almost hidden by
+the words, and the torch and 3140 art is drawn with the words in front;
+Pirate Panic is unchanged. The check is now one pass over the frame with
+per-record counts instead of one pass per record: preparing sprites and
+loose objects went from 651 to 146 microseconds per frame on the map and
+from 269 to 102 on Pirate Panic. The goldens were regenerated (the torches,
+and the bee art replaced in the pack).

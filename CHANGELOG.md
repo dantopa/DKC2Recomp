@@ -48,6 +48,10 @@
   exactly as before.
 - The GPU presenter keeps up to 6144 HD images in a hash table (was 512 in a
   list), enough for a frame of background cells.
+- HD sprites partly covered by other objects (the map torches behind the
+  title words) are drawn with their art instead of falling back to the 1x
+  frame, and verifying sprites is cheaper (0.15 ms instead of 0.65 ms per
+  frame on the world map).
 
 ## 0.0.8 (alpha) - 2026-09-13
 
