@@ -20,6 +20,7 @@
 #include "desktop_paths.h"
 #include "desktop_present_sdl.h"
 #include "desktop_rewind.h"
+#include "input_playback.h"
 #include "input_recording.h"
 #include "verified_rom.h"
 
@@ -1169,6 +1170,22 @@ static int RunGame(const char *rom_path,
           &host.presenter, DKC2_PRODUCT_TITLE " (Recording Input)");
     }
   }
+  /* SNESRECOMP_INPUT_PLAY replays a recorded route in place of the
+   * controllers (one word per emulated frame), as the headless runner does,
+   * so GPU presentation can be checked in any scene. */
+  Dkc2InputPlayback input_playback = {0};
+  const char *input_playback_path = getenv("SNESRECOMP_INPUT_PLAY");
+  if (input_playback_path && *input_playback_path) {
+    char error[192];
+    if (!Dkc2InputPlaybackLoad(input_playback_path, &input_playback, error,
+                               sizeof error)) {
+      fprintf(stderr, "Input playback failed: %s: %s\n", input_playback_path,
+              error);
+      ShowError(error);
+      runtime_failure = true;
+      host.running = false;
+    }
+  }
 
   host.rom = rom;
   host.rom_size = rom_size;
@@ -1382,6 +1399,9 @@ static int RunGame(const char *rom_path,
           ? kHostSpeedMultiplier : 1;
       unsigned long long iteration_start = host_frame;
       for (int run = 0; run < frames_to_run && host.running; run++) {
+        if (input_playback.count)
+          controls.controller =
+              Dkc2InputPlaybackFrame(&input_playback, (size_t)host_frame);
         if (Dkc2InputRecorderIsOpen(&input_recorder) &&
             !Dkc2InputRecorderWrite(
                 &input_recorder, controls.controller,
@@ -1622,6 +1642,7 @@ static int RunGame(const char *rom_path,
   }
   Dkc2DiagnosticsShutdown(completed ? "clean_exit" : "runtime_failure");
   Dkc2RewindHistoryDestroy(&rewind_history);
+  Dkc2InputPlaybackFree(&input_playback);
   free(rewind_scratch);
   DestroyHd(&host);
   free(rom);
