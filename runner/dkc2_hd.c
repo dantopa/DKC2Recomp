@@ -859,9 +859,44 @@ static const HdImage *FilteredCached(Dkc2Hd *hd, uint64_t key) {
   return image;
 }
 
+/* The OBJ palette of OAM attributes or record properties. */
+static unsigned Palette(uint16_t attributes) { return (attributes >> 9) & 7u; }
+
+/* Decodes the OAM and maps each pixel to its top-most entry. */
+static void PrepareOam(Dkc2Hd *hd, const Ppu *ppu) {
+  const int margin = (hd->width - kNativeWidth) / 2;
+  memset(hd->oam_top, 0, (size_t)hd->width * kHeight);
+  /* Lower slots are drawn over higher ones. */
+  for (int slot = kDkc2NativeOamEntries - 1; slot >= 0; slot--) {
+    LooseEntry *entry = &hd->oam[slot];
+    memset(entry, 0, sizeof *entry);
+    entry->group = -1;
+    Dkc2NativeDecodeOamEntry(ppu, (unsigned)slot, &entry->oam);
+    entry->oam.x += margin;
+    const uint16_t attributes = entry->oam.attributes;
+    entry->rank = (uint8_t)SPRITE_PRIO_TO_PRIO((attributes & 0x3000u) >> 12,
+                                               (attributes & 0x800u) == 0);
+    for (int y = 0; y < entry->oam.size; y++) {
+      const int line = entry->oam.y + y;
+      if (line < 0 || line >= kHeight)
+        continue;
+      for (int x = 0; x < entry->oam.size; x++) {
+        const int column = entry->oam.x + x;
+        if (column >= 0 && column < hd->width &&
+            Dkc2NativeOamPixel(ppu, &entry->oam, x, y))
+          hd->oam_top[(size_t)line * hd->width + column] = (uint8_t)(slot + 1);
+      }
+    }
+  }
+}
+
 /* Decodes each live record, builds the top-most ownership map and decides
  * which records the HD path draws: only those the PPU actually showed as
- * decoded. */
+ * decoded (at least 7/8 of the compared pixels). Pixels another object
+ * covers are not compared: those whose top-most OAM entry has another
+ * palette, since a record's own entries all carry its palette (so a
+ * misdecoded record is still compared on all of them). A record mostly
+ * covered (under a quarter compared) is not verified. */
 static void PrepareSprites(Dkc2Hd *hd, const Ppu *ppu, const uint8_t *ram) {
   Dkc2NativeSprite sprites[kDkc2NativeSpriteMax];
   hd->sprite_count = Dkc2NativeCollectSprites(ram, hd->rom, hd->rom_size,
@@ -896,18 +931,26 @@ static void PrepareSprites(Dkc2Hd *hd, const Ppu *ppu, const uint8_t *ram) {
       }
     }
   }
+  uint32_t owned[kDkc2NativeSpriteMax] = {0};
+  uint32_t compared[kDkc2NativeSpriteMax] = {0};
+  uint32_t wrong[kDkc2NativeSpriteMax] = {0};
+  for (size_t i = 0; i < (size_t)hd->width * kHeight; i++) {
+    if (!hd->owner[i])
+      continue;
+    const unsigned k = hd->owner[i] - 1u;
+    owned[k]++;
+    if (hd->obj[i] && hd->oam_top[i] &&
+        Palette(hd->oam[hd->oam_top[i] - 1u].oam.attributes) !=
+            Palette(hd->sprites[k].sprite.properties))
+      continue; /* covered by another object */
+    compared[k]++;
+    wrong[k] += Rgb(hd->obj[i]) != Rgb(hd->native[i]) || !hd->obj[i];
+  }
   for (unsigned k = 0; k < hd->sprite_count; k++) {
     SpriteState *state = &hd->sprites[k];
-    if (!state->decoded)
-      continue;
-    size_t compared = 0, wrong = 0;
-    for (size_t i = 0; i < (size_t)hd->width * kHeight; i++) {
-      if (hd->owner[i] != k + 1)
-        continue;
-      compared++;
-      wrong += Rgb(hd->obj[i]) != Rgb(hd->native[i]) || !hd->obj[i];
-    }
-    state->replaced = compared > 0 && wrong * 8 <= compared;
+    state->replaced = state->decoded && compared[k] > 0 &&
+                      compared[k] * 4 >= owned[k] &&
+                      wrong[k] * 8 <= compared[k];
   }
 }
 
@@ -1018,33 +1061,9 @@ static unsigned GroupRoot(uint8_t *parent, unsigned slot) {
  * order slots each group behind the first record whose lowest OAM slot is
  * below the group's, so records keep their relative order. */
 static void PrepareLoose(Dkc2Hd *hd, const Ppu *ppu) {
-  const int margin = (hd->width - kNativeWidth) / 2;
   const size_t pixel_count = (size_t)hd->width * kHeight;
-  memset(hd->oam_top, 0, pixel_count);
   memset(hd->loose_owner, 0, pixel_count);
   memset(hd->record_front, 0xff, sizeof hd->record_front);
-  /* Lower slots are drawn over higher ones. */
-  for (int slot = kDkc2NativeOamEntries - 1; slot >= 0; slot--) {
-    LooseEntry *entry = &hd->oam[slot];
-    memset(entry, 0, sizeof *entry);
-    entry->group = -1;
-    Dkc2NativeDecodeOamEntry(ppu, (unsigned)slot, &entry->oam);
-    entry->oam.x += margin;
-    const uint16_t attributes = entry->oam.attributes;
-    entry->rank = (uint8_t)SPRITE_PRIO_TO_PRIO((attributes & 0x3000u) >> 12,
-                                               (attributes & 0x800u) == 0);
-    for (int y = 0; y < entry->oam.size; y++) {
-      const int line = entry->oam.y + y;
-      if (line < 0 || line >= kHeight)
-        continue;
-      for (int x = 0; x < entry->oam.size; x++) {
-        const int column = entry->oam.x + x;
-        if (column >= 0 && column < hd->width &&
-            Dkc2NativeOamPixel(ppu, &entry->oam, x, y))
-          hd->oam_top[(size_t)line * hd->width + column] = (uint8_t)(slot + 1);
-      }
-    }
-  }
   for (size_t i = 0; i < pixel_count; i++) {
     if (!hd->oam_top[i])
       continue;
@@ -1951,6 +1970,7 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
   if (hd->cache_count >= kCacheFlush)
     FlushCache(hd);
   /* The displayed OAM was built from the previous game update. */
+  PrepareOam(hd, ppu);
   PrepareSprites(hd, ppu, hd->has_previous ? hd->previous_wram : ram);
   PrepareLoose(hd, ppu);
   memcpy(hd->previous_wram, ram, sizeof hd->previous_wram);
