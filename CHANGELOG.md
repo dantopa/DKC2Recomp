@@ -18,6 +18,22 @@
   and the presenter renders it into an output-sized texture with GLSL 1.20,
   matching the CPU compositor within rounding while using about half the
   CPU time. `DKC2_HD_CPU=1` keeps the CPU path; headless runs always use it.
+- Sprite pack art is keyed by palette content (`<graphic>_p<hash>.rgba`), so
+  one file applies whichever palette slot the game assigns; the slot-keyed
+  name stays as a fallback and the dump writes the new names.
+- Added a learned sprite filter (`DKC2_HD_FILTER=learned`, "Learned (table)"
+  in Settings): a lookup table trained offline is read from
+  `hdfilter/sprites_x4.lut` (or `DKC2_HD_FILTER_TABLE`); without it the
+  smooth filter is used and a warning is printed.
+- Objects outside the sprite table (single bananas, the HUD, map sprites,
+  title-card words) are now drawn at full resolution too: OAM entries the
+  frame shows are grouped into loose objects with their own pack art
+  (`o_<key>.rgba`) and dump entries.
+- HD tooling in the desktop host: F5 or "Reload pack" reloads the art pack
+  without a restart (it also reloads when files are added to the pack
+  folder), F6 shows the object under the mouse with its pack file name, F7
+  copies that name. `DKC2_HD_PROBE=frame,x,y` prints the same for headless
+  runs.
 
 ## 0.0.8 (alpha) - 2026-09-13
 

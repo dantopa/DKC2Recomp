@@ -16,6 +16,7 @@ enum {
   kDkc2OverlayActionLoadState = 1u << 3,
   kDkc2OverlayActionTestHapticsP1 = 1u << 4,
   kDkc2OverlayActionTestHapticsP2 = 1u << 5,
+  kDkc2OverlayActionReloadHdPack = 1u << 6,
 };
 
 typedef enum Dkc2OverlayBindingCapture {

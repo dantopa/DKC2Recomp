@@ -46,6 +46,9 @@ struct Dkc2DesktopOverlay {
   char haptics_device[2][128];
   bool haptics_supported[2];
   bool software_backend;
+  char inspector[128];
+  bool inspector_rect;
+  float inspector_box[4];
 #ifdef _WIN32
   SDL_Surface *software_surface;
   SDL_Renderer *software_renderer;
@@ -611,6 +614,36 @@ extern "C" void Dkc2DesktopOverlaySetStatus(
   overlay->status_success = success;
 }
 
+extern "C" void Dkc2DesktopOverlaySetInspector(Dkc2DesktopOverlay *overlay,
+                                               const char *text,
+                                               const float *rect) {
+  if (!overlay) return;
+  std::snprintf(overlay->inspector, sizeof overlay->inspector, "%s",
+                text ? text : "");
+  overlay->inspector_rect = rect != nullptr;
+  if (rect) std::memcpy(overlay->inspector_box, rect,
+                        sizeof overlay->inspector_box);
+}
+
+static void DrawInspector(const Dkc2DesktopOverlay *overlay) {
+  if (overlay->inspector_rect) {
+    const float *box = overlay->inspector_box;
+    ImGui::GetForegroundDrawList()->AddRect(
+        ImVec2(box[0], box[1]), ImVec2(box[0] + box[2], box[1] + box[3]),
+        IM_COL32(255, 220, 0, 255), 0.0f, 0, 2.0f);
+  }
+  ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_Always);
+  ImGui::SetNextWindowBgAlpha(0.7f);
+  ImGui::Begin("HD inspector", nullptr,
+               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                   ImGuiWindowFlags_AlwaysAutoResize |
+                   ImGuiWindowFlags_NoSavedSettings |
+                   ImGuiWindowFlags_NoFocusOnAppearing |
+                   ImGuiWindowFlags_NoNav);
+  ImGui::TextUnformatted(overlay->inspector);
+  ImGui::End();
+}
+
 static void DrawMainPage(Dkc2DesktopOverlay *overlay) {
   ImGui::TextWrapped("The game is paused at a completed frame boundary.");
   ImGui::Spacing();
@@ -838,11 +871,11 @@ static void DrawSettingsPage(Dkc2DesktopOverlay *overlay) {
   if (ImGui::SliderInt("HD scale", &hd_scale, kDkc2HdMinScale,
                        kDkc2HdMaxScale, "%dx"))
     Dkc2LauncherSetHdScale(hd_scale);
-  static const char *hd_filter_labels[] = {"Pixel (square)",
-                                           "Smooth (gradient)"};
+  static const char *hd_filter_labels[] = {
+      "Pixel (square)", "Smooth (gradient)", "Learned (table)"};
   const int hd_sprites = Dkc2LauncherHdSprites();
   if (ImGui::BeginCombo("HD sprites", hd_filter_labels[hd_sprites])) {
-    for (int i = kDkc2HdFilterNearest; i <= kDkc2HdFilterSmooth; i++) {
+    for (int i = kDkc2HdFilterNearest; i <= kDkc2HdFilterLearned; i++) {
       if (ImGui::Selectable(hd_filter_labels[i], hd_sprites == i))
         Dkc2LauncherSetHdSprites(i);
     }
@@ -860,11 +893,17 @@ static void DrawSettingsPage(Dkc2DesktopOverlay *overlay) {
   bool hd_art = Dkc2LauncherHdArt() != 0;
   if (ImGui::Checkbox("HD art pack", &hd_art))
     Dkc2LauncherSetHdArt(hd_art);
+  ImGui::SameLine();
+  if (ImGui::Button("Reload pack (F5)"))
+    Dkc2DesktopOverlayModelRequest(&overlay->model,
+                                   kDkc2OverlayActionReloadHdPack);
   ImGui::EndDisabled();
   ImGui::TextDisabled(
       "Kongs, enemies and items are drawn at full resolution. With the HD "
       "art pack on, redrawn art from the hdpack folder replaces them and "
-      "the terrain where it exists; off, everything uses the filters.");
+      "the terrain where it exists; off, everything uses the filters. "
+      "F6 shows the object under the mouse and its pack file name; F7 "
+      "copies the name.");
   static const char *aspect_labels[] = {
       "4:3 (Native)", "16:10 (Widescreen)", "16:9 (Widescreen)",
       "21:9 (Ultrawide)"};
@@ -1289,8 +1328,9 @@ static void DrawCreditsPage(void) {
 }
 
 static void RenderOverlayFrame(Dkc2DesktopOverlay *overlay, int width, int height) {
-  if (!overlay || !overlay->initialized || !overlay->model.open ||
-      width <= 0 || height <= 0)
+  if (!overlay || !overlay->initialized ||
+      (!overlay->model.open && !overlay->inspector[0]) || width <= 0 ||
+      height <= 0)
     return;
 
 #ifdef _WIN32
@@ -1316,6 +1356,18 @@ static void RenderOverlayFrame(Dkc2DesktopOverlay *overlay, int width, int heigh
     ImGui::NewFrame();
   }
 
+  if (!overlay->model.open) {
+    DrawInspector(overlay);
+    ImGui::Render();
+#ifdef _WIN32
+    if (overlay->software_backend)
+      ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(),
+                                            overlay->software_renderer);
+    else
+#endif
+      ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    return;
+  }
   const ImVec2 display_size = ImGui::GetIO().DisplaySize;
   const Dkc2DesktopOverlayWindowLayout layout =
       Dkc2DesktopOverlayWindowLayoutForDisplay(display_size.x,

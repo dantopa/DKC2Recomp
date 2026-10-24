@@ -19,6 +19,7 @@
 #include "desktop_overlay.h"
 #include "desktop_paths.h"
 #include "desktop_present_sdl.h"
+#include "desktop_viewport.h"
 #include "desktop_rewind.h"
 #include "input_playback.h"
 #include "input_recording.h"
@@ -137,6 +138,14 @@ typedef struct SdlHost {
    * reference the GPU path is checked against. */
   bool hd_gpu;
   const Dkc2HdScene *hd_scene;
+  /* HD tooling: the pack reloads between frames on F5 or when its folder
+   * changes; F6 toggles the inspector, F7 copies the inspected name. */
+  bool hd_reload;
+  time_t hd_pack_time;
+  unsigned hd_pack_check;
+  bool hd_inspector;
+  bool hd_copy_name;
+  char hd_inspected[24];
 #ifdef _WIN32
   Dkc2WindowsMenu *menu;
 #endif
@@ -302,6 +311,15 @@ static void PumpEvents(SdlHost *host) {
     bool consumed =
         Dkc2DesktopOverlayProcessSdlEvent(host->overlay, &event);
     if (consumed) continue;
+    if (event.type == SDL_KEYDOWN && !event.key.repeat) {
+      const SDL_Scancode key = event.key.keysym.scancode;
+      if (key == SDL_SCANCODE_F5) host->hd_reload = true;
+      if (key == SDL_SCANCODE_F6) host->hd_inspector = !host->hd_inspector;
+      if (key == SDL_SCANCODE_F7) host->hd_copy_name = true;
+      if (key == SDL_SCANCODE_F5 || key == SDL_SCANCODE_F6 ||
+          key == SDL_SCANCODE_F7)
+        continue;
+    }
     if (event.type == SDL_KEYDOWN && !event.key.repeat &&
         event.key.keysym.scancode > SDL_SCANCODE_UNKNOWN &&
         event.key.keysym.scancode < SDL_NUM_SCANCODES)
@@ -680,6 +698,97 @@ static void DestroyHd(SdlHost *host) {
   host->hd_scene = NULL;
 }
 
+static time_t PackFolderTime(const char *dir) {
+  struct stat info;
+  return dir && stat(dir, &info) == 0 ? info.st_mtime : 0;
+}
+
+/* Rebuilds the compositor with its configuration so edited and new pack
+ * files show up without a restart. Called between frames only: the last
+ * scene's quads point into the compositor. Once a second it also checks
+ * the pack folder, whose time changes when files are added or removed. */
+static void ReloadHdWhenAsked(SdlHost *host) {
+  if (!host->hd) {
+    host->hd_reload = false;
+    return;
+  }
+  if (host->hd_config.pack_dir && ++host->hd_pack_check >= 60) {
+    host->hd_pack_check = 0;
+    const time_t time = PackFolderTime(host->hd_config.pack_dir);
+    if (host->hd_pack_time && time != host->hd_pack_time)
+      host->hd_reload = true;
+    host->hd_pack_time = time;
+  }
+  if (!host->hd_reload) return;
+  host->hd_reload = false;
+  DestroyHd(host);
+  host->hd = Dkc2HdCreate(&host->hd_config, host->rom, host->rom_size);
+  if (host->hd)
+    fprintf(stdout, "HD pack reloaded\n");
+  else
+    fprintf(stderr, "warning: HD pack reload failed\n");
+}
+
+/* Shows what the last HD frame draws under the mouse (F6). */
+static void UpdateHdInspector(SdlHost *host) {
+  if (!host->hd_inspector) {
+    Dkc2DesktopOverlaySetInspector(host->overlay, NULL, NULL);
+    return;
+  }
+  SDL_Window *window = (SDL_Window *)host->presenter.window;
+  int mouse_x = 0, mouse_y = 0, window_width = 0, window_height = 0;
+  int drawable_width = 0, drawable_height = 0;
+  SDL_GetMouseState(&mouse_x, &mouse_y);
+  SDL_GetWindowSize(window, &window_width, &window_height);
+  Dkc2SdlPresenterDrawableSize(&host->presenter, &drawable_width,
+                               &drawable_height);
+  const int frame_width = Dkc2VideoWidth();
+  Dkc2DesktopViewport viewport;
+  Dkc2HdProbe probe;
+  if (window_width <= 0 || window_height <= 0 ||
+      !Dkc2DesktopComputeViewport(drawable_width, drawable_height,
+                                  frame_width, kFrameHeight, &viewport)) {
+    Dkc2DesktopOverlaySetInspector(host->overlay, "HD inspector", NULL);
+    return;
+  }
+  /* Window points to drawable pixels to frame pixels. */
+  const double points = (double)drawable_width / window_width;
+  const double pixel_x = mouse_x * points - viewport.x;
+  const double pixel_y = mouse_y * points - viewport.y;
+  const int x = (int)(pixel_x * frame_width / viewport.width);
+  const int y = (int)(pixel_y * kFrameHeight / viewport.height);
+  if (pixel_x < 0 || pixel_y < 0 ||
+      !Dkc2HdProbePixel(host->hd, x, y, &probe)) {
+    host->hd_inspected[0] = '\0';
+    Dkc2DesktopOverlaySetInspector(
+        host->overlay, host->hd ? "HD inspector: outside the HD frame"
+                                : "HD inspector: HD presentation is off",
+        NULL);
+    return;
+  }
+  char text[128];
+  if (!probe.object) {
+    host->hd_inspected[0] = '\0';
+    snprintf(text, sizeof text, "(%d, %d) background", x, y);
+    Dkc2DesktopOverlaySetInspector(host->overlay, text, NULL);
+    return;
+  }
+  memcpy(host->hd_inspected, probe.name, sizeof host->hd_inspected);
+  snprintf(text, sizeof text, "(%d, %d) %s.rgba  %dx%d  %s", x, y,
+           probe.name, probe.width, probe.height,
+           probe.art ? "pack art" : "filter");
+  const double frame_to_points =
+      (double)viewport.width / frame_width / points;
+  const float rect[4] = {
+      (float)((viewport.x + probe.x * (double)viewport.width / frame_width) /
+              points),
+      (float)((viewport.y + probe.y * (double)viewport.height / kFrameHeight) /
+              points),
+      (float)(probe.width * frame_to_points),
+      (float)(probe.height * (double)viewport.height / kFrameHeight / points)};
+  Dkc2DesktopOverlaySetInspector(host->overlay, text, rect);
+}
+
 /* Builds, rebuilds or drops the HD compositor to match the HD options. */
 static void UpdateHd(SdlHost *host) {
   if (host->hd_environment) return;
@@ -859,6 +968,10 @@ static int RunGame(const char *rom_path,
     host.hd_pack_dir = pack_dir && *pack_dir ? pack_dir : "hdpack";
     host.hd_config.pack_dir = host.hd_pack_dir;
     host.hd_config.dump_dir = getenv("DKC2_HD_DUMP");
+    const char *filter_table = getenv("DKC2_HD_FILTER_TABLE");
+    host.hd_config.filter_table = filter_table && *filter_table
+                                      ? filter_table
+                                      : kDkc2HdDefaultFilterTable;
   }
   settings->aspect_index = (int)aspect;
   settings->widescreen = aspect != kDkc2VideoAspectNative;
@@ -1230,6 +1343,12 @@ static int RunGame(const char *rom_path,
     const double stage_top = Dkc2MacHostSeconds();
 #endif
     PumpEvents(&host);
+    ReloadHdWhenAsked(&host);
+    UpdateHdInspector(&host);
+    if (host.hd_copy_name) {
+      host.hd_copy_name = false;
+      if (host.hd_inspected[0]) (void)SDL_SetClipboardText(host.hd_inspected);
+    }
 #ifdef __APPLE__
     const double stage_pumped = Dkc2MacHostSeconds();
     double stage_paced = stage_pumped;
@@ -1297,6 +1416,8 @@ static int RunGame(const char *rom_path,
       host.running = false;
       break;
     }
+    if (overlay_actions & kDkc2OverlayActionReloadHdPack)
+      host.hd_reload = true;
     if (overlay_actions & kDkc2OverlayActionSaveState)
       controls.host_actions |= kDkc2HostSaveState;
     if (overlay_actions & kDkc2OverlayActionLoadState)
