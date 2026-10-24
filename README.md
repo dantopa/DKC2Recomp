@@ -38,6 +38,9 @@ next, lighting and depth effects possible.
 - **Better fallback filter.** Everything else uses a premultiplied
   Catmull-Rom upscale with anti-ringing (no halos around ropes or edges), or
   square pixels.
+- **GPU composition.** The desktop app draws each HD frame on the GPU
+  (OpenGL, over Metal on macOS) from a scene the compositor decides at 1x;
+  the CPU compositor remains for headless runs and as the reference.
 - **Widescreen and fades** keep working at every scale. Scenes that draw
   terrain through the subscreen (Mainbrace Mayhem) keep it.
 - **Settings tab options**, remembered between runs: HD graphics, scale
@@ -55,7 +58,7 @@ next, lighting and depth effects possible.
 | Kongs and objects | Original pixels | Full-resolution redraws (with a local pack) |
 | Title screen | Original | Redrawn HD art (with a local pack) |
 | Edges when scaled | Blocky or blurred | Smooth without ringing halos |
-| Cost (Apple M4, in level) | n/a | ~3 ms/frame at 2x, ~7 ms/frame at 4x |
+| CPU per frame at 4x (Apple M4, whole game, in level) | n/a | ~4 ms with GPU composition (~9 ms on the CPU) |
 
 ## Status
 
