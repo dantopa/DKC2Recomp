@@ -110,6 +110,25 @@ void Dkc2NativeSpritePixelScreen(const Dkc2NativeSprite *sprite,
                                  const Dkc2NativeSpriteFrame *frame,
                                  int frame_x, int frame_y, int *x, int *y);
 
+/* One OAM entry as the PPU draws it: screen position (X after the
+ * widescreen adjustments, so frame column = x + the left margin; Y signed,
+ * so lines below 0 are above the screen), size and its second OAM word
+ * (tile, palette, priority, flips). */
+typedef struct Dkc2NativeOamEntry {
+  int x, y, size;
+  uint16_t attributes;
+} Dkc2NativeOamEntry;
+
+enum { kDkc2NativeOamEntries = 128 };
+
+void Dkc2NativeDecodeOamEntry(const Ppu *ppu, unsigned slot,
+                              Dkc2NativeOamEntry *entry);
+
+/* Color index (0 transparent) of entry pixel (x, y), counted from the
+ * entry's top left on screen (flips applied). */
+uint8_t Dkc2NativeOamPixel(const Ppu *ppu, const Dkc2NativeOamEntry *entry,
+                           int x, int y);
+
 /* 1x reference renderers used by the PPU comparison harness. */
 bool Dkc2NativeRenderTerrain(const Ppu *ppu, const uint8_t *ram,
                              uint32_t *pixels, size_t pitch,

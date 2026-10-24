@@ -61,6 +61,73 @@ static uint8_t Planar4bppBytes(const uint8_t *character, unsigned x,
                    ((row[17] >> shift) & 1u) << 3);
 }
 
+/* Mirrors the PPU's OAM X decode (PpuDecodeOamX, ppu.c): 9-bit X, wrapped
+ * negative past the presented right margin or, in the ambiguous band, unless
+ * the game hinted the slot positive. */
+static int OamScreenX(const Ppu *ppu, unsigned index) {
+  int x = ppu->oam[index] & 0xff;
+  x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
+  const int positive_limit =
+      256 + ppu->extraRightCur +
+      (ppu->wsPresentationXBias > 0 ? ppu->wsPresentationXBias : 0);
+  if (x >= positive_limit) {
+    x -= 512;
+  } else if (x >= 256 && ppu->wsOamRightHintStrict) {
+    const unsigned slot = index >> 1;
+    if (!(ppu->wsOamRightHint[slot >> 3] & (1u << (slot & 7))))
+      x -= 512;
+  }
+  /* Widescreen HUD slots move to the screen edges
+   * (PpuAdjustWidescreenHudOamX). */
+  const uint8_t y = (uint8_t)(ppu->oam[index] >> 8);
+  const unsigned slot = index >> 1;
+  const bool hud_line = ppu->wsHudOamHeight &&
+                        (y >= 224 || y < ppu->wsHudOamHeight);
+  const bool hud_slot =
+      hud_line &&
+      ((ppu->wsHudOamSlots && slot >= ppu->wsHudOamFirstSlot &&
+        slot < (unsigned)ppu->wsHudOamFirstSlot + ppu->wsHudOamSlots) ||
+       (ppu->wsHudOamSlots2 && slot >= ppu->wsHudOamFirstSlot2 &&
+        slot < (unsigned)ppu->wsHudOamFirstSlot2 + ppu->wsHudOamSlots2));
+  if (hud_slot) {
+    const bool full_budget = (ppu->wsHudSplitHeight & 0x80) != 0;
+    if (x >= 0 && x < ppu->wsHudLeftEnd)
+      x -= full_budget ? ppu->extraLeftRight : ppu->extraLeftCur;
+    else if (x >= ppu->wsHudRightStart && x < 256)
+      x += full_budget ? ppu->extraLeftRight : ppu->extraRightCur;
+  }
+  return x - ppu->wsPresentationXBias;
+}
+
+void Dkc2NativeDecodeOamEntry(const Ppu *ppu, unsigned slot,
+                              Dkc2NativeOamEntry *entry) {
+  static const uint8_t kSizes[8][2] = {{8, 16},  {8, 32},  {8, 64},
+                                       {16, 32}, {16, 64}, {32, 64},
+                                       {16, 32}, {16, 32}};
+  const unsigned index = slot * 2u;
+  entry->size = kSizes[PPU_objSize(ppu)]
+                      [(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
+  entry->x = OamScreenX(ppu, index);
+  entry->y = ppu->oam[index] >> 8;
+  if (entry->y + entry->size > 256)
+    entry->y -= 256;
+  entry->attributes = ppu->oam[index + 1];
+}
+
+uint8_t Dkc2NativeOamPixel(const Ppu *ppu, const Dkc2NativeOamEntry *entry,
+                           int x, int y) {
+  const uint16_t attributes = entry->attributes;
+  const int row = attributes & 0x8000u ? entry->size - 1 - y : y;
+  const int col = attributes & 0x4000u ? entry->size - 1 - x : x;
+  const unsigned tile =
+      (((attributes & 0xffu) >> 4) + ((unsigned)row >> 3)) << 4 |
+      (((attributes & 0xfu) + ((unsigned)col >> 3)) & 0xfu);
+  const uint16_t base = attributes & 0x100u ? PPU_objTileAdr2(ppu)
+                                            : PPU_objTileAdr1(ppu);
+  return Planar4bppVram(ppu->vram, (uint16_t)(base + tile * 16u),
+                        (unsigned)col & 7u, (unsigned)row & 7u);
+}
+
 bool Dkc2NativeTerrainBegin(const Ppu *ppu, const uint8_t *ram,
                             Dkc2NativeTerrainView *view) {
   if (!ppu || !ram || !view)

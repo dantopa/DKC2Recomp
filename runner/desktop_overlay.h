@@ -42,6 +42,11 @@ void Dkc2DesktopOverlayGetSettings(const Dkc2DesktopOverlay *overlay,
 void Dkc2DesktopOverlaySetSettings(Dkc2DesktopOverlay *overlay,
                                    const RecompLauncherCSettings *settings);
 uint32_t Dkc2DesktopOverlayTakeActions(Dkc2DesktopOverlay *overlay);
+/* HD inspector: a line drawn over the game while the menu is closed, and
+ * optionally a rectangle (x, y, width, height in window points) around the
+ * inspected object. NULL text hides it. */
+void Dkc2DesktopOverlaySetInspector(Dkc2DesktopOverlay *overlay,
+                                    const char *text, const float *rect);
 void Dkc2DesktopOverlaySetStatus(Dkc2DesktopOverlay *overlay,
                                   const char *status, bool success);
 

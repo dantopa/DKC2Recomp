@@ -6404,3 +6404,34 @@ tolerance rules have synthetic unit tests. Measured at the HD output size, the
 GPU and CPU frames differ in 2 of 1.2 million pixels by one level; the larger
 differences seen earlier came from the Reconstruct upscaler amplifying them.
 A corrupted golden made the test fail as expected.
+
+Sprite art moved to palette-content keys: the pointer table at $0B64 only
+covers dynamically assigned slots, so the key hashes CGRAM colors 1-15 of
+the sprite's palette (brightness excluded). Route frames 1500, 2100 and 3300
+stayed byte-identical; existing enemy art was migrated by pixel-identical
+matches between old and new dumps.
+
+The learned filter is a MuLUT-style table (four 4-pixel patterns of
+luminance ranks, 4x output, softmax over the cell's colors and transparent)
+distilled offline. On held-out real frames it beat the pack-trained table,
+xBR and Catmull-Rom (PSNR 24.3 against 22.6 for Catmull-Rom). The C
+implementation matches the Python reference within 1/255 on 236 frames, and
+the route takes the same time as the smooth filter.
+
+Loose objects come from OAM: each pixel goes to its top-most entry, entries
+drawing a record's pixel belong to the record, and the rest are verified like
+records (7/8 of their top-most pixels must be what the PPU shows). Touching
+verified entries of one priority form a group, slotted into the draw order
+behind the first record whose lowest OAM slot is below the group's. With the
+groups disabled the route output is byte-identical to the previous build;
+enabled, they claim 99.99% of the object pixels the sprite table left to the
+scaled frame, for about 2% more route time. The GPU parity goldens were
+regenerated: they differ from the old ones only on the title-card words and
+the map Kong.
+
+The pack now reloads in place (F5, or when the folder's time changes) between
+frames, since scene quads point into the compositor. The inspector reads the
+front-most quad with an opaque texel under the mouse; headless probes found
+the expected keys for a banana and Diddy (pack art) and for a title-card word
+(filter).
+

@@ -733,6 +733,17 @@ int main(int argc, char **argv) {
   const size_t frame_bytes = frame_width * kHeight * kBytesPerPixel;
   Dkc2BeginDrawing(pixels, frame_width * kBytesPerPixel);
 
+  long hd_probe_frame = -1;
+  int hd_probe_x = 0, hd_probe_y = 0;
+  {
+    const char *text = getenv("DKC2_HD_PROBE");
+    if (text && *text &&
+        sscanf(text, "%ld,%d,%d", &hd_probe_frame, &hd_probe_x,
+               &hd_probe_y) != 3) {
+      fprintf(stderr, "invalid DKC2_HD_PROBE (want frame,x,y)\n");
+      return 1;
+    }
+  }
   const char *frame_sequence_prefix = getenv("DKC2_FRAME_PPM_PREFIX");
   long frame_sequence_start = 0;
   long frame_sequence_end = frame_limit - 1;
@@ -1068,6 +1079,21 @@ int main(int argc, char **argv) {
     const uint32_t *hd_pixels =
         Dkc2HdEndFrame(hd, g_ppu, g_ram, pixels,
                        frame_width * kBytesPerPixel, &hd_width, &hd_height);
+    /* DKC2_HD_PROBE=<frame>,<x>,<y>: prints what the HD frame draws at a
+     * 1x frame pixel, as the desktop inspector shows it. */
+    if (hd_probe_frame == frame) {
+      Dkc2HdProbe probe;
+      if (!Dkc2HdProbePixel(hd, hd_probe_x, hd_probe_y, &probe))
+        printf("HD probe %ld %d %d: not composed\n", frame, hd_probe_x,
+               hd_probe_y);
+      else if (!probe.object)
+        printf("HD probe %ld %d %d: background\n", frame, hd_probe_x,
+               hd_probe_y);
+      else
+        printf("HD probe %ld %d %d: %s %s %d %d %d %d\n", frame, hd_probe_x,
+               hd_probe_y, probe.name, probe.art ? "art" : "filter",
+               probe.x, probe.y, probe.width, probe.height);
+    }
     if (WidescreenTraceEnabled() && frame >= WidescreenTraceStart() &&
         (frame - WidescreenTraceStart()) % WidescreenTraceStep() == 0) {
       EmitWidescreenFrameTrace(frame);
