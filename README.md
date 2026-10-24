@@ -1,13 +1,19 @@
-# DKC2Recomp
+# DKC2Recomp HD
 
-> **Fork notice.** This is a fork of
-> [elliotttate/DKC2Recomp](https://github.com/elliotttate/DKC2Recomp). It adds
-> an experimental **HD presentation** layer (see
-> [HD presentation](#hd-presentation-experimental)) on top of upstream v0.0.8.
-> Everything else is upstream's work; report recompilation, gameplay and audio
-> issues upstream unless they only reproduce with HD enabled. See
-> [CONTRIBUTING.md](CONTRIBUTING.md) to help.
-> This recompilation is a byproduct of developing
+**DKC2Recomp HD** is a separate project that brings *Donkey Kong Country 2*
+to high resolution: an HD compositor that redraws the game at 2x-8x with
+modern, locally generated art for the Kongs, objects, terrain and title
+screen, plus the tooling to build that art from your own ROM. See
+[HD presentation](#hd-presentation-experimental) for what works today and
+[CONTRIBUTING.md](CONTRIBUTING.md) to help.
+
+It is built on a fork of
+[elliotttate/DKC2Recomp](https://github.com/elliotttate/DKC2Recomp) (base:
+upstream v0.0.8), whose static recompilation runs the game. Credit for the
+recompilation, co-op, characters, CRT and MSU-1 features below goes upstream;
+report issues there unless they only reproduce with HD enabled.
+
+> Upstream note: this recompilation is a byproduct of developing
 > [snesrecomp](https://github.com/mstan/snesrecomp): the games are the proving
 > ground, while the reusable framework is the larger goal. This is a community
 > recompilation, not an official port. Please report any reproducible gameplay,
