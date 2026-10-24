@@ -7,6 +7,7 @@
 
 #include "dkc2_game.h"
 #include "dkc2_coop.h"
+#include "dkc2_hd.h"
 #include "dkc2_video.h"
 #include "diagnostics.h"
 #include "desktop_filter.h"
@@ -118,10 +119,32 @@ typedef struct SdlHost {
   bool menu_chord_previous;
   Uint8 key_taps[SDL_NUM_SCANCODES];
   bool escaped_fullscreen;
+  /* HD presentation: the compositor (NULL while off) and the configuration
+   * it was built with, which DKC2_HD fixes for the run; the composed frame
+   * of the last draw, or NULL to present the authentic frame in pixels. */
+  Dkc2Hd *hd;
+  Dkc2HdConfig hd_config;
+  const char *hd_pack_dir; /* used while the HD art pack option is on */
+  bool hd_environment;
+  const uint8_t *rom;
+  size_t rom_size;
+  const uint32_t *hd_pixels;
+  int hd_width;
+  int hd_height;
 #ifdef _WIN32
   Dkc2WindowsMenu *menu;
 #endif
 } SdlHost;
+
+/* Renders the PPU frame, through the HD compositor when it is enabled. */
+static void DrawFrame(SdlHost *host) {
+  Dkc2HdBeginFrame(host->hd, g_ppu, Dkc2VideoWidth());
+  Dkc2DrawPpuFrame();
+  host->hd_pixels = Dkc2HdEndFrame(
+      host->hd, g_ppu, g_ram, host->pixels,
+      (size_t)Dkc2VideoWidth() * kBytesPerPixel, &host->hd_width,
+      &host->hd_height);
+}
 
 typedef struct SdlControls {
   uint32_t controller;
@@ -638,6 +661,41 @@ static uint32_t ApplyWindowsCommands(SdlHost *host,
 }
 #endif
 
+static void DestroyHd(SdlHost *host) {
+  if (!host->hd) return;
+  PpuClearOverlayBindings(g_ppu);
+  Dkc2HdDestroy(host->hd);
+  host->hd = NULL;
+  host->hd_pixels = NULL;
+}
+
+/* Builds, rebuilds or drops the HD compositor to match the HD options. */
+static void UpdateHd(SdlHost *host) {
+  if (host->hd_environment) return;
+  const bool enabled = Dkc2LauncherHdEnabled() != 0;
+  Dkc2HdConfig config = host->hd_config;
+  config.scale = Dkc2LauncherHdScale();
+  config.filter = (Dkc2HdFilter)Dkc2LauncherHdSprites();
+  config.background = (Dkc2HdFilter)Dkc2LauncherHdBackground();
+  config.pack_dir = Dkc2LauncherHdArt() ? host->hd_pack_dir : NULL;
+  if (enabled == (host->hd != NULL) &&
+      (!enabled || (config.scale == host->hd_config.scale &&
+                    config.filter == host->hd_config.filter &&
+                    config.background == host->hd_config.background &&
+                    config.pack_dir == host->hd_config.pack_dir)))
+    return;
+  DestroyHd(host);
+  host->hd_config = config;
+  if (!enabled) return;
+  host->hd = Dkc2HdCreate(&config, host->rom, host->rom_size);
+  if (host->hd) {
+    fprintf(stdout, "HD presentation: %dx\n", config.scale);
+  } else {
+    fprintf(stderr, "warning: HD presentation could not be initialized\n");
+    Dkc2LauncherSetHdEnabled(0);
+  }
+}
+
 static void ApplyOverlaySettings(SdlHost *host,
                                  RecompLauncherCSettings *settings,
                                  int *screen_filter) {
@@ -705,6 +763,7 @@ static void ApplyOverlaySettings(SdlHost *host,
          sizeof host->assist_key_bind);
   memcpy(host->assist_pad_bind, updated.assist_pad_bind,
          sizeof host->assist_pad_bind);
+  UpdateHd(host);
   if (Dkc2VideoGetAspect() != (Dkc2VideoAspect)updated.aspect_index) {
     Dkc2VideoSetAspect((Dkc2VideoAspect)updated.aspect_index);
     memset(host->pixels, 0, sizeof host->pixels);
@@ -775,6 +834,21 @@ static int RunGame(const char *rom_path,
   if (widescreen_override_active)
     aspect = *widescreen_override != '0'
         ? kDkc2VideoAspect16x9 : kDkc2VideoAspectNative;
+  /* HD follows the options unless DKC2_HD fixes it for the run. Art comes
+   * from the "hdpack" folder beside launcher.cfg, or DKC2_HD_PACK. */
+  const char *hd_error = NULL;
+  host.hd_environment =
+      Dkc2HdConfigFromEnvironment(&host.hd_config, &hd_error);
+  if (hd_error) {
+    ShowError(hd_error);
+    return 2;
+  }
+  if (!host.hd_environment) {
+    const char *pack_dir = getenv("DKC2_HD_PACK");
+    host.hd_pack_dir = pack_dir && *pack_dir ? pack_dir : "hdpack";
+    host.hd_config.pack_dir = host.hd_pack_dir;
+    host.hd_config.dump_dir = getenv("DKC2_HD_DUMP");
+  }
   settings->aspect_index = (int)aspect;
   settings->widescreen = aspect != kDkc2VideoAspectNative;
   Dkc2VideoSetAspect(aspect);
@@ -1096,6 +1170,19 @@ static int RunGame(const char *rom_path,
     }
   }
 
+  host.rom = rom;
+  host.rom_size = rom_size;
+  if (host.hd_environment) {
+    host.hd = Dkc2HdCreate(&host.hd_config, rom, rom_size);
+    if (host.hd) {
+      fprintf(stdout, "HD presentation: %dx\n", host.hd_config.scale);
+    } else {
+      ShowError("HD presentation could not be initialized");
+      runtime_failure = true;
+      host.running = false;
+    }
+  }
+
   while (host.running) {
 #ifdef __APPLE__
     const double stage_top = Dkc2MacHostSeconds();
@@ -1141,7 +1228,7 @@ static int RunGame(const char *rom_path,
         audio_fraction = 0.0;
         deadline = SDL_GetPerformanceCounter();
         deadline_fraction = 0.0;
-        Dkc2DrawPpuFrame();
+        DrawFrame(&host);
       } else {
         fprintf(stderr, "warning: DKC2_DESKTOP_TEST_LOADSTATE failed: %s\n",
                 test_load_state_path);
@@ -1243,7 +1330,7 @@ static int RunGame(const char *rom_path,
             RtlSaveSnapshotToMemory(rewind_scratch, rewind_snapshot_size) ==
                 rewind_snapshot_size)
           (void)Dkc2RewindHistoryPush(&rewind_history, rewind_scratch);
-        Dkc2DrawPpuFrame();
+        DrawFrame(&host);
         if (test_save_load_requested && test_load_injected)
           test_load_completed = true;
       } else {
@@ -1286,7 +1373,7 @@ static int RunGame(const char *rom_path,
           runtime_failure = true;
           break;
         }
-        Dkc2DrawPpuFrame();
+        DrawFrame(&host);
         frame_ready = true;
         if (test_rewind_requested) test_rewind_completed = true;
       }
@@ -1330,7 +1417,7 @@ static int RunGame(const char *rom_path,
               !Dkc2RewindHistoryPush(&rewind_history, rewind_scratch))
             rewind_available = false;
         }
-        Dkc2DrawPpuFrame();
+        DrawFrame(&host);
         frame_ready = true;
 #ifdef __APPLE__
         emulate_seconds += (double)(SDL_GetPerformanceCounter() - emulate_start) /
@@ -1400,9 +1487,16 @@ static int RunGame(const char *rom_path,
     stage_paced = Dkc2MacHostSeconds();
 #endif
     if (frame_ready) {
-      const uint8_t *present_pixels = Dkc2DesktopColorFilterApply(
-          &host.color_filter, host.pixels, host.filtered_pixels,
-          Dkc2VideoPixelCount());
+      /* The color filter works on the authentic frame only. */
+      const uint8_t *present_pixels =
+          host.hd_pixels ? (const uint8_t *)host.hd_pixels
+                         : Dkc2DesktopColorFilterApply(
+                               &host.color_filter, host.pixels,
+                               host.filtered_pixels, Dkc2VideoPixelCount());
+      const int present_width =
+          host.hd_pixels ? host.hd_width : Dkc2VideoWidth();
+      const int present_height =
+          host.hd_pixels ? host.hd_height : kFrameHeight;
       /* DKC2_DESKTOP_SCREENSHOT: capture the presented drawable (after the
        * upscaler and screen model, before the overlay is composited over it
        * is not possible, so the overlay should be closed) at frame
@@ -1421,7 +1515,7 @@ static int RunGame(const char *rom_path,
       }
       if (!present_pixels ||
           !Dkc2SdlPresenterPresent(&host.presenter, present_pixels,
-                                   Dkc2VideoWidth(), kFrameHeight,
+                                   present_width, present_height,
                                    Dkc2DesktopOverlayRenderOpenGl,
                                    host.overlay)) {
         fprintf(stderr, "SDL video presentation failed: %s\n", SDL_GetError());
@@ -1529,6 +1623,7 @@ static int RunGame(const char *rom_path,
   Dkc2DiagnosticsShutdown(completed ? "clean_exit" : "runtime_failure");
   Dkc2RewindHistoryDestroy(&rewind_history);
   free(rewind_scratch);
+  DestroyHd(&host);
   free(rom);
   ShutdownHost(&host);
   free(screenshot_rgb);

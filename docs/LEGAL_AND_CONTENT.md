@@ -21,6 +21,11 @@ This is an engineering policy, not legal advice.
 - Reused third-party code must include its license, exact source revision,
   provenance, and a record of local changes. The LakeSnes APU subset follows
   this rule under `third_party/lakesnes_apu`.
+- HD art packs (redrawn sprites, terrain blocks, screen art, and the dumps
+  they come from) are derivative of Nintendo and Rare content regardless of
+  the tool or model that produced them. They stay in ignored local folders and
+  are never committed or distributed; only the tooling that builds a pack from
+  the user's own ROM is public.
 - A license attached to a reverse-engineering tool does not license Nintendo or
   Rare content processed by that tool.
 - Any public release of translated or reconstructed game logic should receive

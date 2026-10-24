@@ -1,6 +1,7 @@
 #include "desktop_launcher.h"
 
 #include "dkc2_coop.h"
+#include "dkc2_hd.h"
 #include "dkc2_video.h"
 #include "launcher_profile.h"
 
@@ -103,6 +104,31 @@ void Dkc2LauncherSetCrt(const Dkc2CrtSettings *crt) {
   Dkc2CrtSettingsClamp(&s_crt);
 }
 
+/* HD presentation (dkc2_hd.h), on by default at 4x with smooth sprites and
+ * background and the HD pack's art. */
+static int s_hd_enabled = 1;
+static int s_hd_scale = 4;
+static int s_hd_sprites = kDkc2HdFilterSmooth;
+static int s_hd_background = kDkc2HdFilterSmooth;
+static int s_hd_art = 1;
+int Dkc2LauncherHdEnabled(void) { return s_hd_enabled; }
+void Dkc2LauncherSetHdEnabled(int enabled) { s_hd_enabled = enabled != 0; }
+int Dkc2LauncherHdScale(void) { return s_hd_scale; }
+void Dkc2LauncherSetHdScale(int scale) {
+  s_hd_scale = ClampInt(scale, kDkc2HdMinScale, kDkc2HdMaxScale);
+}
+int Dkc2LauncherHdSprites(void) { return s_hd_sprites; }
+void Dkc2LauncherSetHdSprites(int filter) {
+  s_hd_sprites = ClampInt(filter, kDkc2HdFilterNearest, kDkc2HdFilterSmooth);
+}
+int Dkc2LauncherHdBackground(void) { return s_hd_background; }
+void Dkc2LauncherSetHdBackground(int filter) {
+  s_hd_background =
+      ClampInt(filter, kDkc2HdFilterNearest, kDkc2HdFilterSmooth);
+}
+int Dkc2LauncherHdArt(void) { return s_hd_art; }
+void Dkc2LauncherSetHdArt(int enabled) { s_hd_art = enabled != 0; }
+
 int Dkc2LauncherWidescreenEdge(void) {
   return s_widescreen_edge;
 }
@@ -200,6 +226,16 @@ void Dkc2LauncherSettingsLoad(RecompLauncherCSettings *settings) {
       Dkc2LauncherSetWidescreenEdge(value);
     else if (strcmp(key, "CoopMode") == 0)
       Dkc2LauncherSetCoopMode(value);
+    else if (strcmp(key, "HdEnabled") == 0)
+      Dkc2LauncherSetHdEnabled(value);
+    else if (strcmp(key, "HdScale") == 0)
+      Dkc2LauncherSetHdScale(value);
+    else if (strcmp(key, "HdSprites") == 0)
+      Dkc2LauncherSetHdSprites(value);
+    else if (strcmp(key, "HdBackground") == 0)
+      Dkc2LauncherSetHdBackground(value);
+    else if (strcmp(key, "HdArt") == 0)
+      Dkc2LauncherSetHdArt(value);
     else if (strcmp(key, "HapticsEnabled") == 0)
       Dkc2LauncherSetHaptics(value);
     else if (strcmp(key, "Upscaler") == 0)
@@ -298,6 +334,8 @@ bool Dkc2LauncherSettingsSave(const RecompLauncherCSettings *settings) {
                     "Widescreen=%d\n"
                     "WidescreenEdge=%d\n"
                     "CoopMode=%d\n"
+                    "HdEnabled=%d\nHdScale=%d\nHdSprites=%d\n"
+                    "HdBackground=%d\nHdArt=%d\n"
                     "Upscaler=%d\nReconstructMode=%d\n"
                     "ReconstructStrength=%d\n"
                     "ReconstructSoftness=%d\nReconstructShading=%d\n"
@@ -324,6 +362,8 @@ bool Dkc2LauncherSettingsSave(const RecompLauncherCSettings *settings) {
                         kDkc2VideoAspectNative,
                     s_widescreen_edge,
                     s_coop_mode,
+                    s_hd_enabled, s_hd_scale, s_hd_sprites, s_hd_background,
+                    s_hd_art,
                     s_upscaler, s_reconstruct_mode, s_reconstruct_strength,
                     s_reconstruct_softness, s_reconstruct_shading,
                     s_haptics_enabled,

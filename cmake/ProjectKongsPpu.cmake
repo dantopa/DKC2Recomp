@@ -26,6 +26,12 @@ dkc2_kongs_patch("if(x + spriteSize > -left_extra) {"
     "if(kongVisible > 0 || x + spriteSize > -left_extra) {")
 dkc2_kongs_patch("index = foundSprites[i - 1];"
     "index = foundSprites[i - 1];\n    if (Dkc2KongsRenderOam(ppu, line, index >> 1)) { tilesFound++; continue; }")
+# HD compositor: captured overlay pixels carry the PPU's composition rank (the
+# z-buffer's high byte) in their alpha byte instead of a constant 0xff, so the
+# host can re-layer captured planes with the console's priority rules.
+# Transparent pixels remain 0.
+dkc2_kongs_patch("return 0xff000000u |"
+    "return (uint32)(pixel >> 8) << 24 |")
 set(_kongs_ppu_output "${CMAKE_CURRENT_BINARY_DIR}/dkc2_ppu.c")
 file(WRITE "${_kongs_ppu_output}.in" "${_kongs_ppu}")
 configure_file("${_kongs_ppu_output}.in" "${_kongs_ppu_output}" COPYONLY)
