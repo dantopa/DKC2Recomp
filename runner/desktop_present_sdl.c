@@ -1,6 +1,7 @@
 #include "desktop_present_sdl.h"
 
 #include "desktop_launcher.h"
+#include "dkc2_hd.h"
 #include "desktop_viewport.h"
 
 #include <SDL.h>
@@ -46,6 +47,7 @@ typedef struct Dkc2GlShaderApi {
   PFNGLUNIFORM1IPROC Uniform1i;
   PFNGLUNIFORM1FPROC Uniform1f;
   PFNGLUNIFORM2FPROC Uniform2f;
+  PFNGLUNIFORM4FPROC Uniform4f;
   PFNGLACTIVETEXTUREPROC ActiveTexture;
   /* EXT_framebuffer_object, for offscreen captures and the CRT passes.
    * Optional. */
@@ -80,6 +82,7 @@ static bool LoadShaderApi(Dkc2GlProcLoader load) {
   DKC2_GL_LOAD(Uniform1i, PFNGLUNIFORM1IPROC);
   DKC2_GL_LOAD(Uniform1f, PFNGLUNIFORM1FPROC);
   DKC2_GL_LOAD(Uniform2f, PFNGLUNIFORM2FPROC);
+  DKC2_GL_LOAD(Uniform4f, PFNGLUNIFORM4FPROC);
   DKC2_GL_LOAD(ActiveTexture, PFNGLACTIVETEXTUREPROC);
 #undef DKC2_GL_LOAD
   s_gl.GenFramebuffers = (PFNGLGENFRAMEBUFFERSEXTPROC)
@@ -284,6 +287,138 @@ static const char kCrtComposeFragmentSource[] =
     "  gl_FragColor = vec4(out_c, 1.0);\n"
     "}\n";
 
+/*
+ * HD scenes (dkc2_hd.h describes the scene and its rules), drawn into RGBA8
+ * targets at the output scale. Every pass works on whole output pixels: the
+ * output pixel is floor(gl_FragCoord), its 1x pixel floor(pixel / scale),
+ * and textures are read at texel centers with nearest sampling, so each
+ * pass computes what the CPU compositor computes for that pixel.
+ *
+ *   upscale    a 1x input (base or BG1) nearest, or premultiplied
+ *              Catmull-Rom with each channel kept within the 2x2 source
+ *              pixels nearest the output pixel (anti-ringing);
+ *   quad       an image over an output rectangle; for sprites, discarded
+ *              where the occlusion map hides it;
+ *   composite  the BG1 layer where the occlusion map puts it in front.
+ */
+static const char kHdUpscaleFragmentSource[] =
+    "#version 120\n"
+    "uniform sampler2D source;\n"
+    "uniform vec2 source_size;\n"
+    "uniform float scale;\n"
+    "uniform bool smooth;\n"
+    "vec4 texel(vec2 p) {\n"
+    "  p = clamp(p, vec2(0.0), source_size - 1.0);\n"
+    "  return texture2D(source, (p + 0.5) / source_size);\n"
+    "}\n"
+    "vec4 premultiplied(vec2 p) {\n"
+    "  vec4 c = texel(p);\n"
+    "  return vec4(c.rgb * c.a, c.a);\n"
+    "}\n"
+    "float weight(float t) {\n"
+    "  t = abs(t);\n"
+    "  if (t < 1.0) return (1.5 * t - 2.5) * t * t + 1.0;\n"
+    "  if (t < 2.0) return ((-0.5 * t + 2.5) * t - 4.0) * t + 2.0;\n"
+    "  return 0.0;\n"
+    "}\n"
+    "vec4 weights(float t) {\n"
+    "  return vec4(weight(t), weight(t - 1.0), weight(t - 2.0),\n"
+    "              weight(t - 3.0));\n"
+    "}\n"
+    "vec4 row(vec2 p, vec4 w) {\n"
+    "  return w.x * premultiplied(p) + w.y * premultiplied(p + vec2(1.0, 0.0))\n"
+    "       + w.z * premultiplied(p + vec2(2.0, 0.0))\n"
+    "       + w.w * premultiplied(p + vec2(3.0, 0.0));\n"
+    "}\n"
+    "void widen(vec4 c, inout vec3 low, inout vec3 high, inout bool any) {\n"
+    "  if (c.a < 0.5) return;\n"
+    "  low = min(low, c.rgb);\n"
+    "  high = max(high, c.rgb);\n"
+    "  any = true;\n"
+    "}\n"
+    "void main() {\n"
+    "  vec2 o = floor(gl_FragCoord.xy);\n"
+    "  vec2 cell = floor((o + 0.5) / scale);\n"
+    "  if (!smooth) {\n"
+    "    gl_FragColor = texel(cell);\n"
+    "    return;\n"
+    "  }\n"
+    "  vec2 position = (o - cell * scale + 0.5) / scale - 0.5;\n"
+    "  vec2 offset = vec2(position.x < 0.0 ? -2.0 : -1.0,\n"
+    "                     position.y < 0.0 ? -2.0 : -1.0);\n"
+    "  vec2 first = cell + offset;\n"
+    "  vec4 wx = weights(position.x - offset.x);\n"
+    "  vec4 wy = weights(position.y - offset.y);\n"
+    "  vec4 sum = wy.x * row(first, wx)\n"
+    "           + wy.y * row(first + vec2(0.0, 1.0), wx)\n"
+    "           + wy.z * row(first + vec2(0.0, 2.0), wx)\n"
+    "           + wy.w * row(first + vec2(0.0, 3.0), wx);\n"
+    "  vec2 near = clamp(first + 1.0, vec2(0.0), source_size - 1.0);\n"
+    "  vec3 low = vec3(1.0);\n"
+    "  vec3 high = vec3(0.0);\n"
+    "  bool any = false;\n"
+    "  widen(texel(near), low, high, any);\n"
+    "  widen(texel(near + vec2(1.0, 0.0)), low, high, any);\n"
+    "  widen(texel(near + vec2(0.0, 1.0)), low, high, any);\n"
+    "  widen(texel(near + vec2(1.0, 1.0)), low, high, any);\n"
+    "  if (sum.a * 255.0 < 1.0 || !any) {\n"
+    "    gl_FragColor = vec4(0.0);\n"
+    "    return;\n"
+    "  }\n"
+    "  gl_FragColor = vec4(clamp(sum.rgb / sum.a, low, high),\n"
+    "                      min(sum.a, 1.0));\n"
+    "}\n";
+
+/* Occlusion (from the scene's ARGB words): r the background rank, g an
+ * object rank, b a sprite-table owner + 1, a the BG1 layer in front. */
+static const char kHdQuadFragmentSource[] =
+    "#version 120\n"
+    "uniform sampler2D image;\n"
+    "uniform sampler2D occlusion;\n"
+    "uniform vec2 image_size;\n"
+    "uniform vec2 native_size;\n"
+    "uniform vec4 rect;\n"
+    "uniform vec2 flip;\n"
+    "uniform float scale;\n"
+    "uniform float brightness;\n"
+    "uniform float rank;\n"
+    "uniform float index;\n"
+    "uniform bool sprite;\n"
+    "void main() {\n"
+    "  vec2 o = floor(gl_FragCoord.xy);\n"
+    "  vec2 local = mix(o - rect.xy, rect.xy + rect.zw - 1.0 - o, flip);\n"
+    "  vec2 cell = floor((local * image_size + 0.5) / rect.zw);\n"
+    "  vec4 color = texture2D(image, (cell + 0.5) / image_size);\n"
+    "  if (sprite) {\n"
+    "    if (color.a == 0.0) discard;\n"
+    "    vec2 pixel = floor((o + 0.5) / scale);\n"
+    "    vec4 hide = floor(texture2D(occlusion, (pixel + 0.5) / native_size)\n"
+    "                      * 255.0 + 0.5);\n"
+    "    if (rank <= hide.r || (hide.g > 0.0 && hide.g >= rank) ||\n"
+    "        (hide.b > 0.0 && hide.b - 1.0 > index)) discard;\n"
+    "  }\n"
+    "  if (brightness < 255.0)\n"
+    "    color.rgb = floor((floor(color.rgb * 255.0 + 0.5) * brightness\n"
+    "                       + 0.5) / 255.0) / 255.0;\n"
+    "  gl_FragColor = color;\n"
+    "}\n";
+
+static const char kHdCompositeFragmentSource[] =
+    "#version 120\n"
+    "uniform sampler2D layer;\n"
+    "uniform sampler2D occlusion;\n"
+    "uniform vec2 output_size;\n"
+    "uniform vec2 native_size;\n"
+    "uniform float scale;\n"
+    "void main() {\n"
+    "  vec2 o = floor(gl_FragCoord.xy);\n"
+    "  vec4 color = texture2D(layer, (o + 0.5) / output_size);\n"
+    "  vec2 pixel = floor((o + 0.5) / scale);\n"
+    "  float front = texture2D(occlusion, (pixel + 0.5) / native_size).a;\n"
+    "  if (color.a == 0.0 || front < 0.5) discard;\n"
+    "  gl_FragColor = color;\n"
+    "}\n";
+
 static GLuint CompileShader(GLenum kind, const char *source,
                             const char *name, char *error,
                             size_t capacity) {
@@ -382,6 +517,40 @@ static void BuildCrtPrograms(Dkc2SdlPresenter *presenter) {
   }
 }
 
+static void BuildHdPrograms(Dkc2SdlPresenter *presenter) {
+  static const char *const sources[kDkc2HdPassCount] = {
+      kHdUpscaleFragmentSource, kHdQuadFragmentSource,
+      kHdCompositeFragmentSource};
+  static const char *const names[kDkc2HdPassCount] = {
+      "hd upscale", "hd quad", "hd composite"};
+  if (!s_gl.fbo) {
+    SetError(presenter->hd_error, sizeof presenter->hd_error,
+             "gpu hd unavailable: framebuffer objects missing");
+    return;
+  }
+  for (int pass = 0; pass < kDkc2HdPassCount; pass++) {
+    presenter->hd_program[pass] =
+        BuildProgram(sources[pass], names[pass], presenter->hd_error,
+                     sizeof presenter->hd_error);
+    if (!presenter->hd_program[pass]) {
+      for (int built = 0; built < pass; built++) {
+        s_gl.DeleteProgram(presenter->hd_program[built]);
+        presenter->hd_program[built] = 0;
+      }
+      return;
+    }
+  }
+  glGenTextures(3, presenter->hd_input);
+  for (int input = 0; input < 3; input++) {
+    glBindTexture(GL_TEXTURE_2D, presenter->hd_input[input]);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  }
+  glBindTexture(GL_TEXTURE_2D, 0);
+}
+
 static bool CrtProgramsReady(const Dkc2SdlPresenter *presenter) {
   for (int pass = 0; pass < kDkc2CrtPassCount; pass++)
     if (!presenter->crt_program[pass]) return false;
@@ -403,7 +572,7 @@ static bool EnvironmentEnabled(const char *name) {
   return value && *value && *value != '0';
 }
 
-/* Half-float render targets for the CRT passes. */
+/* Render targets: half-float for the CRT passes, RGBA8 for HD scenes. */
 static void DestroyTarget(Dkc2GlTarget *target) {
   if (!target) return;
   if (target->fbo && s_gl.fbo) s_gl.DeleteFramebuffers(1, &target->fbo);
@@ -412,14 +581,14 @@ static void DestroyTarget(Dkc2GlTarget *target) {
 }
 
 static bool CreateTarget(Dkc2GlTarget *target, int width, int height,
-                         GLint filter) {
+                         GLint format, GLint filter) {
   memset(target, 0, sizeof *target);
   if (width < 1) width = 1;
   if (height < 1) height = 1;
   glGenTextures(1, &target->texture);
   if (!target->texture) return false;
   glBindTexture(GL_TEXTURE_2D, target->texture);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F_ARB, width, height, 0, GL_RGBA,
+  glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, GL_RGBA,
                GL_FLOAT, NULL);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
@@ -462,14 +631,19 @@ static bool EnsureCrtTargets(Dkc2SdlPresenter *presenter, int viewport_width,
   DestroyCrtTargets(presenter);
   const int glow_w = viewport_width / 4, glow_h = viewport_height / 4;
   const int halo_w = viewport_width / 16, halo_h = viewport_height / 16;
+  const GLint half = GL_RGBA16F_ARB;
   if (!CreateTarget(&presenter->crt_lines, viewport_width, source_height,
-                    GL_NEAREST) ||
+                    half, GL_NEAREST) ||
       !CreateTarget(&presenter->crt_beam, viewport_width, viewport_height,
+                    half, GL_LINEAR) ||
+      !CreateTarget(&presenter->crt_glow[0], glow_w, glow_h, half,
                     GL_LINEAR) ||
-      !CreateTarget(&presenter->crt_glow[0], glow_w, glow_h, GL_LINEAR) ||
-      !CreateTarget(&presenter->crt_glow[1], glow_w, glow_h, GL_LINEAR) ||
-      !CreateTarget(&presenter->crt_halo[0], halo_w, halo_h, GL_LINEAR) ||
-      !CreateTarget(&presenter->crt_halo[1], halo_w, halo_h, GL_LINEAR)) {
+      !CreateTarget(&presenter->crt_glow[1], glow_w, glow_h, half,
+                    GL_LINEAR) ||
+      !CreateTarget(&presenter->crt_halo[0], halo_w, halo_h, half,
+                    GL_LINEAR) ||
+      !CreateTarget(&presenter->crt_halo[1], halo_w, halo_h, half,
+                    GL_LINEAR)) {
     DestroyCrtTargets(presenter);
     SetError(presenter->crt_error, sizeof presenter->crt_error,
              "crt display unavailable: half-float render targets failed");
@@ -489,11 +663,14 @@ void Dkc2GlPipelineInitialize(Dkc2SdlPresenter *presenter, Dkc2GlProcLoader load
   } else {
     BuildReconstructProgram(presenter);
     BuildCrtPrograms(presenter);
+    BuildHdPrograms(presenter);
   }
   if (presenter->program == 0 && presenter->shader_error[0])
     fprintf(stderr, "warning: %s\n", presenter->shader_error);
   if (!CrtProgramsReady(presenter) && presenter->crt_error[0])
     fprintf(stderr, "warning: %s\n", presenter->crt_error);
+  if (!presenter->hd_program[0] && presenter->hd_error[0])
+    fprintf(stderr, "warning: %s\n", presenter->hd_error);
 }
 
 bool Dkc2GlPipelineCrtAvailable(const Dkc2SdlPresenter *presenter) {
@@ -727,16 +904,17 @@ static void DrawIntoTarget(GLuint program, const Dkc2GlTarget *target) {
   DrawFrameQuad(false);
 }
 
-/* The flat presentation: the uploaded frame through the selected sampler
+/* The flat presentation: the source frame through the selected sampler
  * or the Reconstruct program, into the viewport of the bound framebuffer. */
-static void RenderFlat(Dkc2SdlPresenter *presenter, int source_width,
-                       int source_height, const Dkc2DesktopViewport *viewport,
+static void RenderFlat(Dkc2SdlPresenter *presenter, GLuint source,
+                       int source_width, int source_height,
+                       const Dkc2DesktopViewport *viewport,
                        int output_height) {
   const bool reconstruct =
       presenter->upscaler == kDkc2UpscalerReconstruct && presenter->program;
   GLint sampling = presenter->linear_filter && !reconstruct ? GL_LINEAR
                                                              : GL_NEAREST;
-  glBindTexture(GL_TEXTURE_2D, presenter->texture);
+  glBindTexture(GL_TEXTURE_2D, source);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, sampling);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, sampling);
   glViewport(viewport->x, output_height - viewport->y - viewport->height,
@@ -763,9 +941,10 @@ static void RenderFlat(Dkc2SdlPresenter *presenter, int source_width,
 /* The CRT presentation: the five passes, ending in the viewport of
  * final_fbo (0 for the window). False when the targets cannot be built,
  * in which case nothing was drawn and the caller falls back to Flat. */
-static bool RenderCrt(Dkc2SdlPresenter *presenter, int source_width,
-                      int source_height, const Dkc2DesktopViewport *viewport,
-                      int output_height, GLuint final_fbo) {
+static bool RenderCrt(Dkc2SdlPresenter *presenter, GLuint source,
+                      int source_width, int source_height,
+                      const Dkc2DesktopViewport *viewport, int output_height,
+                      GLuint final_fbo) {
   Dkc2CrtFrameParams params;
   if (!Dkc2CrtDerive(&presenter->crt, viewport->width, viewport->height,
                      source_width, source_height, &params))
@@ -776,7 +955,7 @@ static bool RenderCrt(Dkc2SdlPresenter *presenter, int source_width,
   const GLuint *programs = presenter->crt_program;
 
   /* Lines: decode and resample each source row across the viewport. */
-  BindTextureUnit(0, presenter->texture);
+  BindTextureUnit(0, source);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   s_gl.UseProgram(programs[kDkc2CrtPassLines]);
@@ -857,7 +1036,7 @@ static bool RenderCrt(Dkc2SdlPresenter *presenter, int source_width,
   s_gl.UseProgram(0);
   BindTextureUnit(2, 0);
   BindTextureUnit(1, 0);
-  BindTextureUnit(0, presenter->texture);
+  BindTextureUnit(0, source);
   return true;
 }
 
@@ -865,7 +1044,7 @@ static bool RenderCrt(Dkc2SdlPresenter *presenter, int source_width,
  * display in effect. Shared by the window and the capture, so both show
  * the same chain. */
 void Dkc2GlPipelineRender(Dkc2SdlPresenter *presenter, GLuint final_fbo,
-                        int source_width, int source_height,
+                        GLuint source, int source_width, int source_height,
                         int output_width, int output_height,
                         const Dkc2DesktopViewport *viewport) {
   if (s_gl.fbo) s_gl.BindFramebuffer(GL_FRAMEBUFFER_EXT, final_fbo);
@@ -873,7 +1052,7 @@ void Dkc2GlPipelineRender(Dkc2SdlPresenter *presenter, GLuint final_fbo,
   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
   glClear(GL_COLOR_BUFFER_BIT);
   if (presenter->display == kDkc2DisplayCrt &&
-      RenderCrt(presenter, source_width, source_height, viewport,
+      RenderCrt(presenter, source, source_width, source_height, viewport,
                 output_height, final_fbo))
     return;
   if (presenter->display == kDkc2DisplayCrt) {
@@ -883,52 +1062,34 @@ void Dkc2GlPipelineRender(Dkc2SdlPresenter *presenter, GLuint final_fbo,
       fprintf(stderr, "warning: %s; using flat\n", presenter->crt_error);
     if (s_gl.fbo) s_gl.BindFramebuffer(GL_FRAMEBUFFER_EXT, final_fbo);
   }
-  RenderFlat(presenter, source_width, source_height, viewport,
+  RenderFlat(presenter, source, source_width, source_height, viewport,
              output_height);
 }
 
-bool Dkc2SdlPresenterPresent(Dkc2SdlPresenter *presenter,
-                             const uint8_t *pixels, int source_width,
-                             int source_height,
-                             Dkc2SdlOverlayDraw overlay_draw,
-                             void *overlay_user) {
-  if (!presenter || !presenter->window || !presenter->gl_context ||
-      !presenter->texture || !pixels || source_width <= 0 ||
-      source_height <= 0)
-    return false;
+/* Shows the source frame in the window with the display in effect, takes
+ * an armed capture of it, draws the overlay, and swaps. */
+static void ShowFrame(Dkc2SdlPresenter *presenter, GLuint source,
+                      int source_width, int source_height,
+                      Dkc2SdlOverlayDraw overlay_draw, void *overlay_user) {
   SDL_Window *window = (SDL_Window *)presenter->window;
-  SDL_GLContext context = (SDL_GLContext)presenter->gl_context;
-  if (SDL_GL_MakeCurrent(window, context) != 0) return false;
   int output_width = 0;
   int output_height = 0;
   SDL_GL_GetDrawableSize(window, &output_width, &output_height);
   Dkc2DesktopViewport viewport;
   if (!Dkc2DesktopComputeViewport(output_width, output_height,
                                   source_width, source_height, &viewport))
-    return true;
+    return;
 
   glDisable(GL_DEPTH_TEST);
   glDisable(GL_BLEND);
   glEnable(GL_TEXTURE_2D);
-  glBindTexture(GL_TEXTURE_2D, presenter->texture);
-  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-  if (presenter->texture_width != source_width ||
-      presenter->texture_height != source_height) {
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, source_width, source_height, 0,
-                 GL_BGRA, GL_UNSIGNED_BYTE, pixels);
-    presenter->texture_width = source_width;
-    presenter->texture_height = source_height;
-  } else {
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, source_width, source_height,
-                    GL_BGRA, GL_UNSIGNED_BYTE, pixels);
-  }
   glMatrixMode(GL_PROJECTION);
   glLoadIdentity();
   glMatrixMode(GL_MODELVIEW);
   glLoadIdentity();
   glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-  Dkc2GlPipelineRender(presenter, 0, source_width, source_height, output_width,
-              output_height, &viewport);
+  Dkc2GlPipelineRender(presenter, 0, source, source_width, source_height,
+                       output_width, output_height, &viewport);
   /* Offscreen capture: draw the same frame into a framebuffer object and
    * read it back. A hidden window's back buffer reads back empty on macOS,
    * so the capture never depends on the window being displayed. */
@@ -942,15 +1103,16 @@ bool Dkc2SdlPresenterPresent(Dkc2SdlPresenter *presenter,
                  GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glBindTexture(GL_TEXTURE_2D, presenter->texture);
+    glBindTexture(GL_TEXTURE_2D, source);
     s_gl.GenFramebuffers(1, &fbo);
     s_gl.BindFramebuffer(GL_FRAMEBUFFER_EXT, fbo);
     s_gl.FramebufferTexture2D(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT,
                               GL_TEXTURE_2D, color, 0);
     if (s_gl.CheckFramebufferStatus(GL_FRAMEBUFFER_EXT) ==
         GL_FRAMEBUFFER_COMPLETE_EXT) {
-      Dkc2GlPipelineRender(presenter, fbo, source_width, source_height, output_width,
-                  output_height, &viewport);
+      Dkc2GlPipelineRender(presenter, fbo, source, source_width,
+                           source_height, output_width, output_height,
+                           &viewport);
       s_gl.BindFramebuffer(GL_FRAMEBUFFER_EXT, fbo);
       glPixelStorei(GL_PACK_ALIGNMENT, 1);
       glReadPixels(0, 0, output_width, output_height, GL_RGB,
@@ -973,7 +1135,6 @@ bool Dkc2SdlPresenterPresent(Dkc2SdlPresenter *presenter,
     s_gl.BindFramebuffer(GL_FRAMEBUFFER_EXT, 0);
     s_gl.DeleteFramebuffers(1, &fbo);
     glDeleteTextures(1, &color);
-    glBindTexture(GL_TEXTURE_2D, presenter->texture);
   }
   glBindTexture(GL_TEXTURE_2D, 0);
   glDisable(GL_TEXTURE_2D);
@@ -983,6 +1144,239 @@ bool Dkc2SdlPresenterPresent(Dkc2SdlPresenter *presenter,
   }
   glFlush();
   SDL_GL_SwapWindow(window);
+}
+
+bool Dkc2SdlPresenterPresent(Dkc2SdlPresenter *presenter,
+                             const uint8_t *pixels, int source_width,
+                             int source_height,
+                             Dkc2SdlOverlayDraw overlay_draw,
+                             void *overlay_user) {
+  if (!presenter || !presenter->window || !presenter->gl_context ||
+      !presenter->texture || !pixels || source_width <= 0 ||
+      source_height <= 0)
+    return false;
+  if (SDL_GL_MakeCurrent((SDL_Window *)presenter->window,
+                         (SDL_GLContext)presenter->gl_context) != 0)
+    return false;
+  glBindTexture(GL_TEXTURE_2D, presenter->texture);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+  if (presenter->texture_width != source_width ||
+      presenter->texture_height != source_height) {
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, source_width, source_height, 0,
+                 GL_BGRA, GL_UNSIGNED_BYTE, pixels);
+    presenter->texture_width = source_width;
+    presenter->texture_height = source_height;
+  } else {
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, source_width, source_height,
+                    GL_BGRA, GL_UNSIGNED_BYTE, pixels);
+  }
+  ShowFrame(presenter, presenter->texture, source_width, source_height,
+            overlay_draw, overlay_user);
+  return true;
+}
+
+bool Dkc2SdlPresenterHdAvailable(const Dkc2SdlPresenter *presenter) {
+  return presenter && presenter->hd_program[0] != 0;
+}
+
+/* The 1x input textures and the output-sized targets of a scene (the
+ * targets are rebuilt only when the output size changes). */
+static bool PrepareHdTargets(Dkc2SdlPresenter *presenter, int width,
+                             int height, bool layer) {
+  if (presenter->hd_output.width != width ||
+      presenter->hd_output.height != height) {
+    DestroyTarget(&presenter->hd_output);
+    DestroyTarget(&presenter->hd_layer);
+    if (!CreateTarget(&presenter->hd_output, width, height, GL_RGBA8,
+                      GL_NEAREST))
+      return false;
+  }
+  if (layer && !presenter->hd_layer.texture &&
+      !CreateTarget(&presenter->hd_layer, width, height, GL_RGBA8,
+                    GL_NEAREST))
+    return false;
+  return true;
+}
+
+static void UploadHdInput(GLuint texture, const uint32_t *pixels, int width,
+                          int height, bool resize) {
+  glBindTexture(GL_TEXTURE_2D, texture);
+  if (resize)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_BGRA,
+                 GL_UNSIGNED_BYTE, pixels);
+  else
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_BGRA,
+                    GL_UNSIGNED_BYTE, pixels);
+}
+
+/* The uploaded texture of a scene image, 0 when none can be made. Uploads
+ * live under the image id; when the table is full, those the scene being
+ * drawn has not used are dropped. */
+static GLuint HdImageTexture(Dkc2SdlPresenter *presenter,
+                             const Dkc2HdImage *image) {
+  for (unsigned i = 0; i < presenter->hd_image_count; i++) {
+    Dkc2GlHdImage *entry = &presenter->hd_images[i];
+    if (entry->id == image->id) {
+      entry->serial = presenter->hd_serial;
+      return entry->texture;
+    }
+  }
+  if (presenter->hd_image_count == kDkc2HdImageMax) {
+    unsigned kept = 0;
+    for (unsigned i = 0; i < presenter->hd_image_count; i++) {
+      Dkc2GlHdImage *entry = &presenter->hd_images[i];
+      if (entry->serial == presenter->hd_serial)
+        presenter->hd_images[kept++] = *entry;
+      else
+        glDeleteTextures(1, &entry->texture);
+    }
+    presenter->hd_image_count = kept;
+    if (kept == kDkc2HdImageMax) return 0;
+  }
+  GLuint texture = 0;
+  glGenTextures(1, &texture);
+  if (!texture) return 0;
+  glBindTexture(GL_TEXTURE_2D, texture);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, image->width, image->height, 0,
+               GL_BGRA, GL_UNSIGNED_BYTE, image->pixels);
+  presenter->hd_images[presenter->hd_image_count++] =
+      (Dkc2GlHdImage){image->id, texture, presenter->hd_serial};
+  return texture;
+}
+
+/* Draws quads with the quad program into the bound target (width by
+ * height output pixels). */
+static void DrawHdQuads(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene,
+                        const Dkc2HdQuad *quads, unsigned count, bool sprite,
+                        int width, int height) {
+  const GLuint program = presenter->hd_program[kDkc2HdPassQuad];
+  s_gl.UseProgram(program);
+  Uniform1i(program, "image", 0);
+  Uniform1i(program, "occlusion", 1);
+  Uniform2f(program, "native_size", (float)scene->width,
+            (float)scene->height);
+  Uniform1f(program, "scale", (float)scene->scale);
+  Uniform1i(program, "sprite", sprite);
+  const GLint rect = s_gl.GetUniformLocation(program, "rect");
+  for (unsigned q = 0; q < count; q++) {
+    const Dkc2HdQuad *quad = &quads[q];
+    const GLuint texture = HdImageTexture(presenter, quad->image);
+    if (!texture) continue;
+    BindTextureUnit(0, texture);
+    Uniform2f(program, "image_size", (float)quad->image->width,
+              (float)quad->image->height);
+    s_gl.Uniform4f(rect, (float)quad->x, (float)quad->y, (float)quad->width,
+                   (float)quad->height);
+    Uniform2f(program, "flip", quad->flip_x ? 1.0f : 0.0f,
+              quad->flip_y ? 1.0f : 0.0f);
+    Uniform1f(program, "brightness", (float)quad->brightness);
+    Uniform1f(program, "rank", (float)quad->rank);
+    Uniform1f(program, "index", (float)quad->index);
+    /* Output row 0 is the target's first row (texture coordinate 0). */
+    const float left = 2.0f * (float)quad->x / (float)width - 1.0f;
+    const float right =
+        2.0f * (float)(quad->x + quad->width) / (float)width - 1.0f;
+    const float bottom = 2.0f * (float)quad->y / (float)height - 1.0f;
+    const float top =
+        2.0f * (float)(quad->y + quad->height) / (float)height - 1.0f;
+    glBegin(GL_QUADS);
+    glVertex2f(left, bottom);
+    glVertex2f(right, bottom);
+    glVertex2f(right, top);
+    glVertex2f(left, top);
+    glEnd();
+  }
+}
+
+/* Draws a scene into hd_output in the order dkc2_hd.h gives. False when
+ * the targets cannot be built. */
+static bool ComposeHd(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene) {
+  const int width = scene->width * scene->scale;
+  const int height = scene->height * scene->scale;
+  if (!PrepareHdTargets(presenter, width, height, scene->layer != NULL))
+    return false;
+  presenter->hd_serial = scene->serial;
+  const bool resize = presenter->hd_input_width != scene->width;
+  presenter->hd_input_width = scene->width;
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+  UploadHdInput(presenter->hd_input[0], scene->base, scene->width,
+                scene->height, resize);
+  UploadHdInput(presenter->hd_input[1], scene->occlusion, scene->width,
+                scene->height, resize);
+  if (scene->layer)
+    UploadHdInput(presenter->hd_input[2], scene->layer, scene->width,
+                  scene->height, resize);
+  glDisable(GL_DEPTH_TEST);
+  glDisable(GL_BLEND);
+  glEnable(GL_TEXTURE_2D);
+
+  const GLuint upscale = presenter->hd_program[kDkc2HdPassUpscale];
+  s_gl.UseProgram(upscale);
+  Uniform1i(upscale, "source", 0);
+  Uniform2f(upscale, "source_size", (float)scene->width,
+            (float)scene->height);
+  Uniform1f(upscale, "scale", (float)scene->scale);
+  Uniform1i(upscale, "smooth",
+            scene->background == kDkc2HdFilterSmooth);
+  BindTextureUnit(0, presenter->hd_input[0]);
+  DrawIntoTarget(upscale, &presenter->hd_output);
+  BindTextureUnit(1, presenter->hd_input[1]);
+  /* Blended passes keep the output opaque, as the CPU blend does. */
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+  if (scene->layer) {
+    BindTextureUnit(0, presenter->hd_input[2]);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    DrawIntoTarget(upscale, &presenter->hd_layer);
+    DrawHdQuads(presenter, scene, scene->art, scene->art_count, false, width,
+                height);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+    const GLuint composite = presenter->hd_program[kDkc2HdPassComposite];
+    BindTextureUnit(0, presenter->hd_layer.texture);
+    s_gl.UseProgram(composite);
+    Uniform1i(composite, "layer", 0);
+    Uniform1i(composite, "occlusion", 1);
+    Uniform2f(composite, "output_size", (float)width, (float)height);
+    Uniform2f(composite, "native_size", (float)scene->width,
+              (float)scene->height);
+    Uniform1f(composite, "scale", (float)scene->scale);
+    glEnable(GL_BLEND);
+    DrawIntoTarget(composite, &presenter->hd_output);
+  } else {
+    s_gl.BindFramebuffer(GL_FRAMEBUFFER_EXT, presenter->hd_output.fbo);
+    glViewport(0, 0, width, height);
+  }
+  glEnable(GL_BLEND);
+  DrawHdQuads(presenter, scene, scene->sprites, scene->sprite_count, true,
+              width, height);
+  glDisable(GL_BLEND);
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  s_gl.UseProgram(0);
+  BindTextureUnit(1, 0);
+  BindTextureUnit(0, 0);
+  s_gl.BindFramebuffer(GL_FRAMEBUFFER_EXT, 0);
+  return true;
+}
+
+bool Dkc2SdlPresenterPresentHd(Dkc2SdlPresenter *presenter,
+                               const Dkc2HdScene *scene,
+                               Dkc2SdlOverlayDraw overlay_draw,
+                               void *overlay_user) {
+  if (!Dkc2SdlPresenterHdAvailable(presenter) || !presenter->window ||
+      !presenter->gl_context || !scene)
+    return false;
+  if (SDL_GL_MakeCurrent((SDL_Window *)presenter->window,
+                         (SDL_GLContext)presenter->gl_context) != 0)
+    return false;
+  if (scene->serial != presenter->hd_serial && !ComposeHd(presenter, scene))
+    return false;
+  ShowFrame(presenter, presenter->hd_output.texture,
+            scene->width * scene->scale, scene->height * scene->scale,
+            overlay_draw, overlay_user);
   return true;
 }
 
@@ -1043,6 +1437,18 @@ void Dkc2GlPipelineDestroy(Dkc2SdlPresenter *presenter) {
   }
   if (presenter->program) s_gl.DeleteProgram(presenter->program);
   presenter->program = 0;
+  for (int pass = 0; pass < kDkc2HdPassCount; pass++) {
+    if (presenter->hd_program[pass])
+      s_gl.DeleteProgram(presenter->hd_program[pass]);
+    presenter->hd_program[pass] = 0;
+  }
+  if (presenter->hd_input[0]) glDeleteTextures(3, presenter->hd_input);
+  memset(presenter->hd_input, 0, sizeof presenter->hd_input);
+  for (unsigned i = 0; i < presenter->hd_image_count; i++)
+    glDeleteTextures(1, &presenter->hd_images[i].texture);
+  presenter->hd_image_count = 0;
+  DestroyTarget(&presenter->hd_output);
+  DestroyTarget(&presenter->hd_layer);
 }
 
 void Dkc2SdlPresenterDestroy(Dkc2SdlPresenter *presenter) {

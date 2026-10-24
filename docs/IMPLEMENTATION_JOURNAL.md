@@ -6371,3 +6371,21 @@ in the release notes. The feature baseline is the complete 86-test pass above.
 GitHub inspection found no newer Mac artifact than v0.0.6; the release carries
 that original archive and checksum, with its older feature coverage explicitly
 labelled. Source-only changes are committed; release archives stay outside Git.
+
+## 2026-10-24 - HD compositor on the GPU
+
+The owner asked to move the HD compositor to the GPU before adding further
+effects. The CPU compositor was first split into a 1x scene and a CPU
+executor; the Pirate Panic capture (frame 3300 of the recorded route, 4x
+smooth, art pack) and the HD title stayed byte-identical to the previous
+build. The SDL presenter then draws the same scene on the GPU.
+
+Hidden 3300-frame captures compared with `DKC2_HD_CPU=1`: Pirate Panic with
+the art pack differs in 11 of 3.3 million pixels (4 above 2 levels, maximum
+5); the title, and Pirate Panic without art (nearest and smooth), differ by
+at most 2. Process CPU time for the paced run fell from 30.6 s to 13.9 s
+user. `SNESRECOMP_INPUT_PLAY` now drives the SDL host as it does the headless
+runner, which is how these scenes are reached without a window. Mainbrace
+Mayhem (BG1 through the subscreen) was not captured; it takes the non-layered
+path, covered by the art-free runs. The Windows host still uses the CPU
+executor.

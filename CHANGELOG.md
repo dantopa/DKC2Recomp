@@ -13,6 +13,11 @@
   headless runs, and `scripts/hd_pack.py` to build packs from dumps.
 - Scenes that draw BG1 through the subscreen (Mainbrace Mayhem) keep the
   native BG1 instead of losing the terrain.
+- The desktop host draws HD frames on the GPU: the compositor records each
+  frame as a 1x scene (base, occlusion map, BG1 layer, art and sprite quads)
+  and the presenter renders it into an output-sized texture with GLSL 1.20,
+  matching the CPU compositor within rounding while using about half the
+  CPU time. `DKC2_HD_CPU=1` keeps the CPU path; headless runs always use it.
 
 ## 0.0.8 (alpha) - 2026-09-13
 

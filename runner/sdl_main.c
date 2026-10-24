@@ -132,6 +132,11 @@ typedef struct SdlHost {
   const uint32_t *hd_pixels;
   int hd_width;
   int hd_height;
+  /* With the GPU path the last frame is a scene the presenter draws, and
+   * hd_pixels stays NULL. DKC2_HD_CPU=1 keeps the CPU compositor, the
+   * reference the GPU path is checked against. */
+  bool hd_gpu;
+  const Dkc2HdScene *hd_scene;
 #ifdef _WIN32
   Dkc2WindowsMenu *menu;
 #endif
@@ -141,10 +146,14 @@ typedef struct SdlHost {
 static void DrawFrame(SdlHost *host) {
   Dkc2HdBeginFrame(host->hd, g_ppu, Dkc2VideoWidth());
   Dkc2DrawPpuFrame();
-  host->hd_pixels = Dkc2HdEndFrame(
-      host->hd, g_ppu, g_ram, host->pixels,
-      (size_t)Dkc2VideoWidth() * kBytesPerPixel, &host->hd_width,
-      &host->hd_height);
+  const size_t pitch = (size_t)Dkc2VideoWidth() * kBytesPerPixel;
+  if (host->hd_gpu) {
+    host->hd_scene =
+        Dkc2HdEndFrameScene(host->hd, g_ppu, g_ram, host->pixels, pitch);
+    return;
+  }
+  host->hd_pixels = Dkc2HdEndFrame(host->hd, g_ppu, g_ram, host->pixels,
+                                   pitch, &host->hd_width, &host->hd_height);
 }
 
 typedef struct SdlControls {
@@ -668,6 +677,7 @@ static void DestroyHd(SdlHost *host) {
   Dkc2HdDestroy(host->hd);
   host->hd = NULL;
   host->hd_pixels = NULL;
+  host->hd_scene = NULL;
 }
 
 /* Builds, rebuilds or drops the HD compositor to match the HD options. */
@@ -928,6 +938,8 @@ static int RunGame(const char *rom_path,
     ShowError(video_error);
     return 4;
   }
+  host.hd_gpu = Dkc2SdlPresenterHdAvailable(&host.presenter) &&
+                !EnvironmentEnabled("DKC2_HD_CPU");
   {
     /* DKC2_DESKTOP_TEST_WINDOW=WxH: size the window in points so a hidden
      * capture can be taken at a chosen drawable size (the panel's full
@@ -1507,12 +1519,15 @@ static int RunGame(const char *rom_path,
     stage_paced = Dkc2MacHostSeconds();
 #endif
     if (frame_ready) {
-      /* The color filter works on the authentic frame only. */
+      /* The color filter works on the authentic frame only; an HD scene
+       * is drawn by the presenter. */
       const uint8_t *present_pixels =
-          host.hd_pixels ? (const uint8_t *)host.hd_pixels
-                         : Dkc2DesktopColorFilterApply(
-                               &host.color_filter, host.pixels,
-                               host.filtered_pixels, Dkc2VideoPixelCount());
+          host.hd_scene ? NULL
+          : host.hd_pixels
+              ? (const uint8_t *)host.hd_pixels
+              : Dkc2DesktopColorFilterApply(&host.color_filter, host.pixels,
+                                            host.filtered_pixels,
+                                            Dkc2VideoPixelCount());
       const int present_width =
           host.hd_pixels ? host.hd_width : Dkc2VideoWidth();
       const int present_height =
@@ -1533,11 +1548,17 @@ static int RunGame(const char *rom_path,
                                        dh);
         }
       }
-      if (!present_pixels ||
-          !Dkc2SdlPresenterPresent(&host.presenter, present_pixels,
-                                   present_width, present_height,
-                                   Dkc2DesktopOverlayRenderOpenGl,
-                                   host.overlay)) {
+      const bool presented =
+          host.hd_scene
+              ? Dkc2SdlPresenterPresentHd(&host.presenter, host.hd_scene,
+                                          Dkc2DesktopOverlayRenderOpenGl,
+                                          host.overlay)
+              : present_pixels &&
+                    Dkc2SdlPresenterPresent(&host.presenter, present_pixels,
+                                            present_width, present_height,
+                                            Dkc2DesktopOverlayRenderOpenGl,
+                                            host.overlay);
+      if (!presented) {
         fprintf(stderr, "SDL video presentation failed: %s\n", SDL_GetError());
         Dkc2DiagnosticsFatal("SDL video presentation failed");
         runtime_failure = true;

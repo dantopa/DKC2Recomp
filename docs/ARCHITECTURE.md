@@ -1816,3 +1816,27 @@ Held-Kong ownership resolves from those guest selectors after save/load too.
 The state policy preserves the carrier's pickup wait and restores independent
 control and collision flags when a thrown partner has landed. Classic, solo
 and contest retain the original eligibility and state paths.
+
+## HD presentation: scene and executors (2026-10-24)
+
+`runner/dkc2_hd.c` decides every HD frame at 1x and records the decisions as
+a `Dkc2HdScene` (`dkc2_hd.h`): the base frame, an occlusion word per pixel
+(highest background rank, rank of an object outside the sprite table, owning
+sprite-table record, and whether the HD BG1 layer is in front), the BG1
+layer source with its terrain or screen art quads, and the sprite quads with
+rank and table order. Two executors draw a scene at the output scale:
+
+- CPU (`Dkc2HdEndFrame`): the original compositor, now reading the scene. It
+  serves headless runs, the Windows host and `DKC2_HD_CPU=1`, and is the
+  reference the GPU path is compared with.
+- GPU (`Dkc2SdlPresenterPresentHd` in `desktop_present_sdl.c`): three GLSL
+  1.20 programs (upscale, quad, composite) into RGBA8 framebuffer objects.
+  Each fragment works on whole output pixels and reads textures at texel
+  centers, so it evaluates the same per-pixel rule as the CPU. The result
+  feeds the unchanged flat or CRT display chain. On macOS this runs through
+  Apple's OpenGL implementation over Metal.
+
+Scene images carry a process-unique id; the presenter keeps uploads under
+that id and drops unused ones when its table fills. A scene stays valid until
+the next frame: the sprite cache is flushed only at a frame's start, and the
+presenter composes a scene once, however often it is re-presented.
