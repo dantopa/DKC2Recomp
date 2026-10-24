@@ -1077,7 +1077,7 @@ int main(int argc, char **argv) {
       NativeDiffEndFrame(native_diff, frame, rom, rom_size);
     int hd_width = 0, hd_height = 0;
     const uint32_t *hd_pixels =
-        Dkc2HdEndFrame(hd, g_ppu, g_ram, pixels,
+        Dkc2HdEndFrame(hd, g_ppu, g_ram, Dkc2GetFrameLines(), pixels,
                        frame_width * kBytesPerPixel, &hd_width, &hd_height);
     /* DKC2_HD_PROBE=<frame>,<x>,<y>: prints what the HD frame draws at a
      * 1x frame pixel, as the desktop inspector shows it. */

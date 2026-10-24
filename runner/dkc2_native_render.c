@@ -51,6 +51,14 @@ static uint8_t Planar4bppVram(const uint16_t *vram, uint16_t character_word,
                    ((high >> (shift + 8u)) & 1u) << 3);
 }
 
+/* One 2-bpp planar pixel: planes 0/1 in the row word. */
+static uint8_t Planar2bppVram(const uint16_t *vram, uint16_t character_word,
+                              unsigned x, unsigned y) {
+  const uint16_t row = vram[(uint16_t)(character_word + y) & 0x7fff];
+  const unsigned shift = 7u - x;
+  return (uint8_t)(((row >> shift) & 1u) | ((row >> (shift + 8u)) & 1u) << 1);
+}
+
 /* The same planar layout stored as bytes in a ROM sprite payload. */
 static uint8_t Planar4bppBytes(const uint8_t *character, unsigned x,
                                unsigned y) {
@@ -222,6 +230,35 @@ void Dkc2NativeTerrainDecodeBlock(const Ppu *ppu,
                           : 0u;
         }
       }
+    }
+  }
+}
+
+uint16_t Dkc2NativeBgMapEntry(const Ppu *ppu, uint8_t bg_sc, unsigned map_x,
+                              unsigned map_y) {
+  /* 32x32 screens: the second one to the right when the map is wider, below
+   * (after the right one, if any) when it is higher. */
+  unsigned address = ((bg_sc & 0xfcu) << 8) + (((map_y >> 3) & 0x1fu) << 5);
+  if ((map_y & 0x100u) && (bg_sc & 2u))
+    address += (bg_sc & 1u) ? 0x800u : 0x400u;
+  if ((map_x & 0x100u) && (bg_sc & 1u))
+    address += 0x400u;
+  return ppu->vram[(address + ((map_x >> 3) & 0x1fu)) & 0x7fffu];
+}
+
+void Dkc2NativeDecodeBgCharacter(const Ppu *ppu, unsigned bpp,
+                                 uint16_t character_base, uint16_t entry,
+                                 uint8_t indices[64]) {
+  /* A character is 8 words per two bit planes. */
+  const uint16_t character =
+      (uint16_t)(character_base + (entry & 0x3ffu) * bpp * 4u);
+  const uint8_t palette = (uint8_t)(((entry >> 10) & 7u) << bpp);
+  for (unsigned y = 0; y < 8; y++) {
+    for (unsigned x = 0; x < 8; x++) {
+      const uint8_t color = bpp == 4
+                                ? Planar4bppVram(ppu->vram, character, x, y)
+                                : Planar2bppVram(ppu->vram, character, x, y);
+      indices[y * 8u + x] = color ? (uint8_t)(palette | color) : 0u;
     }
   }
 }

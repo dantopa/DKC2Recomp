@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "dkc2_hdma.h"
 #include "snes/ppu.h"
 
 #ifdef __cplusplus
@@ -62,6 +63,15 @@ extern "C" {
  * a BG1 that stays unchanged for a second outside levels is written as
  * "s_<key>.ref".
  *
+ * Background tiles (BG2, BG3), when the pack has backgrounds.txt (its
+ * presence enables them): "b_<key>.rgba" (sixteen hex digits: a hash
+ * of the raw color of every pixel of the unflipped 8x8 character) replaces
+ * a cell wherever the layer shows it untouched by color math, flipped like
+ * the tilemap entry and dimmed with the screen brightness. A cell must be
+ * reproduced from VRAM with the registers its scanlines were drawn with;
+ * widescreen margin cells take the character of a reproduced cell with the
+ * same pixels. The dump writes each new character as "b_<key>.rgba".
+ *
  * Works at any frame width the PPU renders (widescreen margins included).
  * Limits: Mode 1 scenes only, and object color math is not reproduced.
  */
@@ -108,7 +118,7 @@ typedef struct Dkc2HdQuad {
   int x, y, width, height;
   bool flip_x, flip_y;
   uint8_t brightness; /* scales the color; 255 leaves it */
-  uint8_t rank;       /* sprites: composition rank */
+  uint8_t rank;       /* sprites: composition rank; tiles: layer + 1 */
   uint8_t index;      /* sprites: position in the draw order */
 } Dkc2HdQuad;
 
@@ -116,7 +126,9 @@ typedef struct Dkc2HdQuad {
  * One frame decided at 1x, for an executor to draw at the output scale
  * (width * scale by height * scale): the CPU one behind Dkc2HdEndFrame, or a
  * GPU renderer. In order:
- *  1. base upscaled with the background filter (opaque);
+ *  1. base upscaled with the background filter (opaque), then tile quads
+ *     blended over it, each output pixel drawn only where the tile mask of
+ *     its 1x pixel equals the quad's rank (its layer + 1);
  *  2. when layer is set, the BG1 layer: layer upscaled the same way, art
  *     quads replacing its pixels (no blending), then blended over the output
  *     where occlusion alpha is set;
@@ -130,6 +142,10 @@ typedef struct Dkc2HdScene {
   int width, height, scale;
   Dkc2HdFilter background;
   const uint32_t *base;
+  const Dkc2HdQuad *tiles;
+  unsigned tile_count;
+  /* Per pixel: the layer + 1 (BG2 or BG3) the base shows untouched, or 0. */
+  const uint8_t *tile_mask;
   /* Per pixel: R the highest background rank, G the rank of an object pixel
    * no quad draws, B the index + 1 of the quad owning an object pixel, alpha
    * 0xff where the BG1 layer is in front. */
@@ -166,16 +182,19 @@ void Dkc2HdDestroy(Dkc2Hd *hd);
 void Dkc2HdBeginFrame(Dkc2Hd *hd, Ppu *ppu, int frame_width);
 
 /* Call after Dkc2DrawPpuFrame with the BGRA frame it rendered (pitch in
- * bytes). Returns the composed frame (width x height ARGB, tightly packed),
+ * bytes) and the registers its scanlines were drawn with (NULL: no tile
+ * art). Returns the composed frame (width x height ARGB, tightly packed),
  * or NULL when the frame was rendered normally and should be presented as
  * is. */
 const uint32_t *Dkc2HdEndFrame(Dkc2Hd *hd, const Ppu *ppu, const uint8_t *ram,
+                               const Dkc2HdmaLines *lines,
                                const uint8_t *frame, size_t frame_pitch,
                                int *width, int *height);
 
 /* The same frame as a scene for an external executor, or NULL as above. */
 const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
                                        const uint8_t *ram,
+                                       const Dkc2HdmaLines *lines,
                                        const uint8_t *frame,
                                        size_t frame_pitch);
 

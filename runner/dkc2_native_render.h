@@ -77,6 +77,18 @@ uint64_t Dkc2NativeTerrainBlockKey(const Ppu *ppu,
                                    const Dkc2NativeTerrainView *view,
                                    uint32_t tile_x, uint32_t tile_y);
 
+/* The tilemap entry a background shows at map pixel (map_x, map_y), scroll
+ * applied, addressed like the PPU from the layer's BGnSC value. */
+uint16_t Dkc2NativeBgMapEntry(const Ppu *ppu, uint8_t bg_sc, unsigned map_x,
+                              unsigned map_y);
+
+/* CGRAM index (0: transparent) of each pixel of a tilemap entry's unflipped
+ * 8x8 character, 4 bpp (Mode 1 BG1 and BG2) or 2 bpp (BG3); character_base
+ * is the layer's character base in VRAM words. */
+void Dkc2NativeDecodeBgCharacter(const Ppu *ppu, unsigned bpp,
+                                 uint16_t character_base, uint16_t entry,
+                                 uint8_t indices[64]);
+
 typedef struct Dkc2NativeSprite {
   const uint8_t *graphic;  /* compound graphic in the ROM image */
   size_t available;        /* bytes readable from graphic */
