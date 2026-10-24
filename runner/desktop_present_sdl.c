@@ -550,13 +550,15 @@ static void BuildHdPrograms(Dkc2SdlPresenter *presenter) {
       return;
     }
   }
-  glGenTextures(4, presenter->hd_input);
-  for (int input = 0; input < 4; input++) {
-    glBindTexture(GL_TEXTURE_2D, presenter->hd_input[input]);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  for (int set = 0; set < kDkc2HdInputSets; set++) {
+    glGenTextures(4, presenter->hd_input[set]);
+    for (int input = 0; input < 4; input++) {
+      glBindTexture(GL_TEXTURE_2D, presenter->hd_input[set][input]);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
   }
   glBindTexture(GL_TEXTURE_2D, 0);
 }
@@ -1330,31 +1332,34 @@ static bool ComposeHd(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene) {
   if (!PrepareHdTargets(presenter, width, height, scene->layer != NULL))
     return false;
   presenter->hd_serial = scene->serial;
+  const unsigned set = presenter->hd_input_set;
+  presenter->hd_input_set = (set + 1u) % kDkc2HdInputSets;
+  const GLuint *inputs = presenter->hd_input[set];
   /* All inputs get storage together, so a later scene with a layer or
    * tiles finds its texture sized even when earlier ones had none. */
-  if (presenter->hd_input_width != scene->width) {
+  if (presenter->hd_input_width[set] != scene->width) {
     for (int input = 0; input < 3; input++) {
-      glBindTexture(GL_TEXTURE_2D, presenter->hd_input[input]);
+      glBindTexture(GL_TEXTURE_2D, inputs[input]);
       glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, scene->width, scene->height,
                    0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
     }
-    glBindTexture(GL_TEXTURE_2D, presenter->hd_input[3]);
+    glBindTexture(GL_TEXTURE_2D, inputs[3]);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE8, scene->width,
                  scene->height, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
-    presenter->hd_input_width = scene->width;
+    presenter->hd_input_width[set] = scene->width;
   }
   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-  UploadHdInput(presenter->hd_input[0], scene->base, scene->width,
+  UploadHdInput(inputs[0], scene->base, scene->width,
                 scene->height);
-  UploadHdInput(presenter->hd_input[1], scene->occlusion, scene->width,
+  UploadHdInput(inputs[1], scene->occlusion, scene->width,
                 scene->height);
   if (scene->layer)
-    UploadHdInput(presenter->hd_input[2], scene->layer, scene->width,
+    UploadHdInput(inputs[2], scene->layer, scene->width,
                   scene->height);
   if (scene->tile_count) {
     /* One byte per pixel: rows are not 4-byte aligned. */
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glBindTexture(GL_TEXTURE_2D, presenter->hd_input[3]);
+    glBindTexture(GL_TEXTURE_2D, inputs[3]);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, scene->width, scene->height,
                     GL_LUMINANCE, GL_UNSIGNED_BYTE, scene->tile_mask);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
@@ -1371,21 +1376,22 @@ static bool ComposeHd(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene) {
   Uniform1f(upscale, "scale", (float)scene->scale);
   Uniform1i(upscale, "smooth",
             scene->background == kDkc2HdFilterSmooth);
-  BindTextureUnit(0, presenter->hd_input[0]);
+  BindTextureUnit(0, inputs[0]);
   DrawIntoTarget(upscale, &presenter->hd_output);
-  BindTextureUnit(1, presenter->hd_input[1]);
+  BindTextureUnit(1, inputs[1]);
+  /* The quad program declares the tile mask in every pass. */
+  BindTextureUnit(2, inputs[3]);
   /* Blended passes keep the output opaque, as the CPU blend does. */
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
   if (scene->tile_count) {
-    BindTextureUnit(2, presenter->hd_input[3]);
     glEnable(GL_BLEND);
     DrawHdQuads(presenter, scene, scene->tiles, scene->tile_count,
                 kHdQuadTile, width, height);
     glDisable(GL_BLEND);
   }
   if (scene->layer) {
-    BindTextureUnit(0, presenter->hd_input[2]);
+    BindTextureUnit(0, inputs[2]);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     DrawIntoTarget(upscale, &presenter->hd_layer);
     DrawHdQuads(presenter, scene, scene->art, scene->art_count, kHdQuadArt,
@@ -1499,7 +1505,9 @@ void Dkc2GlPipelineDestroy(Dkc2SdlPresenter *presenter) {
       s_gl.DeleteProgram(presenter->hd_program[pass]);
     presenter->hd_program[pass] = 0;
   }
-  if (presenter->hd_input[0]) glDeleteTextures(4, presenter->hd_input);
+  for (int set = 0; set < kDkc2HdInputSets; set++)
+    if (presenter->hd_input[set][0])
+      glDeleteTextures(4, presenter->hd_input[set]);
   memset(presenter->hd_input, 0, sizeof presenter->hd_input);
   for (unsigned i = 0; i < kDkc2HdImageSlots; i++)
     if (presenter->hd_images[i].id)
