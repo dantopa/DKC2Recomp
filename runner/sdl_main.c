@@ -940,6 +940,7 @@ static int RunGame(const char *rom_path,
   }
   host.hd_gpu = Dkc2SdlPresenterHdAvailable(&host.presenter) &&
                 !EnvironmentEnabled("DKC2_HD_CPU");
+  fprintf(stdout, "HD composition: %s\n", host.hd_gpu ? "gpu" : "cpu");
   {
     /* DKC2_DESKTOP_TEST_WINDOW=WxH: size the window in points so a hidden
      * capture can be taken at a chosen drawable size (the panel's full
@@ -1127,14 +1128,26 @@ static int RunGame(const char *rom_path,
   unsigned long long host_frame = 0;
   const char *screenshot_path = getenv("DKC2_DESKTOP_SCREENSHOT");
   if (screenshot_path && !*screenshot_path) screenshot_path = NULL;
-  unsigned long long screenshot_frame = 60;
+  /* DKC2_DESKTOP_SCREENSHOT_FRAME: one frame, or up to eight separated by
+   * commas; with several, each file is the path with "-<frame>" before its
+   * extension. */
+  enum { kMaxScreenshots = 8 };
+  unsigned long long screenshot_frames[kMaxScreenshots] = {60};
+  int screenshot_count = 1;
   {
     const char *frame_text = getenv("DKC2_DESKTOP_SCREENSHOT_FRAME");
-    if (frame_text && *frame_text)
-      screenshot_frame = strtoull(frame_text, NULL, 10);
+    if (frame_text && *frame_text) {
+      screenshot_count = 0;
+      char *end = NULL;
+      while (screenshot_count < kMaxScreenshots) {
+        screenshot_frames[screenshot_count++] = strtoull(frame_text, &end, 10);
+        if (*end != ',') break;
+        frame_text = end + 1;
+      }
+    }
   }
+  int screenshot_index = 0;
   uint8_t *screenshot_rgb = NULL;
-  bool screenshot_written = false;
   const char *test_load_state_path = getenv("DKC2_DESKTOP_TEST_LOADSTATE");
   if (test_load_state_path && !*test_load_state_path)
     test_load_state_path = NULL;
@@ -1538,7 +1551,8 @@ static int RunGame(const char *rom_path,
        * DKC2_DESKTOP_SCREENSHOT_FRAME as a binary PPM, for verifying what
        * the GPU path draws without a visible window. */
       if (screenshot_path && !screenshot_rgb &&
-          host_frame >= screenshot_frame) {
+          screenshot_index < screenshot_count &&
+          host_frame >= screenshot_frames[screenshot_index]) {
         int dw = 0, dh = 0;
         Dkc2SdlPresenterDrawableSize(&host.presenter, &dw, &dh);
         if (dw > 0 && dh > 0) {
@@ -1591,9 +1605,21 @@ static int RunGame(const char *rom_path,
                 stage_paced - stage_before_pace, stage_presented - stage_paced);
       }
 #endif
-      if (screenshot_rgb && host.presenter.capture_done &&
-          !screenshot_written) {
-        FILE *shot = fopen(screenshot_path, "wb");
+      if (screenshot_rgb && host.presenter.capture_done) {
+        char shot_path[1024];
+        if (screenshot_count == 1) {
+          snprintf(shot_path, sizeof shot_path, "%s", screenshot_path);
+        } else {
+          const char *dot = strrchr(screenshot_path, '.');
+          const char *slash = strrchr(screenshot_path, '/');
+          const int stem = dot && (!slash || dot > slash)
+                               ? (int)(dot - screenshot_path)
+                               : (int)strlen(screenshot_path);
+          snprintf(shot_path, sizeof shot_path, "%.*s-%llu%s", stem,
+                   screenshot_path, screenshot_frames[screenshot_index],
+                   screenshot_path + stem);
+        }
+        FILE *shot = fopen(shot_path, "wb");
         if (shot) {
           fprintf(shot, "P6\n%d %d\n255\n", host.presenter.capture_width,
                   host.presenter.capture_height);
@@ -1603,12 +1629,14 @@ static int RunGame(const char *rom_path,
                  shot);
           fclose(shot);
           fprintf(stdout, "screenshot: %s (%dx%d, %s, display=%s)\n",
-                  screenshot_path, host.presenter.capture_width,
+                  shot_path, host.presenter.capture_width,
                   host.presenter.capture_height,
                   Dkc2SdlPresenterUpscalerName(host.presenter.upscaler),
                   Dkc2CrtDisplayName(host.presenter.display));
         }
-        screenshot_written = true;
+        free(screenshot_rgb);
+        screenshot_rgb = NULL;
+        screenshot_index++;
         Dkc2SdlPresenterArmCapture(&host.presenter, NULL, 0, 0);
       }
     }
