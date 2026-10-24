@@ -280,8 +280,10 @@ bool Dkc2HdConfigFromEnvironment(Dkc2HdConfig *config, const char **error) {
     config->filter = kDkc2HdFilterNearest;
   } else if (strcmp(filter, "learned") == 0) {
     config->filter = kDkc2HdFilterLearned;
+  } else if (strcmp(filter, "learned-pixel") == 0) {
+    config->filter = kDkc2HdFilterLearnedPixel;
   } else {
-    *error = "DKC2_HD_FILTER must be nearest, smooth or learned";
+    *error = "DKC2_HD_FILTER must be nearest, smooth, learned or learned-pixel";
     return false;
   }
   config->scale = (int)scale;
@@ -289,8 +291,7 @@ bool Dkc2HdConfigFromEnvironment(Dkc2HdConfig *config, const char **error) {
   config->pack_dir = getenv("DKC2_HD_PACK");
   config->dump_dir = getenv("DKC2_HD_DUMP");
   const char *table = getenv("DKC2_HD_FILTER_TABLE");
-  config->filter_table =
-      table && *table ? table : kDkc2HdDefaultFilterTable;
+  config->filter_table = table && *table ? table : NULL;
   return true;
 }
 
@@ -380,13 +381,18 @@ Dkc2Hd *Dkc2HdCreate(const Dkc2HdConfig *config, const uint8_t *rom,
   hd->scale = config->scale;
   hd->filter = config->filter;
   hd->background = config->background;
-  if (hd->filter == kDkc2HdFilterLearned) {
-    hd->learned = LoadLearnedTable(config->filter_table);
+  if (hd->filter == kDkc2HdFilterLearned ||
+      hd->filter == kDkc2HdFilterLearnedPixel) {
+    const char *table = config->filter_table ? config->filter_table
+                        : hd->filter == kDkc2HdFilterLearnedPixel
+                            ? kDkc2HdPixelFilterTable
+                            : kDkc2HdDefaultFilterTable;
+    hd->learned = LoadLearnedTable(table);
     if (!hd->learned) {
       fprintf(stderr,
               "warning: HD sprite filter table %s is missing or invalid; "
               "using the smooth filter\n",
-              config->filter_table ? config->filter_table : "(none)");
+              table);
       hd->filter = kDkc2HdFilterSmooth;
     }
   }
@@ -845,7 +851,7 @@ static const HdImage *FilteredCached(Dkc2Hd *hd, uint64_t key) {
       return hd->cache[slot].image;
   }
   HdImage *image = NULL;
-  if (hd->filter == kDkc2HdFilterLearned)
+  if (hd->learned)
     image = LearnedImage(hd->learned, &hd->frame);
   if (!image)
     image = hd->filter == kDkc2HdFilterNearest

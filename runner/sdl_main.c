@@ -1065,9 +1065,8 @@ static int RunGame(const char *rom_path,
     host.hd_config.pack_dir = host.hd_pack_dir;
     host.hd_config.dump_dir = getenv("DKC2_HD_DUMP");
     const char *filter_table = getenv("DKC2_HD_FILTER_TABLE");
-    host.hd_config.filter_table = filter_table && *filter_table
-                                      ? filter_table
-                                      : kDkc2HdDefaultFilterTable;
+    host.hd_config.filter_table =
+        filter_table && *filter_table ? filter_table : NULL;
   }
   settings->aspect_index = (int)aspect;
   settings->widescreen = aspect != kDkc2VideoAspectNative;
