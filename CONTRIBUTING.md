@@ -27,7 +27,8 @@ cmake --build build-release
 python3 tests/test_hd_pack.py
 ```
 
-Windows and full platform instructions are in [README.md](README.md#building-from-source).
+Windows and full platform instructions are in the
+[upstream README](https://github.com/elliotttate/DKC2Recomp#building-from-source).
 HD changes should be checked with the headless runner, for example:
 
 ```bash
