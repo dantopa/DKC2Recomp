@@ -164,9 +164,12 @@ struct Dkc2Hd {
    * rendered frame and is composed here, art where the pack has it and the
    * background filter elsewhere. */
   bool layer_pack;
-  /* This frame composes BG1 here: the pack has BG1 art and BG1 is drawn on
+  /* This frame composes BG1 here: the pack has BG1 art, BG1 is drawn on
    * the main screen only (captures see the main screen; scenes such as
-   * Mainbrace Mayhem draw BG1 on the subscreen through color math). */
+   * Mainbrace Mayhem draw BG1 on the subscreen through color math) and
+   * color math does not blend it with the subscreen (captures are taken
+   * before it; the game select menu dims the unselected rows by halving BG1
+   * with BG2, the map adds BG2 and BG3 to it). */
   bool layer_frame;
   ScreenEntry screens[kScreenSlots];
   unsigned screen_count;
@@ -434,9 +437,16 @@ void Dkc2HdBeginFrame(Dkc2Hd *hd, Ppu *ppu, int frame_width) {
                           pitch);
   PpuBindOverlaySurface(ppu, kPpuOverlaySource_Obj,
                         hd->active ? (uint8_t *)hd->obj : NULL, pitch);
+  /* Color math changes BG1 across the screen when the subscreen holds a
+   * background or the fixed color is not black. Subscreen objects alone
+   * only change it under themselves (the title's sparkles), which is not
+   * reproduced. */
+  const bool bg1_math = (PPU_mathEnabled(ppu) & 1u) &&
+                        ((ppu->screenEnabled[1] & 0xfu) ||
+                         (ppu->fixedColor & 0x7fffu));
   hd->layer_frame = hd->active && hd->layer_pack &&
                       (ppu->screenEnabled[0] & 1u) &&
-                      !(ppu->screenEnabled[1] & 1u);
+                      !(ppu->screenEnabled[1] & 1u) && !bg1_math;
   if (!hd->active)
     return;
   /* Captures span the margins too: screen X runs from -extra. */

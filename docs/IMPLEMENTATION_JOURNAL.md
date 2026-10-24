@@ -6435,3 +6435,22 @@ front-most quad with an opaque texel under the mouse; headless probes found
 the expected keys for a banana and Diddy (pack art) and for a title-card word
 (filter).
 
+The save-file highlight in the menus was missing in HD. The cause was not the
+terrain keys but the layered BG1 mode (enabled by screens.txt): BG1 is
+recomposed from a capture taken before color math, so the menu's half-add of
+BG2 (cgadsub 0x41, subscreen 0x02) and the map's added BG2/BG3 (0x23, 0x06)
+vanished. BG1 stays native when color math applies to it and either the
+subscreen has a background or the fixed color is not black; the title (math
+only against OBJ sparkles) stays layered. Against SD 16:9 renders, the mean
+absolute difference fell from 7.8 to 1.5 (menu) and from 6.8 to 3.1 (map);
+the title and level frames are byte-identical to before.
+
+The GPU parity test then failed at frame 1470 (map fade-in) only: the GPU
+frame lacked the bees and parts of the title words. The scenes were identical
+in both modes; the executor was not. `ComposeHd` leaves texture unit 1 (the
+occlusion map) active, and without a BG1 layer the first image uploaded
+during the sprite pass was bound there, replacing the occlusion map for the
+rest of the frame. Layered frames end with unit 0 active, which hid it until
+the map stopped being layered. Uploads now bind unit 0. GPU and CPU match on
+all four frames and the goldens were regenerated (menu and map changes).
+

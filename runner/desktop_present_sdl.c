@@ -1232,7 +1232,8 @@ static GLuint HdImageTexture(Dkc2SdlPresenter *presenter,
   GLuint texture = 0;
   glGenTextures(1, &texture);
   if (!texture) return 0;
-  glBindTexture(GL_TEXTURE_2D, texture);
+  /* Unit 0: during the sprite pass unit 1 holds the occlusion map. */
+  BindTextureUnit(0, texture);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
