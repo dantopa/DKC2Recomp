@@ -1018,14 +1018,28 @@ bool Dkc2KongsRenderOam(Ppu *ppu, int line, unsigned slot) {
     const unsigned palette = 128 + ((actor->properties >> 9) & 7) * 16;
     const unsigned priority = SPRITE_PRIO_TO_PRIO(
         (actor->properties >> 12) & 3, (actor->properties & 0x800) == 0);
+    /* Honor the host OBJ capture exactly like OAM-drawn objects: export the
+     * pixels and, with RemoveFromGame, keep them out of the frame. */
+    const PpuOverlayCapture *capture =
+        &ppu->overlayCaptures[kPpuOverlaySource_Obj];
+    const bool captured =
+        ppu->overlayRenderBuffer[kPpuOverlaySource_Obj] &&
+        line >= capture->y0 && line < capture->y1 && capture->oamCount &&
+        slot >= capture->oamFirst &&
+        slot < (unsigned)capture->oamFirst + capture->oamCount;
     for (unsigned x = 0; x < frame->width; ++x) {
       const unsigned color = frame->pixels[(size_t)row * frame->width + x];
       if (!color) continue;
       const int local = frame->x + (int)x;
       const int px = actor->x + (flip ? -1 - local : local) - ppu->wsPresentationXBias;
       if (px < -(int)ppu->extraLeftCur || px >= 256 + (int)ppu->extraRightCur) continue;
-      ppu->objBuffer.data[px + kPpuExtraLeftRight] =
-          (PpuZbufType)(palette + color + (priority << 8));
+      const PpuZbufType pixel = (PpuZbufType)(palette + color + (priority << 8));
+      if (captured && px >= capture->x0 && px < capture->x1) {
+        ppu->overlayBuffers[kPpuOverlaySource_Obj].data[px + kPpuExtraLeftRight] =
+            pixel;
+        if (capture->flags & kPpuOverlayFlag_RemoveFromGame) continue;
+      }
+      ppu->objBuffer.data[px + kPpuExtraLeftRight] = pixel;
     }
     return true;
   }

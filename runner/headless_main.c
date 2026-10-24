@@ -3,6 +3,8 @@
 #include "dkc2_game.h"
 #include "dkc2_coop.h"
 #include "dkc2_video.h"
+#include "dkc2_hd.h"
+#include "dkc2_native_render.h"
 #include "input_playback.h"
 #include "verified_rom.h"
 
@@ -353,6 +355,161 @@ static int WriteFramePpm(const char *path, const uint8_t *pixels,
   }
   if (fclose(stream) != 0) ok = 0;
   return ok;
+}
+
+/* DKC2_NATIVE_DIFF=<step>: compare the experimental semantic renderer with
+ * the PPU's isolated BG1 and OBJ captures every frame, printing a summary
+ * every <step> frames while terrain is supported. DKC2_NATIVE_DIFF_PPM=<prefix>
+ * also writes a private 2x2 panel (PPU BG1 | native BG1 / PPU OBJ | native
+ * OBJ) at each summary frame. */
+enum {
+  kNativeDiffPixels = kDkc2NativeWidth * kDkc2NativeHeight,
+  kNativeDiffPitch = kDkc2NativeWidth * 4,
+};
+
+typedef struct NativeDiff {
+  long step;
+  const char *ppm_prefix;
+  uint32_t ppu_bg1[kNativeDiffPixels];
+  uint32_t ppu_obj[kNativeDiffPixels];
+  uint32_t native_bg1[kNativeDiffPixels];
+  uint32_t native_obj[kNativeDiffPixels];
+  uint32_t panel[kNativeDiffPixels * 4];
+  /* Low WRAM as it was at the end of the previous frame: the displayed OAM
+   * was built from that state, one game update behind the live tables. */
+  uint8_t previous_wram[0x2000];
+  bool has_previous;
+  long frames;
+  uint64_t bg1_mismatched;
+  uint64_t obj_mismatched;
+  long bg1_exact_frames;
+  long obj_exact_frames;
+  /* Frames whose native sprites contain no wrong pixel: every mismatch is
+   * PPU content the native renderer does not draw yet (HUD, banana list). */
+  long obj_no_wrong_frames;
+} NativeDiff;
+
+typedef struct NativeMismatch {
+  size_t missing;  /* PPU opaque, native transparent */
+  size_t wrong;    /* native opaque and different from the PPU */
+} NativeMismatch;
+
+static NativeMismatch CountMismatched(const uint32_t *ppu,
+                                      const uint32_t *native) {
+  NativeMismatch result = {0, 0};
+  for (size_t i = 0; i < kNativeDiffPixels; i++) {
+    if (ppu[i] == native[i])
+      continue;
+    if (native[i] == 0)
+      result.missing++;
+    else
+      result.wrong++;
+  }
+  return result;
+}
+
+/* Writes an ARGB layer (0 = transparent) as an RGB_ALPHA PAM image. */
+static int WriteLayerPam(const char *path, const uint32_t *pixels,
+                         size_t width, size_t height) {
+  FILE *stream = fopen(path, "wb");
+  if (!stream) return 0;
+  int ok = fprintf(stream,
+                   "P7\nWIDTH %zu\nHEIGHT %zu\nDEPTH 4\nMAXVAL 255\n"
+                   "TUPLTYPE RGB_ALPHA\nENDHDR\n",
+                   width, height) > 0;
+  for (size_t i = 0; ok && i < width * height; i++) {
+    const uint32_t argb = pixels[i];
+    const uint8_t rgba[4] = {(uint8_t)(argb >> 16), (uint8_t)(argb >> 8),
+                             (uint8_t)argb, argb ? 255 : 0};
+    ok = fwrite(rgba, 1, sizeof rgba, stream) == sizeof rgba;
+  }
+  if (fclose(stream) != 0) ok = 0;
+  return ok;
+}
+
+static void NativeDiffBeginFrame(NativeDiff *diff) {
+  static bool bound;
+  if (!bound) {
+    PpuBindOverlaySurface(g_ppu, kPpuOverlaySource_Bg1,
+                          (uint8_t *)diff->ppu_bg1, kNativeDiffPitch);
+    PpuBindOverlaySurface(g_ppu, kPpuOverlaySource_Obj,
+                          (uint8_t *)diff->ppu_obj, kNativeDiffPitch);
+    bound = true;
+  }
+  PpuSetOverlayCapture(g_ppu, kPpuOverlaySource_Bg1, 0, 0, kDkc2NativeWidth,
+                       kDkc2NativeHeight, 0);
+  PpuSetOverlayCapture(g_ppu, kPpuOverlaySource_Obj, 0, 0, kDkc2NativeWidth,
+                       kDkc2NativeHeight, 0);
+  PpuSetOverlayOamRange(g_ppu, 0, 128);
+}
+
+static void NativeDiffEndFrame(NativeDiff *diff, long frame,
+                               const uint8_t *rom, size_t rom_size) {
+  memset(diff->native_bg1, 0, sizeof diff->native_bg1);
+  memset(diff->native_obj, 0, sizeof diff->native_obj);
+  Dkc2NativeTerrainView view;
+  const bool has_previous = diff->has_previous;
+  uint8_t sprite_wram[sizeof diff->previous_wram];
+  memcpy(sprite_wram, diff->previous_wram, sizeof sprite_wram);
+  memcpy(diff->previous_wram, g_ram, sizeof diff->previous_wram);
+  diff->has_previous = true;
+  if (!has_previous ||
+      !Dkc2NativeRenderTerrain(g_ppu, g_ram, diff->native_bg1,
+                               kDkc2NativeWidth, &view))
+    return;
+  const unsigned sprites = Dkc2NativeRenderSprites(
+      g_ppu, sprite_wram, rom, rom_size, diff->native_obj, kDkc2NativeWidth);
+  const NativeMismatch bg1 =
+      CountMismatched(diff->ppu_bg1, diff->native_bg1);
+  const NativeMismatch obj =
+      CountMismatched(diff->ppu_obj, diff->native_obj);
+  const size_t bg1_total = bg1.missing + bg1.wrong;
+  const size_t obj_total = obj.missing + obj.wrong;
+  diff->frames++;
+  diff->bg1_mismatched += bg1_total;
+  diff->obj_mismatched += obj_total;
+  diff->bg1_exact_frames += bg1_total == 0;
+  diff->obj_exact_frames += obj_total == 0;
+  diff->obj_no_wrong_frames += obj.wrong == 0;
+  if (frame % diff->step != 0)
+    return;
+  fprintf(stderr,
+          "native_diff frame=%ld level=%04x world_x=%04x bg1_mismatch=%zu "
+          "obj_missing=%zu obj_wrong=%zu sprites=%u\n",
+          frame, ReadWram16(0x00d3), view.world_x, bg1_total, obj.missing,
+          obj.wrong, sprites);
+  if (!diff->ppm_prefix || !*diff->ppm_prefix)
+    return;
+  const uint32_t *panels[4] = {diff->ppu_bg1, diff->native_bg1,
+                               diff->ppu_obj, diff->native_obj};
+  for (size_t panel = 0; panel < 4; panel++) {
+    for (size_t y = 0; y < kDkc2NativeHeight; y++) {
+      memcpy(diff->panel + (y + panel / 2 * kDkc2NativeHeight) *
+                               (kDkc2NativeWidth * 2) +
+                 panel % 2 * kDkc2NativeWidth,
+             panels[panel] + y * kDkc2NativeWidth, kNativeDiffPitch);
+    }
+  }
+  char path[1024];
+  /* Native layers keep their transparency as RGBA PAM files. */
+  const char *layer_names[2] = {"bg1", "obj"};
+  const uint32_t *layers[2] = {diff->native_bg1, diff->native_obj};
+  for (size_t layer = 0; layer < 2; layer++) {
+    const int pam_length = snprintf(path, sizeof path, "%s_%06ld_%s.pam",
+                                    diff->ppm_prefix, frame,
+                                    layer_names[layer]);
+    if (pam_length < 0 || (size_t)pam_length >= sizeof path ||
+        !WriteLayerPam(path, layers[layer], kDkc2NativeWidth,
+                       kDkc2NativeHeight))
+      fprintf(stderr, "native_diff: unable to write %s\n", path);
+  }
+  const int length =
+      snprintf(path, sizeof path, "%s_%06ld.ppm", diff->ppm_prefix, frame);
+  if (length < 0 || (size_t)length >= sizeof path ||
+      !WriteFramePpm(path, (const uint8_t *)diff->panel,
+                     kDkc2NativeWidth * 2, kDkc2NativeHeight * 2,
+                     kNativeDiffPitch * 2))
+    fprintf(stderr, "native_diff: unable to write %s\n", path);
 }
 
 static int ParseFrameNumber(const char *text, long fallback, long *value) {
@@ -714,6 +871,40 @@ int main(int argc, char **argv) {
     rewind_store = (uint8_t *)malloc(rewind_size * rewind_capacity);
     rewind_frames = (long *)malloc(sizeof(long) * rewind_capacity);
   }
+  NativeDiff *native_diff = NULL;
+  {
+    const char *step_text = getenv("DKC2_NATIVE_DIFF");
+    if (step_text && *step_text) {
+      native_diff = (NativeDiff *)calloc(1, sizeof *native_diff);
+      if (!native_diff) {
+        fprintf(stderr, "native_diff: allocation failed\n");
+        free(rom);
+        return 2;
+      }
+      native_diff->step = strtol(step_text, NULL, 10);
+      if (native_diff->step < 1)
+        native_diff->step = 1;
+      native_diff->ppm_prefix = getenv("DKC2_NATIVE_DIFF_PPM");
+    }
+  }
+  /* DKC2_HD=<scale>: compose frames through the HD path; the private frame
+   * sequence (DKC2_FRAME_PPM_PREFIX) then records the composed frames. */
+  Dkc2Hd *hd = NULL;
+  {
+    Dkc2HdConfig hd_config = {0};
+    const char *hd_error = NULL;
+    if (Dkc2HdConfigFromEnvironment(&hd_config, &hd_error)) {
+      hd = Dkc2HdCreate(&hd_config, rom, rom_size);
+      if (!hd)
+        hd_error = "HD presentation could not be initialized";
+    }
+    if (hd_error) {
+      fprintf(stderr, "%s\n", hd_error);
+      free(native_diff);
+      free(rom);
+      return 2;
+    }
+  }
   for (long frame = 0; frame < frame_limit; frame++) {
     uint32_t _in = Dkc2InputPlaybackFrame(&input_playback, (size_t)frame);
     bool reloaded = false;
@@ -867,7 +1058,16 @@ int main(int argc, char **argv) {
       if (frame % draw_every != 0)
         continue;
     }
+    if (native_diff)
+      NativeDiffBeginFrame(native_diff);
+    Dkc2HdBeginFrame(hd, g_ppu, Dkc2VideoWidth());
     Dkc2DrawPpuFrame();
+    if (native_diff)
+      NativeDiffEndFrame(native_diff, frame, rom, rom_size);
+    int hd_width = 0, hd_height = 0;
+    const uint32_t *hd_pixels =
+        Dkc2HdEndFrame(hd, g_ppu, g_ram, pixels,
+                       frame_width * kBytesPerPixel, &hd_width, &hd_height);
     if (WidescreenTraceEnabled() && frame >= WidescreenTraceStart() &&
         (frame - WidescreenTraceStart()) % WidescreenTraceStep() == 0) {
       EmitWidescreenFrameTrace(frame);
@@ -879,8 +1079,12 @@ int main(int argc, char **argv) {
       int length = snprintf(path, sizeof path, "%s_%06ld.ppm",
                             frame_sequence_prefix, frame);
       if (length < 0 || (size_t)length >= sizeof path ||
-          !WriteFramePpm(path, pixels, frame_width, kHeight,
-                         frame_width * kBytesPerPixel)) {
+          !(hd_pixels
+                ? WriteFramePpm(path, (const uint8_t *)hd_pixels,
+                                (size_t)hd_width, (size_t)hd_height,
+                                (size_t)hd_width * 4u)
+                : WriteFramePpm(path, pixels, frame_width, kHeight,
+                                frame_width * kBytesPerPixel))) {
         fprintf(stderr, "unable to write private frame sequence at %ld\n",
                 frame);
         if (audio_pcm) fclose(audio_pcm);
@@ -1173,6 +1377,25 @@ int main(int argc, char **argv) {
          pirate_panic_active_frames, pirate_panic_completion_flag_changes,
          pirate_panic_exit_transitions, ReadWram16(0x08a8),
          ReadWram16(0x059d), ReadWram16(0x08c2), ReadWram16(0x08c4));
+  if (native_diff) {
+    fprintf(stderr,
+            "native_diff summary: frames=%ld bg1_exact=%ld obj_exact=%ld "
+            "obj_no_wrong=%ld bg1_mismatch_avg=%.1f obj_mismatch_avg=%.1f\n",
+            native_diff->frames, native_diff->bg1_exact_frames,
+            native_diff->obj_exact_frames, native_diff->obj_no_wrong_frames,
+            native_diff->frames
+                ? (double)native_diff->bg1_mismatched / native_diff->frames
+                : 0.0,
+            native_diff->frames
+                ? (double)native_diff->obj_mismatched / native_diff->frames
+                : 0.0);
+    PpuClearOverlayBindings(g_ppu);
+    free(native_diff);
+  }
+  if (hd) {
+    PpuClearOverlayBindings(g_ppu);
+    Dkc2HdDestroy(hd);
+  }
   const char *frame_output = getenv("DKC2_FRAME_PPM");
   if (rewind_store && rewind_frames && frame_sequence_prefix &&
       *frame_sequence_prefix) {

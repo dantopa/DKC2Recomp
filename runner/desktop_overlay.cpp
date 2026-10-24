@@ -6,6 +6,7 @@
 #include "desktop_input.h"
 #include "desktop_launcher.h"
 #include "dkc2_coop.h"
+#include "dkc2_hd.h"
 #include "dkc2_video.h"
 
 #include "imgui.h"
@@ -827,6 +828,43 @@ static void DrawSettingsPage(Dkc2DesktopOverlay *overlay) {
   ImGui::EndDisabled();
   if (crt_display)
     ImGui::TextDisabled("Bypassed while the CRT television display is on.");
+  /* HD presentation (dkc2_hd.h). Remembered in launcher.cfg; the SDL host
+   * rebuilds the compositor on the next frame. */
+  bool hd_enabled = Dkc2LauncherHdEnabled() != 0;
+  if (ImGui::Checkbox("HD graphics", &hd_enabled))
+    Dkc2LauncherSetHdEnabled(hd_enabled);
+  ImGui::BeginDisabled(!hd_enabled);
+  int hd_scale = Dkc2LauncherHdScale();
+  if (ImGui::SliderInt("HD scale", &hd_scale, kDkc2HdMinScale,
+                       kDkc2HdMaxScale, "%dx"))
+    Dkc2LauncherSetHdScale(hd_scale);
+  static const char *hd_filter_labels[] = {"Pixel (square)",
+                                           "Smooth (gradient)"};
+  const int hd_sprites = Dkc2LauncherHdSprites();
+  if (ImGui::BeginCombo("HD sprites", hd_filter_labels[hd_sprites])) {
+    for (int i = kDkc2HdFilterNearest; i <= kDkc2HdFilterSmooth; i++) {
+      if (ImGui::Selectable(hd_filter_labels[i], hd_sprites == i))
+        Dkc2LauncherSetHdSprites(i);
+    }
+    ImGui::EndCombo();
+  }
+  const int hd_background = Dkc2LauncherHdBackground();
+  if (ImGui::BeginCombo("HD background",
+                        hd_filter_labels[hd_background])) {
+    for (int i = kDkc2HdFilterNearest; i <= kDkc2HdFilterSmooth; i++) {
+      if (ImGui::Selectable(hd_filter_labels[i], hd_background == i))
+        Dkc2LauncherSetHdBackground(i);
+    }
+    ImGui::EndCombo();
+  }
+  bool hd_art = Dkc2LauncherHdArt() != 0;
+  if (ImGui::Checkbox("HD art pack", &hd_art))
+    Dkc2LauncherSetHdArt(hd_art);
+  ImGui::EndDisabled();
+  ImGui::TextDisabled(
+      "Kongs, enemies and items are drawn at full resolution. With the HD "
+      "art pack on, redrawn art from the hdpack folder replaces them and "
+      "the terrain where it exists; off, everything uses the filters.");
   static const char *aspect_labels[] = {
       "4:3 (Native)", "16:10 (Widescreen)", "16:9 (Widescreen)",
       "21:9 (Ultrawide)"};
@@ -990,6 +1028,11 @@ static void DrawSettingsPage(Dkc2DesktopOverlay *overlay) {
     Dkc2VideoSetEdgePolicy(kDkc2VideoEdgeGlide);
     Dkc2LauncherSetCoopMode(kDkc2CoopSimultaneous);
     Dkc2CoopSetMode(kDkc2CoopSimultaneous);
+    Dkc2LauncherSetHdEnabled(1);
+    Dkc2LauncherSetHdScale(4);
+    Dkc2LauncherSetHdSprites(kDkc2HdFilterSmooth);
+    Dkc2LauncherSetHdBackground(kDkc2HdFilterSmooth);
+    Dkc2LauncherSetHdArt(1);
     Dkc2DesktopOverlayModelSetAssistTools(
         &overlay->model, overlay->settings.assist_tools != 0);
   }

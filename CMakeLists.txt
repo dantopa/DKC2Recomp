@@ -207,6 +207,8 @@ if(DKC2_BUILD_SNESRECOMP)
         runner/dkc2_game.c
         runner/dkc2_coop.c
         runner/dkc2_video.c
+        runner/dkc2_native_render.c
+        runner/dkc2_hd.c
         runner/dkc2_hdma.c
         runner/headless_host.c
         runner/input_playback.c
@@ -322,6 +324,8 @@ if(DKC2_BUILD_SNESRECOMP)
         runner/dkc2_game.c
         runner/dkc2_coop.c
         runner/dkc2_video.c
+        runner/dkc2_native_render.c
+        runner/dkc2_hd.c
         runner/dkc2_hdma.c
         runner/diagnostics.c
         runner/headless_host.c
@@ -685,6 +689,10 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_project_kongs.py)
         set_tests_properties(project_kongs_import PROPERTIES LABELS "unit;tooling;characters")
+        add_test(NAME hd_pack_tool
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_hd_pack.py)
+        set_tests_properties(hd_pack_tool PROPERTIES LABELS "unit;tooling;hd")
         add_test(NAME audio_pcm_compare
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_compare_audio_pcm.py)

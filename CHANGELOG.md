@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased (fork: HD presentation)
+
+- Added an experimental HD compositor: Mode 1 frames are re-composed at 2x-8x
+  from PPU layer captures with the console's priority rules, with HD sprite
+  art, per-block terrain art and full-screen art (title) loaded from a local
+  pack, and filtered fallbacks for everything else. Widescreen and fades are
+  supported.
+- Added Video settings for HD graphics, scale, sprite/background filters and
+  the HD art pack; choices are remembered in launcher.cfg.
+- Added `DKC2_HD`, `DKC2_HD_FILTER`, `DKC2_HD_PACK` and `DKC2_HD_DUMP` for
+  headless runs, and `scripts/hd_pack.py` to build packs from dumps.
+- Scenes that draw BG1 through the subscreen (Mainbrace Mayhem) keep the
+  native BG1 instead of losing the terrain.
+
 ## 0.0.8 (alpha) - 2026-09-13
 
 - Fixed Player 2 grabbing ropes in simultaneous TEAM mode. Rope reactions now

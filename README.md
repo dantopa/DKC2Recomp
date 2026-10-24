@@ -1,4 +1,12 @@
 # DKC2Recomp
+
+> **Fork notice.** This is a fork of
+> [elliotttate/DKC2Recomp](https://github.com/elliotttate/DKC2Recomp). It adds
+> an experimental **HD presentation** layer (see
+> [HD presentation](#hd-presentation-experimental)) on top of upstream v0.0.8.
+> Everything else is upstream's work; report recompilation, gameplay and audio
+> issues upstream unless they only reproduce with HD enabled. See
+> [CONTRIBUTING.md](CONTRIBUTING.md) to help.
 > This recompilation is a byproduct of developing
 > [snesrecomp](https://github.com/mstan/snesrecomp): the games are the proving
 > ground, while the reusable framework is the larger goal. This is a community
@@ -359,6 +367,47 @@ audio, controller sources/deadzones/bindings, Assist bindings, and the
 skip-launcher preference.
 The selected ROM, cartridge SRAM, save states, and rewind history are not
 deleted or replaced. The restored choices are persisted when Play is pressed.
+
+## HD presentation (experimental)
+
+The HD compositor (`runner/dkc2_hd.c`) re-composes each Mode 1 frame at an
+integer scale (2x-8x) instead of upscaling the finished 256x224 image. The PPU
+exports BG1-BG3 and OBJ with their composition ranks; the host then draws:
+
+- **Sprites** (Kongs, enemies, items) at full output resolution with the
+  console's priority rules, from an HD art pack when one has the frame,
+  otherwise filtered from the ROM frame.
+- **Terrain** (BG1) from per-block pack art where a block matches, otherwise
+  the background filter.
+- **Still screens** (title) from full-screen pack art matched against a native
+  BG1 reference.
+- **Everything else** (sky, water, HUD, loose objects) scaled from the
+  authentic frame with an anti-ringing Catmull-Rom filter or square pixels.
+
+Enable it in the in-game **Settings** tab: *HD graphics*, *HD scale*, sprite and
+background filters, and *HD art pack*. Headless and scripted runs use
+`DKC2_HD=<2-8>`, `DKC2_HD_FILTER=nearest|smooth`, `DKC2_HD_PACK=<dir>` and
+`DKC2_HD_DUMP=<dir>`; the pack format is documented in `runner/dkc2_hd.h`.
+
+**No art ships with this repository.** Packs are built locally from your own
+ROM: run with `DKC2_HD_DUMP` to capture native sprite frames, terrain blocks
+and still screens, then `scripts/hd_pack.py` lays frames out as grids for an
+image model, cuts the redrawn grids back into frames (alignment, silhouette
+IoU, white-matte removal) and validates them. Keep packs in `private/` or the
+user-data `hdpack` folder; see [docs/LEGAL_AND_CONTENT.md](docs/LEGAL_AND_CONTENT.md).
+
+Status (HD layer only):
+
+| Area | State |
+| --- | --- |
+| Compositor, priorities, widescreen, fades | Working |
+| Diddy/Dixie redrawn frames | ~900 of ~950 graphics; a few juggling/idle frames still being re-cut |
+| Common objects (barrels, bananas bunches, DK coin, explosions, balloons) | First pass |
+| Terrain block art | Pirate Panic only |
+| Title screen art | Working |
+| Sky/water (BG2/BG3), loose objects (single bananas) | Filter only; pack support not implemented |
+| Mounts (riding poses), other levels' enemies | Not covered yet |
+| Performance | ~3 ms/frame at 2x, ~7 ms/frame at 4x on an M4 (single thread) |
 
 ## Video settings
 

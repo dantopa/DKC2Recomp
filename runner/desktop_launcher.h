@@ -20,6 +20,19 @@ void Dkc2LauncherSetWidescreenEdge(int policy);
  * or the cartridge's classic alternating control. */
 int Dkc2LauncherCoopMode(void);
 void Dkc2LauncherSetCoopMode(int mode);
+/* HD presentation: enabled, integer scale and the Dkc2HdFilter used for
+ * sprites without pack art and for the background. */
+int Dkc2LauncherHdEnabled(void);
+void Dkc2LauncherSetHdEnabled(int enabled);
+int Dkc2LauncherHdScale(void);
+void Dkc2LauncherSetHdScale(int scale);
+int Dkc2LauncherHdSprites(void);
+void Dkc2LauncherSetHdSprites(int filter);
+int Dkc2LauncherHdBackground(void);
+void Dkc2LauncherSetHdBackground(int filter);
+/* Whether the HD pack's art is used (otherwise only the filters draw). */
+int Dkc2LauncherHdArt(void);
+void Dkc2LauncherSetHdArt(int enabled);
 /* Upscaler choice (kDkc2Upscaler*), remembered with the launcher settings;
  * the Reconstruct experiment's mode (0..3) and strength (0..100). */
 int Dkc2LauncherHaptics(void);
