@@ -34,6 +34,12 @@
   folder), F6 shows the object under the mouse with its pack file name, F7
   copies that name. `DKC2_HD_PROBE=frame,x,y` prints the same for headless
   runs.
+- Menus and the world map keep their color math in HD: the save-file
+  highlight and the map glow were lost because the HD BG1 layer was composed
+  after the console's blend. Such screens now keep the native BG1.
+- Fixed GPU HD frames hiding objects on frames that introduce new sprite
+  images outside layered scenes (the first new image overwrote the
+  occlusion map).
 
 ## 0.0.8 (alpha) - 2026-09-13
 
