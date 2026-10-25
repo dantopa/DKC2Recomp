@@ -4,6 +4,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <io.h>  /* _findfirst/_findnext: MSVC has no <dirent.h> */
+#else
+#include <dirent.h>
+#endif
 
 #include "dkc2_native_render.h"
 
@@ -165,6 +170,10 @@ struct Dkc2Hd {
   int tap_offset[kDkc2HdMaxScale];
   float tap_weight[kDkc2HdMaxScale][4];
   char pack_dir[kPathMax];
+  /* Name hash of every file in the pack directory, sorted: art is opened
+   * only when listed, so keys without art never reach the file system. */
+  uint64_t *pack_files;
+  size_t pack_file_count;
   char dump_dir[kPathMax];
   const uint8_t *rom;
   size_t rom_size;
@@ -337,6 +346,7 @@ static bool CopyPath(char *destination, const char *source) {
 }
 
 static HdImage *LoadImage(const char *path);
+static bool ListPack(Dkc2Hd *hd);
 
 /* Reads screens.txt: one 16-digit hex key per line, each with a native BG1
  * reference "s_<key>.ref" (as the dump writes it) and art "s_<key>.rgba". */
@@ -414,6 +424,10 @@ Dkc2Hd *Dkc2HdCreate(const Dkc2HdConfig *config, const uint8_t *rom,
     return NULL;
   }
   if (hd->pack_dir[0]) {
+    if (!ListPack(hd)) {
+      Dkc2HdDestroy(hd);
+      return NULL;
+    }
     char path[kPathMax + 32];
     snprintf(path, sizeof path, "%s/terrain.txt", hd->pack_dir);
     FILE *index = fopen(path, "r");
@@ -471,6 +485,7 @@ void Dkc2HdDestroy(Dkc2Hd *hd) {
   }
   free(hd->layer);
   free(hd->rows);
+  free(hd->pack_files);
   free(hd->learned);
   free(hd->output);
   free(hd);
@@ -558,6 +573,75 @@ static HdImage *LoadImage(const char *path) {
   return image;
 }
 
+static uint64_t NameHash(const char *name) {
+  uint64_t hash = 14695981039346656037ull;
+  for (; *name; name++)
+    hash = (hash ^ (unsigned char)*name) * 1099511628211ull;
+  return hash;
+}
+
+static int CompareHash(const void *a, const void *b) {
+  const uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+  return (x > y) - (x < y);
+}
+
+static bool AddPackFile(Dkc2Hd *hd, size_t *capacity, const char *name) {
+  if (hd->pack_file_count == *capacity) {
+    const size_t grown = *capacity ? *capacity * 2 : 1024;
+    uint64_t *files =
+        (uint64_t *)realloc(hd->pack_files, grown * sizeof *files);
+    if (!files)
+      return false;
+    hd->pack_files = files;
+    *capacity = grown;
+  }
+  hd->pack_files[hd->pack_file_count++] = NameHash(name);
+  return true;
+}
+
+/* Lists the pack directory once. A missing directory lists nothing, which
+ * loads no art, as opening each file would. False when out of memory. */
+static bool ListPack(Dkc2Hd *hd) {
+  size_t capacity = 0;
+  bool ok = true;
+#ifdef _WIN32
+  char pattern[kPathMax + 4];
+  snprintf(pattern, sizeof pattern, "%s/*", hd->pack_dir);
+  struct _finddata_t entry;
+  const intptr_t find = _findfirst(pattern, &entry);
+  if (find != -1) {
+    do
+      ok = AddPackFile(hd, &capacity, entry.name);
+    while (ok && _findnext(find, &entry) == 0);
+    _findclose(find);
+  }
+#else
+  DIR *directory = opendir(hd->pack_dir);
+  if (directory) {
+    const struct dirent *entry;
+    while (ok && (entry = readdir(directory)) != NULL)
+      ok = AddPackFile(hd, &capacity, entry->d_name);
+    closedir(directory);
+  }
+#endif
+  if (hd->pack_file_count)
+    qsort(hd->pack_files, hd->pack_file_count, sizeof *hd->pack_files,
+          CompareHash);
+  return ok;
+}
+
+/* Pack file `name`, read only when the pack listing has it. */
+static HdImage *LoadPackImage(const Dkc2Hd *hd, const char *name) {
+  const uint64_t hash = NameHash(name);
+  if (!hd->pack_file_count ||
+      !bsearch(&hash, hd->pack_files, hd->pack_file_count,
+               sizeof *hd->pack_files, CompareHash))
+    return NULL;
+  char path[kPathMax + 32];
+  snprintf(path, sizeof path, "%s/%s", hd->pack_dir, name);
+  return LoadImage(path);
+}
+
 static bool WriteFrameImage(const char *path,
                             const Dkc2NativeSpriteFrame *frame) {
   FILE *file = fopen(path, "wb");
@@ -629,10 +713,10 @@ static const HdImage *PackImage(Dkc2Hd *hd, const Ppu *ppu,
   PackEntry *entry =
       PackFind(hd->sprite_art, kSpriteArtSlots, &hd->sprite_art_count, key);
   if (entry && entry->state == kPackUnknown) {
-    char path[kPathMax + 32];
-    snprintf(path, sizeof path, "%s/%04x_p%08x.rgba", hd->pack_dir,
-             state->sprite.graphic_id, (unsigned)(key >> 16));
-    entry->image = LoadImage(path);
+    char name[32];
+    snprintf(name, sizeof name, "%04x_p%08x.rgba", state->sprite.graphic_id,
+             (unsigned)(key >> 16));
+    entry->image = LoadPackImage(hd, name);
     entry->state = entry->image ? kPackLoaded : kPackMissing;
   }
   if (entry && entry->image)
@@ -640,10 +724,9 @@ static const HdImage *PackImage(Dkc2Hd *hd, const Ppu *ppu,
   const unsigned slot = state->sprite.graphic_id / 4u;
   const unsigned palette = (state->sprite.properties >> 9) & 7u;
   if (hd->pack_state[slot][palette] == kPackUnknown) {
-    char path[kPathMax + 32];
-    snprintf(path, sizeof path, "%s/%04x_%x.rgba", hd->pack_dir, slot * 4u,
-             palette);
-    hd->pack[slot][palette] = LoadImage(path);
+    char name[32];
+    snprintf(name, sizeof name, "%04x_%x.rgba", slot * 4u, palette);
+    hd->pack[slot][palette] = LoadPackImage(hd, name);
     hd->pack_state[slot][palette] =
         hd->pack[slot][palette] ? kPackLoaded : kPackMissing;
   }
@@ -1261,10 +1344,9 @@ static void AddLoose(Dkc2Hd *hd, const Ppu *ppu, unsigned g,
       PackFind(hd->sprite_art, kSpriteArtSlots, &hd->sprite_art_count, key);
   DumpLoose(hd, ppu, key, entry);
   if (entry && hd->pack_dir[0] && entry->state == kPackUnknown) {
-    char path[kPathMax + 32];
-    snprintf(path, sizeof path, "%s/o_%016llx.rgba", hd->pack_dir,
-             (unsigned long long)key);
-    entry->image = LoadImage(path);
+    char name[32];
+    snprintf(name, sizeof name, "o_%016llx.rgba", (unsigned long long)key);
+    entry->image = LoadPackImage(hd, name);
     entry->state = entry->image ? kPackLoaded : kPackMissing;
   }
   const HdImage *image = entry ? entry->image : NULL;
@@ -1496,10 +1578,10 @@ static PackEntry *TerrainFind(Dkc2Hd *hd, uint64_t key) {
 
 static const HdImage *TerrainArt(Dkc2Hd *hd, PackEntry *entry) {
   if (entry->state == kPackUnknown) {
-    char path[kPathMax + 32];
-    snprintf(path, sizeof path, "%s/t_%016llx.rgba", hd->pack_dir,
+    char name[32];
+    snprintf(name, sizeof name, "t_%016llx.rgba",
              (unsigned long long)entry->key);
-    entry->image = LoadImage(path);
+    entry->image = LoadPackImage(hd, name);
     entry->state = entry->image ? kPackLoaded : kPackMissing;
   }
   return entry->image;
@@ -1704,10 +1786,9 @@ static void AddTile(Dkc2Hd *hd, const Ppu *ppu, unsigned layer, int x, int y,
     art->dumped = WriteCaptureImage(path, pixels, kTile, kTile, kTile);
   }
   if (art->state == kPackUnknown && hd->pack_dir[0]) {
-    char path[kPathMax + 32];
-    snprintf(path, sizeof path, "%s/b_%016llx.rgba", hd->pack_dir,
-             (unsigned long long)key);
-    art->image = LoadImage(path);
+    char name[32];
+    snprintf(name, sizeof name, "b_%016llx.rgba", (unsigned long long)key);
+    art->image = LoadPackImage(hd, name);
     art->state = art->image ? kPackLoaded : kPackMissing;
   }
   if (!art->image || hd->tile_count >= kTileMax)
