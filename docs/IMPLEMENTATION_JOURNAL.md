@@ -6594,10 +6594,12 @@ cell read from VRAM as ` layer,x,y,key,flips`, with x and y the tilemap cell
 wrapped by the map size from BGnSC; cells filled from a remembered neighbour
 (widescreen margins) are left out since their position is not a tilemap
 one. The runtime path is unchanged. On the Pirate Panic route the sky is
-BG2: 416 cells (32x13, repeating every 256 pixels) with 120 keys; cloud
-cells are mostly used once and the most repeated keys are flat sky (up to
-33 cells). Turning the tile pass on with `backgrounds.txt` costs about
+BG2: 416 cells (32x13, repeating every 256 pixels) with 119 keys, the
+same at 4:3 and in widescreen; 34 keys are used once and the most repeated
+are flat sky (up to 32 cells). Turning the tile pass on with `backgrounds.txt` costs about
 0.5 ms per frame at the median in Castle Crush (21:9, learned filter: 3.2
 against 2.8 ms) with no frame over 16 ms in four of five runs. Headless
 savestates written mid-route render Pirate Panic with horizontal streaks
-even without HD; the same frames from a continuous run are clean.
+even without HD, and their background cells read as different
+characters, so keys dumped from such a state never occur in play: dumps
+for art must come from a continuous run.
