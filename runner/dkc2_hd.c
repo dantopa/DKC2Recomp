@@ -264,6 +264,12 @@ struct Dkc2Hd {
   TilePending tile_pending[kTileColumns * kTileRows];
   Dkc2HdQuad tiles[kTileMax];
   unsigned tile_count;
+  /* With DKC2_HD_DUMP, the frame's VRAM cells as " layer,x,y,key,flips"
+   * (x, y: tilemap cell), written to tiles.txt when the frame dumped a new
+   * character, so generated art can see a whole layer. */
+  char tile_layout[kTileMax * 32];
+  size_t tile_layout_length;
+  bool tile_layout_new;
   uint8_t tile_mask[kMaxPixels];
   Dkc2HdScene scene;
   uint32_t *output;
@@ -1784,6 +1790,7 @@ static void AddTile(Dkc2Hd *hd, const Ppu *ppu, unsigned layer, int x, int y,
     snprintf(path, sizeof path, "%s/b_%016llx.rgba", hd->dump_dir,
              (unsigned long long)key);
     art->dumped = WriteCaptureImage(path, pixels, kTile, kTile, kTile);
+    hd->tile_layout_new |= art->dumped;
   }
   if (art->state == kPackUnknown && hd->pack_dir[0]) {
     char name[32];
@@ -1805,6 +1812,19 @@ static void AddTile(Dkc2Hd *hd, const Ppu *ppu, unsigned layer, int x, int y,
   quad->flip_y = (entry & 0x8000u) != 0;
   quad->brightness = ppu->brightnessMult[31];
   quad->rank = (uint8_t)(layer + 1);
+}
+
+/* Appends the frame's background cells to tiles.txt in the dump. */
+static void WriteTileLayout(const Dkc2Hd *hd) {
+  char path[kPathMax + 32];
+  snprintf(path, sizeof path, "%s/tiles.txt", hd->dump_dir);
+  FILE *layout = fopen(path, "a");
+  bool ok = layout && fprintf(layout, "%.*s\n", (int)hd->tile_layout_length,
+                              hd->tile_layout) >= 0;
+  if (layout && fclose(layout) != 0)
+    ok = false;
+  if (!ok)
+    fprintf(stderr, "warning: DKC2_HD_DUMP could not update %s\n", path);
 }
 
 /* Whether two lines draw a layer with the same registers. */
@@ -1864,6 +1884,18 @@ static void ProcessTileRow(Dkc2Hd *hd, const Ppu *ppu,
       continue;
     }
     const uint64_t key = TileKey(ppu, indices);
+    if (hd->dump_dir[0] && ppu->brightnessMult[31] == 255u) {
+      const unsigned columns = state->bg_sc[layer] & 1u ? 64u : 32u;
+      const unsigned rows = state->bg_sc[layer] & 2u ? 64u : 32u;
+      const unsigned map_x = (unsigned)(x - extra) + h_scroll;
+      const size_t room = sizeof hd->tile_layout - hd->tile_layout_length;
+      const int written = snprintf(
+          hd->tile_layout + hd->tile_layout_length, room, " %u,%u,%u,%016llx,%u",
+          layer, (map_x >> 3) & (columns - 1u), (map_y >> 3) & (rows - 1u),
+          (unsigned long long)key, (unsigned)(entry >> 14));
+      if (written > 0 && (size_t)written < room)
+        hd->tile_layout_length += (size_t)written;
+    }
     if (content) {
       TileSeen *seen = TileSeenFind(hd, content);
       *seen = (TileSeen){content, key, entry};
@@ -1880,6 +1912,8 @@ static void ProcessTileRow(Dkc2Hd *hd, const Ppu *ppu,
 static void ProcessTiles(Dkc2Hd *hd, const Ppu *ppu,
                          const Dkc2HdmaLines *lines) {
   hd->tile_count = 0;
+  hd->tile_layout_length = 0;
+  hd->tile_layout_new = false;
   if (!lines || !hd->tile_pass)
     return;
   for (unsigned layer = kTileFirstLayer; layer < kBgLayers; layer++) {
@@ -1912,6 +1946,8 @@ static void ProcessTiles(Dkc2Hd *hd, const Ppu *ppu,
         AddTile(hd, ppu, layer, cell.x, cell.y, seen->key, seen->entry, NULL);
     }
   }
+  if (hd->tile_layout_new)
+    WriteTileLayout(hd);
 }
 
 /* Whether the native 256 columns lie inside the frame (the presentation

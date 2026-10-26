@@ -67,6 +67,10 @@
   only when the pack has that file: before, every sprite, terrain block,
   object and background tile without art tried to open its file during the
   frame, which caused hitches of up to about 100 ms on a cold disk.
+- `DKC2_HD_DUMP` also writes `tiles.txt`: for each frame that showed a new
+  background cell, the BG2/BG3 cells read from VRAM as
+  `layer,x,y,key,flips` by tilemap position, so a whole layer can be
+  rebuilt for generated art.
 
 ## 0.0.8 (alpha) - 2026-09-13
 

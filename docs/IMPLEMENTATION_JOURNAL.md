@@ -6586,3 +6586,18 @@ Crush route (21:9, learned filter, the user's pack): 393 failed and 107
 found before, 0 failed and 100 found after. With a warm disk cache neither
 build had a frame over 16 ms, so the gain shows on a cold disk; the art
 that is found is still read four bytes at a time.
+
+Background layout in the dump. Art for BG2/BG3 is keyed per 8x8 cell, so a
+generated picture of a whole layer needs to know where each key sits. The
+dump now appends to `tiles.txt`, on frames that dumped a new cell, every
+cell read from VRAM as ` layer,x,y,key,flips`, with x and y the tilemap cell
+wrapped by the map size from BGnSC; cells filled from a remembered neighbour
+(widescreen margins) are left out since their position is not a tilemap
+one. The runtime path is unchanged. On the Pirate Panic route the sky is
+BG2: 416 cells (32x13, repeating every 256 pixels) with 120 keys; cloud
+cells are mostly used once and the most repeated keys are flat sky (up to
+33 cells). Turning the tile pass on with `backgrounds.txt` costs about
+0.5 ms per frame at the median in Castle Crush (21:9, learned filter: 3.2
+against 2.8 ms) with no frame over 16 ms in four of five runs. Headless
+savestates written mid-route render Pirate Panic with horizontal streaks
+even without HD; the same frames from a continuous run are clean.
