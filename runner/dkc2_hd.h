@@ -72,6 +72,17 @@ extern "C" {
  * widescreen margin cells take the character of a reproduced cell with the
  * same pixels. The dump writes each new character as "b_<key>.rgba".
  *
+ * Background panoramas (needs the tile pass): panoramas.txt lists 16-digit
+ * hex keys; each has "l_<key>.ref", cells of one layer as the dump writes
+ * them to tiles.txt (" layer,x,y,key,flips"), and "l_<key>.rgba", art for
+ * that layer's whole tilemap at an integer multiple of its size (tilemap
+ * pixel x, y at art x * m, y * m). When at least 7/8 of the reproduced cells
+ * a frame shows of the referenced ones match, the art replaces the layer's
+ * cells: each run of scanlines drawn with the same registers shows the art
+ * where its scroll puts it, so per-line scroll (parallax bands, water) is
+ * kept. Lines that add the fixed color to the layer add it to the art too;
+ * other color math leaves those lines native.
+ *
  * Works at any frame width the PPU renders (widescreen margins included).
  * Limits: Mode 1 scenes only, and object color math is not reproduced.
  */
@@ -113,17 +124,28 @@ typedef struct Dkc2HdImage {
   uint32_t pixels[];
 } Dkc2HdImage;
 
-/* An image over the output rectangle (x, y, width, height), sampled nearest:
- * output column hx shows image column hx * image->width / width, counted
- * from the right edge when flipped (rows likewise). */
+/* An image's source rectangle over the output rectangle (x, y, width,
+ * height), sampled nearest: output column hx shows image column source_x +
+ * hx * source_width / width, counted from the right edge when flipped (rows
+ * likewise). A source_width of 0 stands for the whole image. */
 typedef struct Dkc2HdQuad {
   const Dkc2HdImage *image;
   int x, y, width, height;
+  int source_x, source_y, source_width, source_height;
   bool flip_x, flip_y;
   uint8_t brightness; /* scales the color; 255 leaves it */
-  uint8_t rank;       /* sprites: composition rank; tiles: layer + 1 */
+  /* Sprites: composition rank. Tiles: layer + 1, plus kDkc2HdTileMath for
+   * panorama lines that add the fixed color. */
+  uint8_t rank;
   uint8_t index;      /* sprites: position in the draw order */
+  /* Tiles: BGR555 color added to each channel (each 5-bit value expanded to
+   * 8 bits) before the brightness; 0 adds nothing. */
+  uint16_t add_color;
 } Dkc2HdQuad;
+
+/* Tile mask and tile rank flag: the layer's pixel had the fixed color added
+ * by color math (only on layers a panorama replaces). */
+enum { kDkc2HdTileMath = 0x80 };
 
 /*
  * One frame decided at 1x, for an executor to draw at the output scale
@@ -147,7 +169,9 @@ typedef struct Dkc2HdScene {
   const uint32_t *base;
   const Dkc2HdQuad *tiles;
   unsigned tile_count;
-  /* Per pixel: the layer + 1 (BG2 or BG3) the base shows untouched, or 0. */
+  /* Per pixel: the layer + 1 (BG2 or BG3) the base shows untouched, or 0;
+   * with kDkc2HdTileMath where a panorama layer shows with the fixed color
+   * added. */
   const uint8_t *tile_mask;
   /* Per pixel: R the highest background rank, G the rank of an object pixel
    * no quad draws, B the index + 1 of the quad owning an object pixel, alpha

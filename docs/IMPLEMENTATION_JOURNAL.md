@@ -6626,3 +6626,45 @@ and 2800 and compares VRAM with the continuous run; it fails without the
 fix (11625 bytes) and passes with it. HD dumps taken after a state load are
 now as trustworthy as continuous ones for states written from here on;
 older states keep the bad latches they were saved with.
+
+## 2026-10-27 - Background panoramas
+
+Pirate Panic's sky with `b_` cell art looked like a patchwork: BG2 shows 416
+cells drawn from 119 characters (flat sky up to 32 times), so every
+repeated cell must carry the same art and no gradient or cloud can run
+across cells; the sea had no art at all. BG2 there is one 32x32 tilemap
+(the map's first 224 rows show) drawn with three sky bands at their own
+scroll (lines 1-24, 25-48, 49-104), then the horizon and the sea with a
+different scroll on every line, and color math adding a fixed green that
+grows from 0x0180 at line 113 to 0x0360 at the bottom. Vertical scroll and
+the fixed colors stayed constant through the level.
+
+A panorama replaces the whole tilemap with one image. The tile pass still
+reproduces cells; when at least 7/8 of the referenced cells it reproduces
+match the reference (and at least 16 do), the layer's cell quads give way
+to one quad per run of lines with equal registers and color math, split
+where the tilemap wraps, with a source rectangle into the art. The line
+record gained CGWSEL, CGADSUB and COLDATA; lines that add the fixed color
+mark the layer's pixels showing it (exact 5-bit sum) in the tile mask with
+`kDkc2HdTileMath` and add the color to the art; subtraction, halving,
+windowed math and clipping keep those lines native. The GPU quad shader
+takes the same source rectangle and added color.
+
+Identity check: the layer's own tilemap enlarged without filtering as the
+panorama reproduces the native frame within one level on every replaced
+pixel (the 8-bit vs 5-bit fixed-color sum), sky bands and sea, at 4:3,
+16:10 and 21:9; GPU and CPU differ in 4 pixels by one level. On the
+continuous route the panorama turns on once at the level start and stays,
+with 0 differing cells of about 430 compared per frame.
+`supplied_rom_hd_panorama` builds that identity panorama from the boot
+route (dumped `tiles.txt`, the tilemap read from a savestate) and checks
+it. Full suite: the six co-op checks that already failed; macOS 68/68.
+
+Art (private pack): Gemini batch, two periods of the untinted map side by
+side. A first pair painted clouds across the band edges, which would tear
+as the bands slide; the second prompt marked the edges with red guide
+lines, and one of the two kept them (the other moved them). The cut fills
+the guide rows from the rows around them, stretches the sky so the guides
+land on the band edges, takes one period with a 96-px cross-faded wrap
+seam, and shifts each row to the native row's mean color; rows no line
+shows are clear. Cost about US$0.28 for four images.

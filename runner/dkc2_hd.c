@@ -68,6 +68,12 @@ enum {
   kTileArtSlots = 16384,
   /* Verified cells of one layer, looked up by their captured pixels. */
   kTileSeenSlots = 4096,
+  /* Background panoramas (see dkc2_hd.h): pack entries, the largest
+   * tilemap in cells per side, and the reproduced reference cells a frame
+   * must show before its matches count. */
+  kPanoramaSlots = 8,
+  kMapSide = 64,
+  kPanoramaMinCells = 16,
 };
 
 /* Pixels each learned pattern reads, as (row, column) offsets from the top
@@ -107,6 +113,19 @@ typedef struct ScreenEntry {
   HdImage *reference;  /* native BG1 the art was made for */
   HdImage *art;
 } ScreenEntry;
+
+/* Art for a whole background tilemap and the cells it was made for. */
+typedef struct PanoramaEntry {
+  uint64_t key;
+  unsigned layer;
+  HdImage *art;
+  /* Character key (0: not referenced) and tilemap flips per cell, row by
+   * row over kMapSide columns. */
+  uint64_t cells[kMapSide * kMapSide];
+  uint8_t flips[kMapSide * kMapSide];
+  /* This frame: referenced cells reproduced, and those that differ. */
+  unsigned compared, wrong;
+} PanoramaEntry;
 
 /* An OAM entry (frame columns) and what the HD path makes of it. */
 typedef struct LooseEntry {
@@ -216,6 +235,8 @@ struct Dkc2Hd {
   bool layer_frame;
   ScreenEntry screens[kScreenSlots];
   unsigned screen_count;
+  PanoramaEntry panoramas[kPanoramaSlots];
+  unsigned panorama_count;
   /* Dump: hash of the native BG1, frames it has been unchanged, and the
    * last one written. */
   uint64_t screen_hash;
@@ -386,6 +407,51 @@ static void LoadScreens(Dkc2Hd *hd) {
   fclose(index);
 }
 
+/* Reads panoramas.txt: one 16-digit hex key per line, each with reference
+ * cells "l_<key>.ref" (tiles.txt items of one layer) and art
+ * "l_<key>.rgba". */
+static void LoadPanoramas(Dkc2Hd *hd) {
+  char path[kPathMax + 64];
+  snprintf(path, sizeof path, "%s/panoramas.txt", hd->pack_dir);
+  FILE *index = fopen(path, "r");
+  if (!index)
+    return;
+  unsigned long long key = 0;
+  while (hd->panorama_count < kPanoramaSlots &&
+         fscanf(index, "%16llx", &key) == 1) {
+    PanoramaEntry *panorama = &hd->panoramas[hd->panorama_count];
+    memset(panorama, 0, sizeof *panorama);
+    snprintf(path, sizeof path, "%s/l_%016llx.ref", hd->pack_dir, key);
+    FILE *reference = fopen(path, "r");
+    unsigned layer = 0, x = 0, y = 0, flips = 0, cells = 0;
+    unsigned long long cell = 0;
+    bool valid = reference != NULL;
+    while (valid && fscanf(reference, " %u,%u,%u,%16llx,%u", &layer, &x, &y,
+                           &cell, &flips) == 5) {
+      valid = layer >= kTileFirstLayer && layer < kBgLayers &&
+              x < kMapSide && y < kMapSide && cell != 0 &&
+              (cells == 0 || layer == panorama->layer);
+      panorama->layer = layer;
+      panorama->cells[y * kMapSide + x] = cell;
+      panorama->flips[y * kMapSide + x] = (uint8_t)(flips & 3u);
+      cells++;
+    }
+    valid = valid && feof(reference) && cells >= kPanoramaMinCells;
+    if (reference)
+      fclose(reference);
+    snprintf(path, sizeof path, "%s/l_%016llx.rgba", hd->pack_dir, key);
+    panorama->art = valid ? LoadImage(path) : NULL;
+    if (!panorama->art) {
+      fprintf(stderr, "warning: DKC2_HD_PACK panorama %016llx is incomplete\n",
+              key);
+      continue;
+    }
+    panorama->key = key;
+    hd->panorama_count++;
+  }
+  fclose(index);
+}
+
 Dkc2Hd *Dkc2HdCreate(const Dkc2HdConfig *config, const uint8_t *rom,
                      size_t rom_size) {
   if (!config || !rom || config->scale < kDkc2HdMinScale ||
@@ -447,6 +513,8 @@ Dkc2Hd *Dkc2HdCreate(const Dkc2HdConfig *config, const uint8_t *rom,
     hd->tile_pass = index != NULL;
     if (index)
       fclose(index);
+    LoadPanoramas(hd);
+    hd->tile_pass |= hd->panorama_count > 0;
   }
   hd->tile_pass |= hd->dump_dir[0] != '\0';
   if (hd->layer_pack)
@@ -489,6 +557,8 @@ void Dkc2HdDestroy(Dkc2Hd *hd) {
     free(hd->screens[i].reference);
     free(hd->screens[i].art);
   }
+  for (unsigned i = 0; i < hd->panorama_count; i++)
+    free(hd->panoramas[i].art);
   free(hd->layer);
   free(hd->rows);
   free(hd->pack_files);
@@ -1389,11 +1459,23 @@ static bool SpriteHidden(const Dkc2Hd *hd, const Dkc2HdQuad *quad, size_t i) {
 }
 
 /* Draws a quad of a kind into target (output pixels). */
+/* A 5-bit color channel expanded to 8 bits as the PPU does. */
+static unsigned Expand5(unsigned value) { return value << 3 | value >> 2; }
+
 static void DrawQuad(Dkc2Hd *hd, uint32_t *target, const Dkc2HdQuad *quad,
                      QuadKind kind) {
   const HdImage *image = quad->image;
   const int scale = hd->scale;
   const int out_width = hd->width * scale, out_height = kHeight * scale;
+  const bool whole = quad->source_width == 0;
+  const int source_x = whole ? 0 : quad->source_x;
+  const int source_y = whole ? 0 : quad->source_y;
+  const int source_width = whole ? image->width : quad->source_width;
+  const int source_height = whole ? image->height : quad->source_height;
+  /* Added per channel, in the pixel's byte order (blue lowest). */
+  const unsigned add[3] = {Expand5((quad->add_color >> 10) & 0x1fu),
+                           Expand5((quad->add_color >> 5) & 0x1fu),
+                           Expand5(quad->add_color & 0x1fu)};
   for (int hy = 0; hy < quad->height; hy++) {
     const int y = quad->flip_y ? quad->y + quad->height - 1 - hy
                                : quad->y + hy;
@@ -1401,13 +1483,15 @@ static void DrawQuad(Dkc2Hd *hd, uint32_t *target, const Dkc2HdQuad *quad,
       continue;
     const uint32_t *source =
         image->pixels +
-        (size_t)(hy * image->height / quad->height) * (size_t)image->width;
+        (size_t)(source_y + hy * source_height / quad->height) *
+            (size_t)image->width +
+        (size_t)source_x;
     for (int hx = 0; hx < quad->width; hx++) {
       const int x = quad->flip_x ? quad->x + quad->width - 1 - hx
                                  : quad->x + hx;
       if (x < 0 || x >= out_width)
         continue;
-      uint32_t pixel = source[hx * image->width / quad->width];
+      uint32_t pixel = source[hx * source_width / quad->width];
       const unsigned alpha = pixel >> 24;
       const size_t i =
           (size_t)(y / scale) * (size_t)hd->width + (size_t)(x / scale);
@@ -1415,6 +1499,14 @@ static void DrawQuad(Dkc2Hd *hd, uint32_t *target, const Dkc2HdQuad *quad,
         continue;
       if (kind == kQuadTile && (!alpha || hd->tile_mask[i] != quad->rank))
         continue;
+      if (quad->add_color) {
+        uint32_t sum = pixel & 0xff000000u;
+        for (int c = 0; c < 3; c++) {
+          const unsigned channel = ((pixel >> (c * 8)) & 0xffu) + add[c];
+          sum |= (channel > 255u ? 255u : channel) << (c * 8);
+        }
+        pixel = sum;
+      }
       if (quad->brightness != 255u) {
         uint32_t scaled = pixel & 0xff000000u;
         for (int shift = 0; shift < 24; shift += 8)
@@ -1884,15 +1976,26 @@ static void ProcessTileRow(Dkc2Hd *hd, const Ppu *ppu,
       continue;
     }
     const uint64_t key = TileKey(ppu, indices);
+    const unsigned columns = state->bg_sc[layer] & 1u ? 64u : 32u;
+    const unsigned rows = state->bg_sc[layer] & 2u ? 64u : 32u;
+    const unsigned cell_x = (((unsigned)(x - extra) + h_scroll) >> 3) &
+                            (columns - 1u);
+    const unsigned cell_y = (map_y >> 3) & (rows - 1u);
+    for (unsigned p = 0; p < hd->panorama_count; p++) {
+      PanoramaEntry *panorama = &hd->panoramas[p];
+      const size_t cell = (size_t)cell_y * kMapSide + cell_x;
+      if (panorama->layer != layer || !panorama->cells[cell])
+        continue;
+      panorama->compared++;
+      panorama->wrong += panorama->cells[cell] != key ||
+                         panorama->flips[cell] != entry >> 14;
+    }
     if (hd->dump_dir[0] && ppu->brightnessMult[31] == 255u) {
-      const unsigned columns = state->bg_sc[layer] & 1u ? 64u : 32u;
-      const unsigned rows = state->bg_sc[layer] & 2u ? 64u : 32u;
-      const unsigned map_x = (unsigned)(x - extra) + h_scroll;
       const size_t room = sizeof hd->tile_layout - hd->tile_layout_length;
       const int written = snprintf(
           hd->tile_layout + hd->tile_layout_length, room, " %u,%u,%u,%016llx,%u",
-          layer, (map_x >> 3) & (columns - 1u), (map_y >> 3) & (rows - 1u),
-          (unsigned long long)key, (unsigned)(entry >> 14));
+          layer, cell_x, cell_y, (unsigned long long)key,
+          (unsigned)(entry >> 14));
       if (written > 0 && (size_t)written < room)
         hd->tile_layout_length += (size_t)written;
     }
@@ -1902,6 +2005,117 @@ static void ProcessTileRow(Dkc2Hd *hd, const Ppu *ppu,
     }
     AddTile(hd, ppu, layer, x, top, key, entry, indices);
   }
+}
+
+/* Whether two lines draw a layer with the same registers and color math. */
+static bool SamePanoramaLine(const Dkc2HdmaLineState *a,
+                             const Dkc2HdmaLineState *b, unsigned layer) {
+  return SameTileLine(a, b, layer) && a->cgwsel == b->cgwsel &&
+         a->cgadsub == b->cgadsub && a->fixed_color == b->fixed_color;
+}
+
+/* A captured layer pixel with the fixed color added by the PPU (5-bit
+ * channels, saturated, then the brightness). */
+static uint32_t AddFixedColor(const Ppu *ppu, uint32_t captured,
+                              uint16_t fixed) {
+  uint32_t sum = 0;
+  for (int c = 0; c < 3; c++) {
+    const unsigned value = (captured >> (c * 8)) & 0xffu;
+    unsigned level = 0;
+    while (level < 31u && ppu->brightnessMult[level] != value)
+      level++;
+    /* brightnessMult holds 31 copies of its last entry past 31. */
+    sum |= (uint32_t)ppu->brightnessMult[level + ((fixed >> (10 - 5 * c)) &
+                                                  0x1fu)]
+           << (c * 8);
+  }
+  return sum;
+}
+
+/* Lines first..end (past) of a panorama layer drawn with state: the art
+ * where the scroll puts the tilemap, split where the tilemap wraps. Lines
+ * that add the fixed color add it to the art, and their layer pixels with
+ * that color added join the tile mask. */
+static void AddPanoramaLines(Dkc2Hd *hd, const Ppu *ppu,
+                             const Dkc2HdmaLineState *state, unsigned layer,
+                             const PanoramaEntry *panorama, int first,
+                             int end) {
+  const bool math = (state->cgadsub >> layer & 1u) != 0;
+  const bool readable = (state->bgmode & 7) == 1 &&
+                        !(state->bgmode >> (layer + 4) & 1) &&
+                        !(state->mosaic >> layer & 1);
+  /* Clipping to black, subtraction, halving and windowed math leave the
+   * lines native. */
+  if (!readable || (state->cgwsel & 0xc0u) ||
+      (math && ((state->cgadsub & 0xc0u) || (state->cgwsel & 0x30u))))
+    return;
+  const unsigned map_width = (state->bg_sc[layer] & 1u ? 64u : 32u) * kTile;
+  const unsigned map_height = (state->bg_sc[layer] & 2u ? 64u : 32u) * kTile;
+  const HdImage *art = panorama->art;
+  const unsigned multiple = (unsigned)art->width / map_width;
+  if (multiple == 0 || (unsigned)art->width != map_width * multiple ||
+      (unsigned)art->height != map_height * multiple)
+    return;
+  const uint16_t add = math ? state->fixed_color & 0x7fffu : 0;
+  uint8_t rank = (uint8_t)(layer + 1);
+  if (add) {
+    rank |= kDkc2HdTileMath;
+    for (int y = first; y < end; y++) {
+      for (int x = 0; x < hd->width; x++) {
+        const size_t i = (size_t)y * (size_t)hd->width + (size_t)x;
+        const uint32_t captured = hd->bg[layer][i];
+        if (captured && (uint8_t)(captured >> 24) == hd->base_rank[i] &&
+            (Rgb(hd->base[i]) == Rgb(captured) ||
+             Rgb(hd->base[i]) == AddFixedColor(ppu, captured, add)))
+          hd->tile_mask[i] = rank;
+      }
+    }
+  }
+  const int extra = (hd->width - kNativeWidth) / 2;
+  const int scale = hd->scale;
+  for (int y = first; y < end;) {
+    /* Captured row 0 is scanline 1. */
+    const unsigned map_y =
+        ((unsigned)(y + 1) + state->v_scroll[layer]) & (map_height - 1u);
+    const int height =
+        end - y < (int)(map_height - map_y) ? end - y : (int)(map_height - map_y);
+    for (int x = 0; x < hd->width && hd->tile_count < kTileMax;) {
+      const unsigned map_x =
+          ((unsigned)(x - extra) + state->h_scroll[layer]) & (map_width - 1u);
+      const int width = hd->width - x < (int)(map_width - map_x)
+                            ? hd->width - x
+                            : (int)(map_width - map_x);
+      Dkc2HdQuad *quad = &hd->tiles[hd->tile_count++];
+      memset(quad, 0, sizeof *quad);
+      quad->image = art;
+      quad->x = x * scale;
+      quad->y = y * scale;
+      quad->width = width * scale;
+      quad->height = height * scale;
+      quad->source_x = (int)(map_x * multiple);
+      quad->source_y = (int)(map_y * multiple);
+      quad->source_width = width * (int)multiple;
+      quad->source_height = height * (int)multiple;
+      quad->brightness = ppu->brightnessMult[31];
+      quad->rank = rank;
+      quad->add_color = add;
+      x += width;
+    }
+    y += height;
+  }
+}
+
+/* The pack panorama for a layer whose reproduced cells match it this
+ * frame, if any. */
+static const PanoramaEntry *MatchPanorama(const Dkc2Hd *hd, unsigned layer) {
+  for (unsigned p = 0; p < hd->panorama_count; p++) {
+    const PanoramaEntry *panorama = &hd->panoramas[p];
+    if (panorama->layer == layer &&
+        panorama->compared >= kPanoramaMinCells &&
+        panorama->wrong * 8 <= panorama->compared)
+      return panorama;
+  }
+  return NULL;
 }
 
 /* Background tile art for BG2 and BG3. Each layer is split into rows of
@@ -1918,6 +2132,9 @@ static void ProcessTiles(Dkc2Hd *hd, const Ppu *ppu,
     return;
   for (unsigned layer = kTileFirstLayer; layer < kBgLayers; layer++) {
     memset(hd->tile_seen, 0, sizeof hd->tile_seen);
+    for (unsigned p = 0; p < hd->panorama_count; p++)
+      hd->panoramas[p].compared = hd->panoramas[p].wrong = 0;
+    const unsigned layer_tiles = hd->tile_count;
     unsigned pending = 0;
     int row = 0;
     while (row < kHeight) {
@@ -1944,6 +2161,20 @@ static void ProcessTiles(Dkc2Hd *hd, const Ppu *ppu,
           TileSeenFind(hd, TileContent(hd, layer, cell.x, cell.y));
       if (seen->content)
         AddTile(hd, ppu, layer, cell.x, cell.y, seen->key, seen->entry, NULL);
+    }
+    /* A matched panorama replaces the layer's cell art. */
+    const PanoramaEntry *panorama = MatchPanorama(hd, layer);
+    if (!panorama)
+      continue;
+    hd->tile_count = layer_tiles;
+    for (int first = 0; first < kHeight;) {
+      int end = first + 1;
+      while (end < kHeight && SamePanoramaLine(&lines->line[first + 1],
+                                               &lines->line[end + 1], layer))
+        end++;
+      AddPanoramaLines(hd, ppu, &lines->line[first + 1], layer, panorama,
+                       first, end);
+      first = end;
     }
   }
   if (hd->tile_layout_new)
