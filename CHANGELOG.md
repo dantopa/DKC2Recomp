@@ -80,6 +80,9 @@
   8x8 cells, drawn per run of scanlines with their own scroll and the fixed
   color the game adds, so parallax bands and per-line water keep moving as
   in the original. The CPU compositor and the GPU presenter both draw it.
+- HD on the world map: the drifting clouds show again over the sky (they are
+  sprites the sky hides, which the game adds back through the subscreen),
+  and no sprite peeks into the black side bars of a centered screen.
 
 ## 0.0.8 (alpha) - 2026-09-13
 

@@ -1034,6 +1034,8 @@ bool Dkc2KongsRenderOam(Ppu *ppu, int line, unsigned slot) {
       const int px = actor->x + (flip ? -1 - local : local) - ppu->wsPresentationXBias;
       if (px < -(int)ppu->extraLeftCur || px >= 256 + (int)ppu->extraRightCur) continue;
       const PpuZbufType pixel = (PpuZbufType)(palette + color + (priority << 8));
+      /* The subscreen copy keeps every sprite pixel (see objSubBuffer). */
+      ppu->objSubBuffer.data[px + kPpuExtraLeftRight] = pixel;
       if (captured && px >= capture->x0 && px < capture->x1) {
         ppu->overlayBuffers[kPpuOverlaySource_Obj].data[px + kPpuExtraLeftRight] =
             pixel;
