@@ -6571,6 +6571,22 @@ filter setting gained "Learned (PixelPerfect)" (`learned-pixel`), which
 reads `hdfilter/sprites_pixel_x4.lut`, next to "Learned (SGI)", which still
 reads `hdfilter/sprites_x4.lut`. Settings saved before keep their value.
 
+Pack misses no longer reach the disk. With a pack on, the real app showed
+frames of 27-106 ms in Castle Crush that never happened without the pack;
+a sample put the time in `Dkc2HdEndFrameScene > LoadImage > open`. Each
+sprite palette, slot, terrain block, loose object and background tile is
+looked up once by its file name, and most have no art (the pack has 155
+terrain blocks, mostly Pirate Panic), so a new level opened hundreds of
+files that do not exist on the main thread. `Dkc2HdCreate` now lists the
+pack directory once (`opendir`, `_findfirst` on Windows), keeps the sorted
+FNV-1a hashes of the names, and `LoadPackImage` opens a file only when its
+name is listed; a hash collision only costs the old failed open. Screens
+still load from `screens.txt`. Counting opens over 25 s of the bot's Castle
+Crush route (21:9, learned filter, the user's pack): 393 failed and 107
+found before, 0 failed and 100 found after. With a warm disk cache neither
+build had a frame over 16 ms, so the gain shows on a cold disk; the art
+that is found is still read four bytes at a time.
+
 ## 2026-10-26 - PPU port latches in savestates
 
 Frames rendered after loading a headless state were sometimes garbled
