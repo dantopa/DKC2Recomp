@@ -54,6 +54,10 @@
   frame on the world map).
 - The GPU HD presenter no longer stalls rewriting textures the GPU is still
   reading: composition peaked at 27 ms on some frames, now 3.6 ms.
+- Savestates (quick save, rewind and headless states) keep the PPU port
+  latches, so a state saved while a level loads no longer resumes with
+  garbled graphics. The format is v8 and older states still load. The
+  `snesrecomp` submodule now points at the `dantopa/snesrecomp` fork.
 
 ## 0.0.8 (alpha) - 2026-09-13
 

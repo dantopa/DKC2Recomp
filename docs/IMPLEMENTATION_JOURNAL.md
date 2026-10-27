@@ -6530,3 +6530,26 @@ up to 27 ms. They now rotate across three sets (worst composition 3.6 ms).
 A/B pacing runs were too noisy to show a visible difference. The quad pass
 also sampled an unbound tile-mask unit in scenes without tiles; it is now
 always bound.
+
+## 2026-10-26 - PPU port latches in savestates
+
+Frames rendered after loading a headless state were sometimes garbled
+(streaked Pirate Panic, broken shop icons) while real play was fine. On the
+boot route of the co-op checks, states saved every 100 frames and loaded
+reached the same VRAM at frame 3018 as the uninterrupted run except when
+saved at frames 2600, 2800 and 2900 (11625, 299 and 278 bytes). Loaded at
+2600, WRAM stayed identical while VRAM diverged 16 frames later in one
+upload (0x4021-0xB7FD): the game writes the level graphics through the PPU
+data port over several frames, and the snapshot did not hold the port
+state, so the rest of the upload landed at a stale address.
+
+The fix is in the `snesrecomp` submodule, now at the `dantopa/snesrecomp`
+fork (branch `fix/ppu-latch-savestate`): format v8 appends the 21 bytes from
+`vramPointer` to `m7prev` (VRAM address, remap, increment and read buffer,
+CGRAM and OAM pointers and buffers, latched flags) after the joypad block,
+with an assert on that span. v4-v7 states still load. Rewind sizes its
+slots from the snapshot itself. `supplied_rom_savestate_vram` saves at 2600
+and 2800 and compares VRAM with the continuous run; it fails without the
+fix (11625 bytes) and passes with it. HD dumps taken after a state load are
+now as trustworthy as continuous ones for states written from here on;
+older states keep the bad latches they were saved with.
