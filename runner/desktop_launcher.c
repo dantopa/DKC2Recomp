@@ -119,7 +119,7 @@ void Dkc2LauncherSetHdScale(int scale) {
 }
 int Dkc2LauncherHdSprites(void) { return s_hd_sprites; }
 void Dkc2LauncherSetHdSprites(int filter) {
-  s_hd_sprites = ClampInt(filter, kDkc2HdFilterNearest, kDkc2HdFilterLearned);
+  s_hd_sprites = ClampInt(filter, kDkc2HdFilterNearest, kDkc2HdFilterLearnedPixel);
 }
 int Dkc2LauncherHdBackground(void) { return s_hd_background; }
 void Dkc2LauncherSetHdBackground(int filter) {

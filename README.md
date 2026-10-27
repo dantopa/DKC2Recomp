@@ -91,7 +91,7 @@ Each item is tracked in the [issues](https://github.com/dantopa/DKC2Recomp/issue
 
 Build exactly as upstream; the HD layer is part of the SDL and desktop
 targets. Enable it in the in-game **Settings** tab. For headless and
-scripted runs use `DKC2_HD=<2-8>`, `DKC2_HD_FILTER=nearest|smooth`,
+scripted runs use `DKC2_HD=<2-8>`, `DKC2_HD_FILTER=nearest|smooth|learned|learned-pixel`,
 `DKC2_HD_PACK=<dir>` and `DKC2_HD_DUMP=<dir>`. The pack format is documented
 in `runner/dkc2_hd.h`.
 

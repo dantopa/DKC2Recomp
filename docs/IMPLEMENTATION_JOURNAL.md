@@ -6562,6 +6562,15 @@ underruns. In one earlier run the display link delivered no ticks for the
 first 17 seconds and the host paced on its clock meanwhile; it did not
 happen again.
 
+Two learned filters. The MuLUT table was distilled a second time with the
+PixelPerfect upscaler as the teacher (same held-out graphics): it reaches
+29.49 dB / 0.913 SSIM against its teacher, where the SGI distillation
+reached 24.34 dB / 0.911 against SGI, so the table imitates the pixel-art
+style much more closely than the smooth one. Both are kept: the sprite
+filter setting gained "Learned (PixelPerfect)" (`learned-pixel`), which
+reads `hdfilter/sprites_pixel_x4.lut`, next to "Learned (SGI)", which still
+reads `hdfilter/sprites_x4.lut`. Settings saved before keep their value.
+
 ## 2026-10-26 - PPU port latches in savestates
 
 Frames rendered after loading a headless state were sometimes garbled

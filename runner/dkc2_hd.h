@@ -83,13 +83,16 @@ enum {
 typedef enum Dkc2HdFilter {
   kDkc2HdFilterNearest = 0,
   kDkc2HdFilterSmooth = 1,
-  /* Sprites only: a table learned offline (see below). */
+  /* Sprites only: tables learned offline (see below), one per style. */
   kDkc2HdFilterLearned = 2,
+  kDkc2HdFilterLearnedPixel = 3,
 } Dkc2HdFilter;
 
-/* Learned filter table, relative to the working directory (the user data
- * folder in the desktop host) unless DKC2_HD_FILTER_TABLE names one. */
+/* Learned filter tables, relative to the working directory (the user data
+ * folder in the desktop host) unless DKC2_HD_FILTER_TABLE names one: the
+ * smooth-art style, and the pixel-art style. */
 #define kDkc2HdDefaultFilterTable "hdfilter/sprites_x4.lut"
+#define kDkc2HdPixelFilterTable "hdfilter/sprites_pixel_x4.lut"
 
 typedef struct Dkc2HdConfig {
   int scale;
@@ -97,7 +100,7 @@ typedef struct Dkc2HdConfig {
   Dkc2HdFilter background;  /* the scaled authentic frame */
   const char *pack_dir;  /* optional */
   const char *dump_dir;  /* optional: writes each new 1x sprite frame */
-  const char *filter_table;  /* the learned filter's table */
+  const char *filter_table;  /* overrides the learned filter's table */
 } Dkc2HdConfig;
 
 typedef struct Dkc2Hd Dkc2Hd;
@@ -166,7 +169,7 @@ typedef struct Dkc2HdProbe {
   int x, y, width, height;  /* the quad in 1x frame pixels */
 } Dkc2HdProbe;
 
-/* Reads DKC2_HD=<scale>, DKC2_HD_FILTER=nearest|smooth|learned (with
+/* Reads DKC2_HD=<scale>, DKC2_HD_FILTER=nearest|smooth|learned|learned-pixel (with
  * DKC2_HD_FILTER_TABLE), DKC2_HD_PACK and DKC2_HD_DUMP; the background is
  * smooth. False when DKC2_HD is unset;
  * *error is set when it is present but invalid. */

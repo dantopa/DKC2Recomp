@@ -54,6 +54,10 @@
   frame on the world map).
 - The GPU HD presenter no longer stalls rewriting textures the GPU is still
   reading: composition peaked at 27 ms on some frames, now 3.6 ms.
+- Settings offers two learned sprite filters: "Learned (SGI)" reads
+  `hdfilter/sprites_x4.lut` as before, and "Learned (PixelPerfect)"
+  (`DKC2_HD_FILTER=learned-pixel`) reads `hdfilter/sprites_pixel_x4.lut`.
+  `DKC2_HD_FILTER_TABLE` still overrides the table for either.
 - The SDL host builds against SDL3 on macOS (SDL2 stays available with
   `-DSNESRECOMP_SDL_BACKEND=SDL2`, and is still what Windows and Linux use).
   `build_macos.sh` now needs SDL3 and bundles `libSDL3.0.dylib`; before it

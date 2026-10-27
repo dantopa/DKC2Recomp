@@ -891,10 +891,11 @@ static void DrawSettingsPage(Dkc2DesktopOverlay *overlay) {
                        kDkc2HdMaxScale, "%dx"))
     Dkc2LauncherSetHdScale(hd_scale);
   static const char *hd_filter_labels[] = {
-      "Pixel (square)", "Smooth (gradient)", "Learned (table)"};
+      "Pixel (square)", "Smooth (gradient)", "Learned (SGI)",
+      "Learned (PixelPerfect)"};
   const int hd_sprites = Dkc2LauncherHdSprites();
   if (ImGui::BeginCombo("HD sprites", hd_filter_labels[hd_sprites])) {
-    for (int i = kDkc2HdFilterNearest; i <= kDkc2HdFilterLearned; i++) {
+    for (int i = kDkc2HdFilterNearest; i <= kDkc2HdFilterLearnedPixel; i++) {
       if (ImGui::Selectable(hd_filter_labels[i], hd_sprites == i))
         Dkc2LauncherSetHdSprites(i);
     }
