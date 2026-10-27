@@ -796,6 +796,13 @@ if(BUILD_TESTING)
                     --rom "${DKC2_ROM}")
             set_tests_properties(supplied_rom_coop_carry PROPERTIES
                 LABELS "private;integration;coop;input;savestate" TIMEOUT 180)
+            add_test(NAME supplied_rom_savestate_vram
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_savestate_vram.py
+                    --runner "$<TARGET_FILE:dkc2_snesrecomp_headless>"
+                    --rom "${DKC2_ROM}")
+            set_tests_properties(supplied_rom_savestate_vram PROPERTIES
+                LABELS "private;integration;savestate" TIMEOUT 180)
             add_test(NAME supplied_rom_coop_lifecycle
                 COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_coop_lifecycle.py
