@@ -10,18 +10,22 @@ repo_dir="$(cd "$(dirname "$0")" && pwd)"
 build_dir="$repo_dir/build/macos"
 rom_path="${1:-${DKC2_ROM:-}}"
 
-for tool in cmake ninja sdl2-config python3 install_name_tool otool codesign; do
+for tool in cmake ninja pkg-config python3 install_name_tool otool codesign; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "error: missing required tool: $tool" >&2
-    echo "Install CMake, Ninja, and SDL2 (for example: brew install cmake ninja sdl2)." >&2
+    echo "Install CMake, Ninja, pkg-config, and SDL3 (for example: brew install cmake ninja pkg-config sdl3)." >&2
     exit 2
   fi
 done
 
 requested_target="${DKC2_MACOS_DEPLOYMENT_TARGET:-14.0}"
-system_sdl="$(sdl2-config --prefix)/lib/libSDL2-2.0.0.dylib"
+if ! sdl_prefix="$(pkg-config --variable=prefix sdl3)"; then
+  echo "error: SDL3 was not found by pkg-config (brew install sdl3)" >&2
+  exit 2
+fi
+system_sdl="$sdl_prefix/lib/libSDL3.0.dylib"
 if [[ ! -f "$system_sdl" ]]; then
-  echo "error: unable to locate the SDL2 dynamic library at $system_sdl" >&2
+  echo "error: unable to locate the SDL3 dynamic library at $system_sdl" >&2
   exit 2
 fi
 sdl_target="$(otool -l "$system_sdl" | awk '
@@ -40,7 +44,7 @@ print(dependency if dependency and version(dependency) > version(requested)
 PY
 )"
 if [[ "$deployment_target" != "$requested_target" ]]; then
-  echo "macOS deployment target raised from $requested_target to $deployment_target for bundled SDL2"
+  echo "macOS deployment target raised from $requested_target to $deployment_target for bundled SDL3"
 fi
 
 if ! compgen -G "$repo_dir/generated/snesrecomp/*.c" >/dev/null; then
@@ -56,9 +60,9 @@ cmake -E remove_directory "$build_dir/DKC2Recomp.app"
 cmake -S "$repo_dir" -B "$build_dir" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="$deployment_target" \
-  -DCMAKE_PREFIX_PATH="$(sdl2-config --prefix)" \
+  -DCMAKE_PREFIX_PATH="$sdl_prefix" \
   -DDKC2_BUILD_SNESRECOMP=ON \
-  -DDKC2_FETCH_SDL2=OFF \
+  -DSNESRECOMP_SDL_BACKEND=SDL3 \
   -DDKC2_ROM="$rom_path"
 cmake --build "$build_dir" \
   --target dkc2_snesrecomp_sdl dkc2_snesrecomp_headless --parallel
@@ -66,9 +70,9 @@ cmake --build "$build_dir" \
 app="$build_dir/DKC2Recomp.app"
 executable="$app/Contents/MacOS/DKC2Recomp"
 frameworks="$app/Contents/Frameworks"
-linked_sdl="$(otool -L "$executable" | awk '/libSDL2.*dylib/ {print $1; exit}')"
+linked_sdl="$(otool -L "$executable" | awk '/libSDL3.*dylib/ {print $1; exit}')"
 if [[ -z "$linked_sdl" || ! -f "$linked_sdl" ]]; then
-  echo "error: unable to resolve the linked SDL2 dynamic library" >&2
+  echo "error: unable to resolve the linked SDL3 dynamic library" >&2
   exit 3
 fi
 sdl_name="$(basename "$linked_sdl")"

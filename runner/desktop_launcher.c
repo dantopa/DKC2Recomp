@@ -5,7 +5,7 @@
 #include "dkc2_video.h"
 #include "launcher_profile.h"
 
-#include <SDL.h>
+#include "desktop/sdl_compat.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

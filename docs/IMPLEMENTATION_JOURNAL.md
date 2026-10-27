@@ -6531,6 +6531,37 @@ A/B pacing runs were too noisy to show a visible difference. The quad pass
 also sampled an unbound tile-mask unit in scenes without tiles; it is now
 always bound.
 
+SDL3 host on macOS. The Mac app was already running SDL3 underneath: it
+linked Homebrew's `sdl2-compat`, which translates SDL2 calls and loads
+`libSDL3` from Homebrew at run time, and `build_macos.sh` bundled only the
+shim, so the app needed Homebrew SDL3 on the machine that ran it. The host
+now builds against SDL3 directly on macOS and the bundle carries
+`libSDL3.0.dylib` with no Homebrew references. SDL2 remains a configure
+option (`-DSNESRECOMP_SDL_BACKEND=SDL2`) and stays the default on Windows and
+Linux, whose input and menu code still uses the SDL2 window-manager API; a
+Windows configure with SDL3 stops with an error. `sdl_main.c`, the presenter,
+the overlay and the launcher include the runner's `sdl_compat.h` and keep
+both paths: SDL3 functions that return `bool` where SDL2 returned 0 on
+success (context, swap interval, fullscreen, init, rumble) are handled at
+their call sites, the audio queue became an `SDL_AudioStream` (queued bytes
+are still counted at the cartridge rate, and the device pull is converted to
+cartridge frames so the fill target keeps its meaning), gamepads are opened
+by instance id, rumble support is read from the gamepad properties, the Cocoa
+window for the display link comes from the window properties, and the overlay
+uses the ImGui SDL3 backend. Saved bindings stay valid: SDL3 keeps SDL2's
+scancode and gamepad button and axis numbers.
+
+Checks on the M4: the full suite passes except the six co-op checks that
+already failed (headless, no SDL); the five macOS app smokes and the GPU
+parity against the goldens pass. A visible 900-frame A/B with the SDL2 build
+locked to the display link at the same frame (13), presented at a 16.7 ms
+median in both, and the occasional long frames were in the GL swap with
+both backends while the GPU was training a filter. The SDL3 audio queue sits
+about 10 ms lower (average 1218 frames against 1499, minimum 512) without
+underruns. In one earlier run the display link delivered no ticks for the
+first 17 seconds and the host paced on its clock meanwhile; it did not
+happen again.
+
 ## 2026-10-26 - PPU port latches in savestates
 
 Frames rendered after loading a headless state were sometimes garbled

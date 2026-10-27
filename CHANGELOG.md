@@ -54,6 +54,11 @@
   frame on the world map).
 - The GPU HD presenter no longer stalls rewriting textures the GPU is still
   reading: composition peaked at 27 ms on some frames, now 3.6 ms.
+- The SDL host builds against SDL3 on macOS (SDL2 stays available with
+  `-DSNESRECOMP_SDL_BACKEND=SDL2`, and is still what Windows and Linux use).
+  `build_macos.sh` now needs SDL3 and bundles `libSDL3.0.dylib`; before it
+  bundled the Homebrew `sdl2-compat` shim, which loads SDL3 from Homebrew
+  at run time and so did not work on a Mac without it.
 - Savestates (quick save, rewind and headless states) keep the PPU port
   latches, so a state saved while a level loads no longer resumes with
   garbled graphics. The format is v8 and older states still load. The

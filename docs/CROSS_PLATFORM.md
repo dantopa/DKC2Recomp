@@ -53,20 +53,22 @@ open build/macos/DKC2Recomp.app
 ```
 
 `build_macos.sh` generates ignored private sources when necessary, creates the
-native `DKC2Recomp.app`, bundles the linked SDL2 dylib, fixes its install name,
+native `DKC2Recomp.app`, bundles the linked SDL3 dylib, fixes its install name,
 ad-hoc signs and verifies the bundle, and registers it with LaunchServices. The
 Mac host stores mutable files under
 `~/Library/Application Support/Flat2VR/DKC2Recomp`; nothing private is copied
 into the app. Set `DKC2_MACOS_DEPLOYMENT_TARGET` to override the default 14.0
-deployment floor. If the installed SDL2 dylib requires a newer system, the
+deployment floor. If the installed SDL3 dylib requires a newer system, the
 script raises the effective target to that dependency's declared minimum and
 reports it rather than producing a bundle with conflicting version claims.
 Ad-hoc signing is suitable for local testing only and is not notarization.
 
 ## macOS build
 
-Install the Xcode command-line tools plus CMake, Python 3, Rust/Cargo, and
-SDL2. Homebrew can provide the non-Xcode dependencies.
+Install the Xcode command-line tools plus CMake, Python 3, Rust/Cargo,
+pkg-config and SDL3. Homebrew can provide the non-Xcode dependencies. The
+macOS host builds against SDL3 by default; configure with
+`-DSNESRECOMP_SDL_BACKEND=SDL2` to build it against SDL2 instead.
 
 ```sh
 git submodule update --init --recursive
