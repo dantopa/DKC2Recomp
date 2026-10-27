@@ -71,6 +71,10 @@
   background cell, the BG2/BG3 cells read from VRAM as
   `layer,x,y,key,flips` by tilemap position, so a whole layer can be
   rebuilt for generated art.
+- Savestates (quick save, rewind and headless states) keep the PPU port
+  latches, so a state saved while a level loads no longer resumes with
+  garbled graphics. The format is v8 and older states still load. The
+  `snesrecomp` submodule now points at the `dantopa/snesrecomp` fork.
 
 ## 0.0.8 (alpha) - 2026-09-13
 
