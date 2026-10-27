@@ -6668,3 +6668,32 @@ the guide rows from the rows around them, stretches the sky so the guides
 land on the band edges, takes one period with a 96-px cross-faded wrap
 seam, and shifts each row to the native row's mean color; rows no line
 shows are clear. Cost about US$0.28 for four images.
+
+## 2026-10-27 - Map clouds under HD
+
+On the Gangplank Galleon map in HD the clouds over the sea vanished and a
+grey cloud piece showed in the left black bar. The map draws BG1, BG2 (the
+sky) and OBJ on the main screen and BG3 and OBJ on the subscreen, adding the
+subscreen to BG1, BG2 and the backdrop. The clouds are priority-0 sprites:
+BG2 hides them on the main screen and the console adds them from the
+subscreen. The HD OBJ capture (RemoveFromGame) took sprites off both
+screens, so the addition was lost, and the compositor, drawing sprites by
+main-screen rank, showed them only where nothing covers them: the margin of
+the centered map screen, which the PPU never shows but still rasterized
+sprites into.
+
+PPU (snesrecomp fork): a removed sprite stays on the subscreen where the
+main screen (drawn first) hides it; where it would show on the main screen
+it leaves no subscreen copy, so the compositor's sprite has no pixelated
+ghost behind it. Sprites rasterize only into the columns the line shows
+(the per-side margins, or the full budget for selected HUD slots), so a
+centered screen exports nothing in its bars. The co-op actor injection
+writes the subscreen copy too. Native output is unchanged (map frame
+identical). `ppu_sprite_limit_test` covers the three cases and fails on the
+previous PPU in the two buggy ones.
+
+The map Diddy also switched between pack art and the filtered sprite: the
+pack had art for four of the eight walk frames (graphics 0f94-0fb0, palette
+802096c5). The other four were generated (one Gemini image, about US$0.13)
+from the pixel frames with the existing four as the style reference, keyed
+out of a green background at 64x64 like the rest.

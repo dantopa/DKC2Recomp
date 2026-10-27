@@ -2333,6 +2333,11 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
   /* With terrain art BG1 is not in the frame: objects are restored by rank
    * against BG2/BG3 and the HD BG1 layer is drawn by priority afterwards. */
   const bool layered = hd->layer_frame;
+  /* The columns the PPU shows: a centered screen (the map) shows no
+   * margin, so sprite art crossing into it is hidden there. */
+  const int extra = (hd->width - kNativeWidth) / 2;
+  const int shown_first = extra - ppu->extraLeftCur;
+  const int shown_end = extra + kNativeWidth + ppu->extraRightCur;
   for (int y = 0; y < kHeight; y++) {
     for (int x = 0; x < hd->width; x++) {
       const size_t i = (size_t)y * (size_t)hd->width + (size_t)x;
@@ -2349,6 +2354,8 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
         if ((layer > 0 || !layered) && layer_rank > rank)
           rank = layer_rank;
       }
+      if (x < shown_first || x >= shown_end)
+        background = 0xff;
       uint32_t occlusion = (uint32_t)background << 16;
       const uint32_t object = hd->obj[i];
       if (object && !ReplacedPixel(hd, i) && !hd->loose_owner[i]) {

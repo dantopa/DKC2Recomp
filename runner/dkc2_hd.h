@@ -173,7 +173,8 @@ typedef struct Dkc2HdScene {
    * with kDkc2HdTileMath where a panorama layer shows with the fixed color
    * added. */
   const uint8_t *tile_mask;
-  /* Per pixel: R the highest background rank, G the rank of an object pixel
+  /* Per pixel: R the highest background rank (0xff in columns the PPU does
+   * not show), G the rank of an object pixel
    * no quad draws, B the index + 1 of the quad owning an object pixel, alpha
    * 0xff where the BG1 layer is in front. */
   const uint32_t *occlusion;
