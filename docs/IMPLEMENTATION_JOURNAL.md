@@ -6587,6 +6587,23 @@ found before, 0 failed and 100 found after. With a warm disk cache neither
 build had a frame over 16 ms, so the gain shows on a cold disk; the art
 that is found is still read four bytes at a time.
 
+Background layout in the dump. Art for BG2/BG3 is keyed per 8x8 cell, so a
+generated picture of a whole layer needs to know where each key sits. The
+dump now appends to `tiles.txt`, on frames that dumped a new cell, every
+cell read from VRAM as ` layer,x,y,key,flips`, with x and y the tilemap cell
+wrapped by the map size from BGnSC; cells filled from a remembered neighbour
+(widescreen margins) are left out since their position is not a tilemap
+one. The runtime path is unchanged. On the Pirate Panic route the sky is
+BG2: 416 cells (32x13, repeating every 256 pixels) with 119 keys, the
+same at 4:3 and in widescreen; 34 keys are used once and the most repeated
+are flat sky (up to 32 cells). Turning the tile pass on with `backgrounds.txt` costs about
+0.5 ms per frame at the median in Castle Crush (21:9, learned filter: 3.2
+against 2.8 ms) with no frame over 16 ms in four of five runs. Headless
+savestates written mid-route render Pirate Panic with horizontal streaks
+even without HD, and their background cells read as different
+characters, so keys dumped from such a state never occur in play: dumps
+for art must come from a continuous run.
+
 ## 2026-10-26 - PPU port latches in savestates
 
 Frames rendered after loading a headless state were sometimes garbled
