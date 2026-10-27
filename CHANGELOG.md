@@ -67,6 +67,10 @@
   only when the pack has that file: before, every sprite, terrain block,
   object and background tile without art tried to open its file during the
   frame, which caused hitches of up to about 100 ms on a cold disk.
+- Savestates (quick save, rewind and headless states) keep the PPU port
+  latches, so a state saved while a level loads no longer resumes with
+  garbled graphics. The format is v8 and older states still load. The
+  `snesrecomp` submodule now points at the `dantopa/snesrecomp` fork.
 
 ## 0.0.8 (alpha) - 2026-09-13
 
