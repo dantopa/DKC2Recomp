@@ -51,6 +51,7 @@ typedef struct Dkc2GlShaderApi {
   PFNGLUNIFORM1IPROC Uniform1i;
   PFNGLUNIFORM1FPROC Uniform1f;
   PFNGLUNIFORM2FPROC Uniform2f;
+  PFNGLUNIFORM3FPROC Uniform3f;
   PFNGLUNIFORM4FPROC Uniform4f;
   PFNGLACTIVETEXTUREPROC ActiveTexture;
   /* EXT_framebuffer_object, for offscreen captures and the CRT passes.
@@ -86,6 +87,7 @@ static bool LoadShaderApi(Dkc2GlProcLoader load) {
   DKC2_GL_LOAD(Uniform1i, PFNGLUNIFORM1IPROC);
   DKC2_GL_LOAD(Uniform1f, PFNGLUNIFORM1FPROC);
   DKC2_GL_LOAD(Uniform2f, PFNGLUNIFORM2FPROC);
+  DKC2_GL_LOAD(Uniform3f, PFNGLUNIFORM3FPROC);
   DKC2_GL_LOAD(Uniform4f, PFNGLUNIFORM4FPROC);
   DKC2_GL_LOAD(ActiveTexture, PFNGLACTIVETEXTUREPROC);
 #undef DKC2_GL_LOAD
@@ -388,6 +390,8 @@ static const char kHdQuadFragmentSource[] =
     "uniform vec2 image_size;\n"
     "uniform vec2 native_size;\n"
     "uniform vec4 rect;\n"
+    "uniform vec4 source;\n"
+    "uniform vec3 add;\n"
     "uniform vec2 flip;\n"
     "uniform float scale;\n"
     "uniform float brightness;\n"
@@ -397,7 +401,7 @@ static const char kHdQuadFragmentSource[] =
     "void main() {\n"
     "  vec2 o = floor(gl_FragCoord.xy);\n"
     "  vec2 local = mix(o - rect.xy, rect.xy + rect.zw - 1.0 - o, flip);\n"
-    "  vec2 cell = floor((local * image_size + 0.5) / rect.zw);\n"
+    "  vec2 cell = source.xy + floor((local * source.zw + 0.5) / rect.zw);\n"
     "  vec4 color = texture2D(image, (cell + 0.5) / image_size);\n"
     "  if (kind != 0) {\n"
     "    if (color.a == 0.0) discard;\n"
@@ -411,6 +415,7 @@ static const char kHdQuadFragmentSource[] =
     "      discard;\n"
     "    }\n"
     "  }\n"
+    "  color.rgb = min(color.rgb + add, 1.0);\n"
     "  if (brightness < 255.0)\n"
     "    color.rgb = floor((floor(color.rgb * 255.0 + 0.5) * brightness\n"
     "                       + 0.5) / 255.0) / 255.0;\n"
@@ -926,6 +931,16 @@ static void Uniform2f(GLuint program, const char *name, float x, float y) {
   s_gl.Uniform2f(s_gl.GetUniformLocation(program, name), x, y);
 }
 
+static void Uniform3f(GLuint program, const char *name, float x, float y,
+                      float z) {
+  s_gl.Uniform3f(s_gl.GetUniformLocation(program, name), x, y, z);
+}
+
+static void Uniform4f(GLuint program, const char *name, float x, float y,
+                      float z, float w) {
+  s_gl.Uniform4f(s_gl.GetUniformLocation(program, name), x, y, z, w);
+}
+
 static void BindTextureUnit(int unit, GLuint texture) {
   s_gl.ActiveTexture(GL_TEXTURE0 + (GLenum)unit);
   glBindTexture(GL_TEXTURE_2D, texture);
@@ -1302,6 +1317,12 @@ static GLuint HdImageTexture(Dkc2SdlPresenter *presenter,
   return texture;
 }
 
+/* A 5-bit color channel expanded to 8 bits as the PPU does, as a shader
+ * color value. */
+static float HdExpand5(unsigned value) {
+  return (float)(value << 3 | value >> 2) / 255.0f;
+}
+
 /* Draws quads with the quad program into the bound target (width by
  * height output pixels). */
 static void DrawHdQuads(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene,
@@ -1324,6 +1345,15 @@ static void DrawHdQuads(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene,
     BindTextureUnit(0, texture);
     Uniform2f(program, "image_size", (float)quad->image->width,
               (float)quad->image->height);
+    const bool whole = quad->source_width == 0;
+    Uniform4f(program, "source", whole ? 0.0f : (float)quad->source_x,
+              whole ? 0.0f : (float)quad->source_y,
+              (float)(whole ? quad->image->width : quad->source_width),
+              (float)(whole ? quad->image->height : quad->source_height));
+    /* Each 5-bit channel expanded to 8 bits as the PPU does. */
+    Uniform3f(program, "add", HdExpand5(quad->add_color & 0x1fu),
+              HdExpand5((quad->add_color >> 5) & 0x1fu),
+              HdExpand5((quad->add_color >> 10) & 0x1fu));
     s_gl.Uniform4f(rect, (float)quad->x, (float)quad->y, (float)quad->width,
                    (float)quad->height);
     Uniform2f(program, "flip", quad->flip_x ? 1.0f : 0.0f,

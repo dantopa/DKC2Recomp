@@ -50,6 +50,10 @@ typedef struct Dkc2HdmaLineState {
   uint16_t tile_base; /* BG12NBA, BG34NBA << 8 */
   uint8_t bgmode;
   uint8_t mosaic;
+  /* Color math: CGWSEL, CGADSUB and the fixed color (COLDATA, BGR555). */
+  uint8_t cgwsel;
+  uint8_t cgadsub;
+  uint16_t fixed_color;
 } Dkc2HdmaLineState;
 
 typedef struct Dkc2HdmaLines {

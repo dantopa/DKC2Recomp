@@ -2401,6 +2401,9 @@ void Dkc2DrawPpuFrame(void) {
     state->tile_base = g_ppu->bgTileAdr;
     state->bgmode = g_ppu->bgmode;
     state->mosaic = g_ppu->mosaic;
+    state->cgwsel = g_ppu->cgwsel;
+    state->cgadsub = g_ppu->cgadsub;
+    state->fixed_color = g_ppu->fixedColor;
     ppu_runLine(g_ppu, line);
     Dkc2KongsEndLine(g_ppu);
     if (presentation_bias != 0) {

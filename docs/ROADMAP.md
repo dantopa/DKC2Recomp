@@ -500,6 +500,9 @@ Exit criterion: reach and render the title screen with correct audio and input.
 - [x] Tile backgrounds (BG2/BG3 cells) and the GPU presenter.
 - [x] Sprite verification that accounts for objects drawn over a record.
 - [x] SDL3 desktop host on macOS (SDL2 kept as a fallback and on Windows/Linux).
+- [x] Background panoramas: one image per BG2/BG3 tilemap, drawn with the
+  per-line scroll and fixed-color math (Pirate Panic sky and sea first).
+- [ ] Panoramas for more levels, and BG3 foregrounds (Pirate Panic rigging).
 - [ ] Larger learned filter (cascade, wider tables or a small distilled CNN).
 - [ ] Taller view: draw rows above and below the 224-line camera from the
   level map, as widescreen does for the sides. Needs enemy activation past

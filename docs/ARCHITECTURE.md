@@ -1840,3 +1840,13 @@ Scene images carry a process-unique id; the presenter keeps uploads under
 that id and drops unused ones when its table fills. A scene stays valid until
 the next frame: the sprite cache is flushed only at a frame's start, and the
 presenter composes a scene once, however often it is re-presented.
+
+Background panoramas (2026-10-27) reuse the tile quads: a quad may name a
+source rectangle of its image and a fixed color to add before the
+brightness. A layer whose reproduced cells match a pack panorama's
+reference drops its cell quads for one quad per run of scanlines with equal
+registers (split where the tilemap wraps), so per-line scroll needs no new
+scene element. The scanline register record (`Dkc2HdmaLineState`) carries
+CGWSEL, CGADSUB and the fixed color; on lines that add the fixed color to
+the panorama layer the tile mask also takes that layer's pixels with the
+color added (flag `kDkc2HdTileMath`), and the quads add it to the art.

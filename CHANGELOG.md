@@ -75,6 +75,11 @@
   latches, so a state saved while a level loads no longer resumes with
   garbled graphics. The format is v8 and older states still load. The
   `snesrecomp` submodule now points at the `dantopa/snesrecomp` fork.
+- HD background panoramas: a pack can replace a whole BG2/BG3 tilemap with
+  one image (`panoramas.txt`, `l_<key>.ref`, `l_<key>.rgba`) instead of
+  8x8 cells, drawn per run of scanlines with their own scroll and the fixed
+  color the game adds, so parallax bands and per-line water keep moving as
+  in the original. The CPU compositor and the GPU presenter both draw it.
 
 ## 0.0.8 (alpha) - 2026-09-13
 
