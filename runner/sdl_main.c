@@ -55,9 +55,61 @@
 #endif
 
 #ifdef __SWITCH__
+#include <SDL_opengl.h>
 #include <pthread.h>
 #include <unistd.h>
 static const char kSwitchDataDirectory[] = "sdmc:/switch/DKC2Recomp";
+
+/* perf.log in the data folder: every kSwitchPerfFrames presented frames, the
+ * rate and the mean cost of each stage. The console has no environment to
+ * opt in through, so it is always written. */
+enum { kSwitchPerfFrames = 300 };
+
+typedef struct SwitchPerf {
+  FILE *file;
+  uint64_t frequency;
+  uint64_t window_start;
+  uint64_t run, draw, audio, present;
+  unsigned emulated, presented;
+} SwitchPerf;
+
+static void SwitchPerfOpen(SwitchPerf *perf, const char *backend) {
+  memset(perf, 0, sizeof *perf);
+  perf->file = fopen("perf.log", "w");
+  if (!perf->file) return;
+  const GLubyte *renderer = glGetString(GL_RENDERER);
+  fprintf(perf->file, "backend: %s\nrenderer: %s\n", backend,
+          renderer ? (const char *)renderer : "unknown");
+  fprintf(perf->file, "fps run_ms draw_ms audio_ms present_ms hd\n");
+  fflush(perf->file);
+  perf->frequency = SDL_GetPerformanceFrequency();
+  perf->window_start = SDL_GetPerformanceCounter();
+}
+
+static double SwitchPerfMs(const SwitchPerf *perf, uint64_t ticks,
+                           unsigned count) {
+  return count ? 1000.0 * (double)ticks / (double)perf->frequency / count : 0.0;
+}
+
+static void SwitchPerfPresented(SwitchPerf *perf, int hd_scale) {
+  if (!perf->file || ++perf->presented < kSwitchPerfFrames) return;
+  const uint64_t now = SDL_GetPerformanceCounter();
+  const double seconds =
+      (double)(now - perf->window_start) / (double)perf->frequency;
+  fprintf(perf->file, "%.1f %.2f %.2f %.2f %.2f %d\n",
+          seconds > 0.0 ? perf->presented / seconds : 0.0,
+          SwitchPerfMs(perf, perf->run, perf->emulated),
+          SwitchPerfMs(perf, perf->draw, perf->emulated),
+          SwitchPerfMs(perf, perf->audio, perf->emulated),
+          SwitchPerfMs(perf, perf->present, perf->presented), hd_scale);
+  fflush(perf->file);
+  FILE *file = perf->file;
+  const uint64_t frequency = perf->frequency;
+  memset(perf, 0, sizeof *perf);
+  perf->file = file;
+  perf->frequency = frequency;
+  perf->window_start = now;
+}
 #endif
 
 #ifndef DKC2_RELEASE_VERSION
@@ -1339,6 +1391,10 @@ static int RunGame(const char *rom_path,
     }
   }
 #endif
+#ifdef __SWITCH__
+  SwitchPerf perf;
+  SwitchPerfOpen(&perf, host.presenter.backend);
+#endif
   Dkc2DesktopFpsCounter fps_counter;
   uint64_t deadline = SDL_GetPerformanceCounter();
   uint64_t frequency = SDL_GetPerformanceFrequency();
@@ -1671,7 +1727,13 @@ static int RunGame(const char *rom_path,
 #ifdef __APPLE__
         const uint64_t emulate_start = SDL_GetPerformanceCounter();
 #endif
+#ifdef __SWITCH__
+        const uint64_t perf_run_start = SDL_GetPerformanceCounter();
+#endif
         (void)RtlRunFrame(controls.controller);
+#ifdef __SWITCH__
+        perf.run += SDL_GetPerformanceCounter() - perf_run_start;
+#endif
         PulseHaptics(&host, Dkc2CoopTakeStompEvents(), false);
         if (g_fail || !Dkc2LastLleResult()) {
           fprintf(stderr, "Runtime stopped at frame %llu (resume PC $%06x).\n",
@@ -1690,8 +1752,15 @@ static int RunGame(const char *rom_path,
               !Dkc2RewindHistoryPush(&rewind_history, rewind_scratch))
             rewind_available = false;
         }
+#ifdef __SWITCH__
+        const uint64_t perf_draw_start = SDL_GetPerformanceCounter();
+#endif
         DrawFrame(&host);
         frame_ready = true;
+#ifdef __SWITCH__
+        const uint64_t perf_audio_start = SDL_GetPerformanceCounter();
+        perf.draw += perf_audio_start - perf_draw_start;
+#endif
 #ifdef __APPLE__
         emulate_seconds += (double)(SDL_GetPerformanceCounter() - emulate_start) /
                            (double)frequency;
@@ -1715,6 +1784,10 @@ static int RunGame(const char *rom_path,
             host.audio_available = false;
           }
         }
+#ifdef __SWITCH__
+        perf.audio += SDL_GetPerformanceCounter() - perf_audio_start;
+        perf.emulated++;
+#endif
         if (test_frame_limit && host_frame >= test_frame_limit) {
           host.running = false;
           break;
@@ -1790,6 +1863,9 @@ static int RunGame(const char *rom_path,
                                        dh);
         }
       }
+#ifdef __SWITCH__
+      const uint64_t perf_present_start = SDL_GetPerformanceCounter();
+#endif
       bool presented = false;
       if (host.hd_scene) {
         presented = Dkc2SdlPresenterPresentHd(&host.presenter, host.hd_scene,
@@ -1819,6 +1895,10 @@ static int RunGame(const char *rom_path,
         runtime_failure = true;
         break;
       }
+#ifdef __SWITCH__
+      perf.present += SDL_GetPerformanceCounter() - perf_present_start;
+      SwitchPerfPresented(&perf, host.hd ? host.hd_config.scale : 0);
+#endif
 #ifdef __APPLE__
       if (pacing_log) {
         if (!display_paced) (void)Dkc2MacDisplayLinkLatest(&tick);
@@ -1899,6 +1979,9 @@ static int RunGame(const char *rom_path,
 #ifdef __APPLE__
   Dkc2MacDisplayLinkStop();
   if (pacing_log) fclose(pacing_log);
+#endif
+#ifdef __SWITCH__
+  if (perf.file) fclose(perf.file);
 #endif
   if (test_rewind_requested && !test_rewind_completed) runtime_failure = true;
   if (test_fast_forward_requested && !test_fast_forward_completed)

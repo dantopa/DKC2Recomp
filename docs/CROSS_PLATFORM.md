@@ -146,8 +146,12 @@ Platform differences:
 - MSU-1 PCM tracks are unavailable (Horizon cannot map files and the set does
   not fit in memory); the SPC soundtrack plays;
 - no POSIX crash-signal handler or machine report: Atmosphere records crashes.
+- `perf.log` in the data folder records, every 300 presented frames, the
+  frame rate, the mean milliseconds of the recompiled CPU, PPU/HD drawing,
+  audio and presentation, and the GL renderer.
 
-The build compiles and links; it has not yet been run on hardware.
+The build boots on hardware (firmware 23.0.1) but runs too slowly; the
+perf log is being used to find where the time goes.
 
 ## Native acceptance required
 
