@@ -6719,4 +6719,10 @@ and desktop pieces needed attention:
 - no POSIX signal delivery: the crash-signal handler is not installed;
 - no file mapping: MSU-1 tracks are reported unavailable.
 
+An installable `.nsp` is packed with hacBrewPack from the same ELF
+(`assets/switch/DKC2Recomp.npdm.json`, the hacBrewPack template with the
+current npdmtool field names and debug flags off). An installed title starts
+without a useful working directory, so the Switch host always enters
+`sdmc:/switch/DKC2Recomp`, shared with the `.nro`.
+
 Not yet run on a console or emulator.

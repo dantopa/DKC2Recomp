@@ -54,6 +54,11 @@
 #define DKC2_MKDIR(path) mkdir(path, 0755)
 #endif
 
+#ifdef __SWITCH__
+#include <unistd.h>
+static const char kSwitchDataDirectory[] = "sdmc:/switch/DKC2Recomp";
+#endif
+
 #ifndef DKC2_RELEASE_VERSION
 #define DKC2_RELEASE_VERSION "dev"
 #endif
@@ -1978,6 +1983,12 @@ int main(int argc, char **argv) {
     return 2;
   }
   Dkc2LauncherSetAssetsPath(assets_path);
+#elif defined(__SWITCH__)
+  /* The .nro and the installed title share one data folder on the SD card;
+   * an installed title starts with no useful working directory. */
+  (void)DKC2_MKDIR(kSwitchDataDirectory);
+  if (chdir(kSwitchDataDirectory) != 0)
+    fprintf(stderr, "warning: cannot enter %s\n", kSwitchDataDirectory);
 #else
   (void)snesrecomp_anchor_to_exe_dir();
 #endif
@@ -1990,8 +2001,7 @@ int main(int argc, char **argv) {
   if (!rom_path[0])
     (void)Dkc2LauncherReadRomCache(rom_path, sizeof rom_path);
 #ifdef __SWITCH__
-  /* The console has no file picker: the ROM sits beside the .nro, which is
-   * the working directory under the homebrew loader. */
+  /* The console has no file picker: the ROM sits in the data folder. */
   if (!rom_path[0])
     (void)snprintf(rom_path, sizeof rom_path, "%s", "dkc2.smc");
 #endif

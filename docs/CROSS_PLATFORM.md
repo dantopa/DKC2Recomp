@@ -111,10 +111,29 @@ docker run --rm -v "$PWD":/src -w /src devkitpro/devkita64 bash -lc '
 ```
 
 Copy `build/switch/DKC2Recomp.nro` and `build/switch/assets/` to
-`sdmc:/switch/DKC2Recomp/` and put the ROM there as `dkc2.smc`. The homebrew
-loader starts in that folder, so `rom.cfg`, `launcher.cfg` and `saves/` stay
-beside the `.nro`. Launch it through a game's title override (hold R while
+`sdmc:/switch/DKC2Recomp/` and put the ROM there as `dkc2.smc`. The host
+always works in that folder, so `rom.cfg`, `launcher.cfg` and `saves/` stay
+there. Launch the `.nro` through a game's title override (hold R while
 starting a game): the album applet leaves too little memory.
+
+An installable title (`.nsp`, program id `01d2c20000000000`) runs from the
+same folder with full application memory. It needs hacBrewPack (the original
+repository is gone; `rlaphoenix/hacBrewPack` mirrors it) and the `prod.keys`
+dumped from your own console with Lockpick_RCM, at `~/.switch/prod.keys`.
+Inside the same image, from a work directory:
+
+```sh
+elf2nso build/switch/DKC2Recomp.elf exefs/main
+npdmtool assets/switch/DKC2Recomp.npdm.json exefs/main.npdm
+cp build/switch/DKC2Recomp.nacp control/control.nacp
+cp /opt/devkitpro/libnx/default_icon.jpg control/icon_AmericanEnglish.dat
+hacbrewpack -k ~/.switch/prod.keys --titleid 01d2c20000000000 \
+  --titlename DKC2Recomp --titlepublisher Flat2VR --noromfs --nologo \
+  --exefsdir exefs --controldir control --nspdir nsp
+```
+
+Installing it requires sigpatches and an installer such as DBI. Never commit
+or share the keys or the packed title.
 
 Platform differences:
 
