@@ -6725,4 +6725,7 @@ current npdmtool field names and debug flags off). An installed title starts
 without a useful working directory, so the Switch host always enters
 `sdmc:/switch/DKC2Recomp`, shared with the `.nro`.
 
-Not yet run on a console or emulator.
+First run on hardware crashed (Data Abort, 2168-0002) while compiling the
+first GLSL shader: Mesa's GLSL preprocessor overflowed the 1 MiB main-thread
+stack (backtrace glcpp_parser_parse -> vsnprintf). On Switch `main()` now
+runs the host on an 8 MiB thread.

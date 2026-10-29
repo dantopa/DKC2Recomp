@@ -55,6 +55,7 @@
 #endif
 
 #ifdef __SWITCH__
+#include <pthread.h>
 #include <unistd.h>
 static const char kSwitchDataDirectory[] = "sdmc:/switch/DKC2Recomp";
 #endif
@@ -1956,7 +1957,7 @@ static int RunGame(const char *rom_path,
   return completed ? 0 : 5;
 }
 
-int main(int argc, char **argv) {
+static int HostMain(int argc, char **argv) {
   SDL_SetMainReady();
   bool force_launcher = false;
   int rom_argument = 1;
@@ -2027,3 +2028,38 @@ int main(int argc, char **argv) {
   (void)Dkc2LauncherSettingsSave(&settings);
   return result;
 }
+
+#ifdef __SWITCH__
+/* Mesa's GLSL preprocessor recurses deeply and overflows the 1 MiB stack the
+ * loader gives the main thread, so the host runs on a larger one. */
+enum { kSwitchHostStackSize = 8 * 1024 * 1024 };
+
+typedef struct {
+  int argc;
+  char **argv;
+  int result;
+} SwitchHostArguments;
+
+static void *SwitchHostThread(void *context) {
+  SwitchHostArguments *arguments = context;
+  arguments->result = HostMain(arguments->argc, arguments->argv);
+  return NULL;
+}
+
+int main(int argc, char **argv) {
+  SwitchHostArguments arguments = {argc, argv, 2};
+  pthread_attr_t attributes;
+  pthread_t thread;
+  if (pthread_attr_init(&attributes) != 0 ||
+      pthread_attr_setstacksize(&attributes, kSwitchHostStackSize) != 0 ||
+      pthread_create(&thread, &attributes, SwitchHostThread, &arguments) != 0) {
+    fprintf(stderr, "fatal: cannot start the host thread\n");
+    return 2;
+  }
+  (void)pthread_attr_destroy(&attributes);
+  (void)pthread_join(thread, NULL);
+  return arguments.result;
+}
+#else
+int main(int argc, char **argv) { return HostMain(argc, argv); }
+#endif
