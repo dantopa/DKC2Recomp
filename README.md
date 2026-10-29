@@ -71,6 +71,7 @@ next, lighting and depth effects possible.
 | Title screen art | Working |
 | Sky/water (BG2/BG3), loose objects (single bananas) | Filter only |
 | Mounts, most enemies | Not covered yet |
+| Nintendo Switch homebrew build | Builds; not yet run on hardware ([docs](docs/CROSS_PLATFORM.md#nintendo-switch-homebrew-build-experimental)) |
 
 ## Roadmap: a remaster without a pack
 

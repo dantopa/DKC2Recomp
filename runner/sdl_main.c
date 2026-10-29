@@ -1989,6 +1989,12 @@ int main(int argc, char **argv) {
   Dkc2LauncherSettingsLoad(&settings);
   if (!rom_path[0])
     (void)Dkc2LauncherReadRomCache(rom_path, sizeof rom_path);
+#ifdef __SWITCH__
+  /* The console has no file picker: the ROM sits beside the .nro, which is
+   * the working directory under the homebrew loader. */
+  if (!rom_path[0])
+    (void)snprintf(rom_path, sizeof rom_path, "%s", "dkc2.smc");
+#endif
   bool suppress_launcher = EnvironmentEnabled("SNESRECOMP_NO_LAUNCHER") ||
                            EnvironmentEnabled("DKC2_DESKTOP_TEST_HIDDEN");
   bool show_launcher = !suppress_launcher &&

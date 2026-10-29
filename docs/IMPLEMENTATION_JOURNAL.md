@@ -6697,3 +6697,26 @@ pack had art for four of the eight walk frames (graphics 0f94-0fb0, palette
 802096c5). The other four were generated (one Gemini image, about US$0.13)
 from the pixel frames with the existing four as the style reference, keyed
 out of a green background at 64x64 like the rest.
+
+## 2026-10-29 - Switch homebrew build
+
+The SDL host builds for Switch homebrew with the devkitPro toolchain
+(`devkitpro/devkita64` Docker image: libnx, switch-sdl2 2.28, Mesa 20.1).
+The recompiled game and the PPU compiled for aarch64 unchanged; only host
+and desktop pieces needed attention:
+
+- newlib hides POSIX declarations under `-std=c11`, so the Switch build
+  defines `_GNU_SOURCE`, and clears `CMAKE_DL_LIBS` (no libdl);
+- `uname()` is missing: the target uses the headless host-report adapter;
+- tinyfiledialogs needs termios: it is dropped and `runner/switch_host.c`
+  answers the dialogs as cancelled; the ROM defaults to `dkc2.smc` in the
+  working directory, which the homebrew loader sets to the `.nro` folder;
+- ImGui's desktop GL loader needs dlopen: the launcher and overlay use the
+  OpenGL ES 2 configuration recomp-ui already has for Android; ImGui's shell
+  helpers (fork/exec) are disabled;
+- the presenter's GL 2.1 fixed-function calls are not exported by the
+  static Mesa GLES library; `switch_host.c` resolves them from the context;
+- no POSIX signal delivery: the crash-signal handler is not installed;
+- no file mapping: MSU-1 tracks are reported unavailable.
+
+Not yet run on a console or emulator.

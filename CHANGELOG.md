@@ -2,6 +2,10 @@
 
 ## Unreleased (fork: HD presentation)
 
+- Added an experimental Nintendo Switch homebrew build of the SDL host
+  (`dkc2_snesrecomp_sdl_nro`, built with the devkitPro Docker image). It
+  reads `dkc2.smc` beside the `.nro`; MSU-1 PCM is unavailable there. Not yet
+  run on hardware.
 - Added an experimental HD compositor: Mode 1 frames are re-composed at 2x-8x
   from PPU layer captures with the console's priority rules, with HD sprite
   art, per-block terrain art and full-screen art (title) loaded from a local

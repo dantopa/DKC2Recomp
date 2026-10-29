@@ -94,6 +94,42 @@ and macOS acceptance must deliberately exercise this recovery path as well as
 normal clean-exit reporting. Reports exclude ROM paths/data and all saves, but
 include loaded-module paths and basic machine/OS information.
 
+## Nintendo Switch homebrew build (experimental)
+
+The SDL host also builds as a homebrew `.nro` for a console running
+Atmosphere, with devkitPro's libnx, `switch-sdl2` and Mesa. The official
+`devkitpro/devkita64` image has every dependency, so no host install is
+needed:
+
+```sh
+docker run --rm -v "$PWD":/src -w /src devkitpro/devkita64 bash -lc '
+  cmake -S . -B build/switch -G Ninja \
+    -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/cmake/Switch.cmake \
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+    -DDKC2_BUILD_SNESRECOMP=ON -DSNESRECOMP_SDL_BACKEND=SDL2 &&
+  cmake --build build/switch --target dkc2_snesrecomp_sdl_nro'
+```
+
+Copy `build/switch/DKC2Recomp.nro` and `build/switch/assets/` to
+`sdmc:/switch/DKC2Recomp/` and put the ROM there as `dkc2.smc`. The homebrew
+loader starts in that folder, so `rom.cfg`, `launcher.cfg` and `saves/` stay
+beside the `.nro`. Launch it through a game's title override (hold R while
+starting a game): the album applet leaves too little memory.
+
+Platform differences:
+
+- the launcher and overlay use OpenGL ES 2 (as recomp-ui does on Android);
+  the presenter keeps its GL 2.1 context, and the fixed-function calls the
+  static Mesa library does not export are resolved from that context
+  (`runner/switch_host.c`);
+- file dialogs report a cancel, so paths come from the ROM default above and
+  the saved configuration;
+- MSU-1 PCM tracks are unavailable (Horizon cannot map files and the set does
+  not fit in memory); the SPC soundtrack plays;
+- no POSIX crash-signal handler or machine report: Atmosphere records crashes.
+
+The build compiles and links; it has not yet been run on hardware.
+
 ## Native acceptance required
 
 Before checking off either operating system, run these checks on that system:

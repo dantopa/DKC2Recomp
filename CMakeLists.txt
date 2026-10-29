@@ -10,6 +10,12 @@ include(CTest)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
+if(NINTENDO_SWITCH)
+    # newlib hides POSIX declarations (strdup, strtok_r, realpath) under -std=c11.
+    add_compile_definitions(_GNU_SOURCE)
+    # Horizon has no libdl; everything links statically.
+    set(CMAKE_DL_LIBS "")
+endif()
 
 set(DKC2_ROM "" CACHE FILEPATH "Private path to a headerless DKC2 USA v1.0 ROM")
 set(DKC2_COOP_ROPE_STATE "" CACHE FILEPATH "External Topsail Trouble rope regression snapshot")
@@ -363,7 +369,8 @@ if(DKC2_BUILD_SNESRECOMP)
         runner/desktop_pacer.c
         runner/desktop_audio_rate.c
         runner/sdl_main.c
-        ${SNESRECOMP_ROOT}/runner/src/host_report.c)
+        # Horizon has no uname(): the Switch build keeps the headless report adapter.
+        $<$<NOT:$<PLATFORM_ID:NintendoSwitch>>:${SNESRECOMP_ROOT}/runner/src/host_report.c>)
     if(APPLE)
         enable_language(OBJC)
         target_sources(dkc2_snesrecomp_sdl PRIVATE
@@ -389,7 +396,7 @@ if(DKC2_BUILD_SNESRECOMP)
         SNESRECOMP_REVERSE_DEBUG=0
         SNESRECOMP_EXTERNAL_RAM_ROUTINE_GUARDS=1
         SYSTEM_VOLUME_MIXER_AVAILABLE=0
-        DKC2_REAL_HOST_REPORT=1)
+        $<$<NOT:$<PLATFORM_ID:NintendoSwitch>>:DKC2_REAL_HOST_REPORT=1>)
     target_link_libraries(dkc2_snesrecomp_sdl PRIVATE
         ${SNESRECOMP_RUNNER_LIBRARIES})
     snesrecomp_target_sdl(dkc2_snesrecomp_sdl)
@@ -427,6 +434,25 @@ if(DKC2_BUILD_SNESRECOMP)
         BOXART ${CMAKE_SOURCE_DIR}/recomp/launcher/boxart.tga)
     dkc2_enable_project_warnings(dkc2_snesrecomp_sdl)
     dkc2_enable_release_optimization(dkc2_snesrecomp_sdl)
+    if(NINTENDO_SWITCH)
+        # A console has no file dialogs; switch_host.c answers them as cancelled.
+        get_target_property(_dkc2_sdl_sources dkc2_snesrecomp_sdl SOURCES)
+        list(FILTER _dkc2_sdl_sources EXCLUDE REGEX "/tinyfiledialogs\\.c$")
+        set_property(TARGET dkc2_snesrecomp_sdl PROPERTY SOURCES ${_dkc2_sdl_sources})
+        target_sources(dkc2_snesrecomp_sdl PRIVATE runner/switch_host.c)
+        # Mesa on Horizon links OpenGL ES directly; ImGui's desktop loader
+        # needs dlopen(). This is the same configuration recomp-ui uses on Android.
+        target_compile_definitions(dkc2_snesrecomp_sdl PRIVATE
+            LNG_GLES2=1
+            IMGUI_IMPL_OPENGL_ES2=1
+            IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
+        target_link_libraries(dkc2_snesrecomp_sdl PRIVATE GLESv2 EGL glapi drm_nouveau nx)
+        nx_generate_nacp(DKC2Recomp.nacp
+            NAME "DKC2Recomp"
+            AUTHOR "Flat2VR"
+            VERSION "${PROJECT_VERSION}")
+        nx_create_nro(dkc2_snesrecomp_sdl NACP DKC2Recomp.nacp)
+    endif()
 
     if(BUILD_TESTING AND APPLE AND DKC2_ROM)
         add_test(NAME supplied_rom_macos_app_smoke

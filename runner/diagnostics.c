@@ -46,7 +46,8 @@ typedef struct Dkc2DiagnosticState {
 } Dkc2DiagnosticState;
 
 static Dkc2DiagnosticState s_diagnostics;
-#ifndef _WIN32
+/* Horizon delivers no POSIX signals; Atmosphere records the crash report. */
+#if !defined(_WIN32) && !defined(__SWITCH__)
 static char s_signal_marker[kPathCapacity];
 #endif
 
@@ -244,7 +245,7 @@ static LONG WINAPI Dkc2UnhandledException(EXCEPTION_POINTERS *information) {
                      "crash_minidump.dmp");
   return EXCEPTION_EXECUTE_HANDLER;
 }
-#else
+#elif !defined(__SWITCH__)
 static void Dkc2SignalHandler(int signal_number) {
   int descriptor = open(s_signal_marker, O_WRONLY | O_CREAT | O_TRUNC, 0600);
   if (descriptor >= 0) {
@@ -294,7 +295,7 @@ bool Dkc2DiagnosticsInit(const char *host_name, const char *build_version) {
   host_report_breadcrumb("diagnostics initialized: host=%s", s_diagnostics.host);
 #ifdef _WIN32
   (void)SetUnhandledExceptionFilter(Dkc2UnhandledException);
-#else
+#elif !defined(__SWITCH__)
   if (JoinPath(s_signal_marker, sizeof s_signal_marker, s_diagnostics.root,
                "pending_crash_signal.txt")) {
     FILE *pending = fopen(s_signal_marker, "rb");

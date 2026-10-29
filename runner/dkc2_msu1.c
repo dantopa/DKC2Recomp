@@ -28,6 +28,20 @@ static void *mmap(void *address,size_t size,int protection,int flags,int fd,int 
 static int munmap(void *address,size_t size) {
   (void)size; return UnmapViewOfFile(address) ? 0 : -1;
 }
+#elif defined(__SWITCH__)
+/* Horizon cannot map files and the PCM set does not fit in memory, so tracks
+ * are reported unavailable and the SPC soundtrack plays instead. */
+#include <unistd.h>
+#define PROT_READ 0
+#define MAP_PRIVATE 0
+#define MAP_FAILED ((void *)-1)
+static void *mmap(void *address,size_t size,int protection,int flags,int fd,int offset) {
+  (void)address; (void)size; (void)protection; (void)flags; (void)fd; (void)offset;
+  errno = ENOSYS; return MAP_FAILED;
+}
+static int munmap(void *address,size_t size) {
+  (void)address; (void)size; return -1;
+}
 #else
 #include <sys/mman.h>
 #include <unistd.h>

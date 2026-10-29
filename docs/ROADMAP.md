@@ -140,6 +140,8 @@
       exist. Do not invent mod identities or migrate current saves early.
 - [ ] Pass the native Linux acceptance matrix and publish a source-clean Linux
       package.
+- [ ] Run the experimental Switch homebrew build on hardware: boot, 60 fps
+      native, audio, Joy-Con/Pro Controller input, saves; then try HD.
 - [x] Create and locally validate the native Apple-silicon application bundle,
       AppKit menu/icon, bundled SDL2, Application Support persistence, and
       ad-hoc signing verification.
