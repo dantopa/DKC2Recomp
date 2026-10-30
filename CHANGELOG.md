@@ -2,6 +2,10 @@
 
 ## Unreleased (fork: HD presentation)
 
+- Switch: `--bench SECONDS [--hd S]` replays `bench.input` and prints the
+  per-stage timings (drawing now split into PPU frame and HD scene) to
+  stdout, which nxlink receives; the `.nro` and `.nsp` carry the app icon in
+  every HOME menu language.
 - HD pack images load with one read instead of one per pixel: about 9x
   faster on the Mac, and the main HD slowdown on the Switch, where art loads
   from the SD card as it first appears.

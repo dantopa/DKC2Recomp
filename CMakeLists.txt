@@ -451,7 +451,8 @@ if(DKC2_BUILD_SNESRECOMP)
             NAME "DKC2Recomp"
             AUTHOR "Flat2VR"
             VERSION "${PROJECT_VERSION}")
-        nx_create_nro(dkc2_snesrecomp_sdl NACP DKC2Recomp.nacp)
+        nx_create_nro(dkc2_snesrecomp_sdl NACP DKC2Recomp.nacp
+            ICON "${CMAKE_CURRENT_SOURCE_DIR}/assets/switch/icon.jpg")
     endif()
 
     if(BUILD_TESTING AND APPLE AND DKC2_ROM)

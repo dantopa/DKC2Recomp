@@ -6736,3 +6736,17 @@ per `fread`, a million calls for a 4 MiB image, and art loads the first time
 each graphic appears, so the cost spread over play. One read per image and
 an in-place conversion load the whole Mac pack in 0.41 s instead of 3.58 s
 (same pixels); the console gap is larger.
+
+After the fix HD 2x runs at 37-60 fps on hardware with spikes in drawing
+(up to 12 ms). To measure without a person at the controls, the Switch host
+takes `--bench SECONDS [--hd S]`: no launcher, no saves, the recorded route
+in `bench.input`, the per-stage lines on stdout (nxlink `-s` receives them)
+and `bench: done`. The arguments set the existing desktop test controls and
+the in-memory HD options, which the bench does not save. Drawing is split
+into the PPU frame and the HD scene.
+
+The installed title showed "?" on the HOME menu: the control data had only
+an English icon, libnx's default. The HOME menu uses the console language's
+icon, so the NSP now carries `assets/switch/icon.jpg` (the app icon as a
+256x256 baseline JPEG, EXIF removed) under every language; the `.nro` uses
+the same icon. Not yet checked on hardware.

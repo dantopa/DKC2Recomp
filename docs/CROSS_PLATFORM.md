@@ -126,11 +126,20 @@ Inside the same image, from a work directory:
 elf2nso build/switch/DKC2Recomp.elf exefs/main
 npdmtool assets/switch/DKC2Recomp.npdm.json exefs/main.npdm
 cp build/switch/DKC2Recomp.nacp control/control.nacp
-cp /opt/devkitpro/libnx/default_icon.jpg control/icon_AmericanEnglish.dat
+for language in AmericanEnglish BritishEnglish Japanese French German \
+    LatinAmericanSpanish Spanish Italian Dutch CanadianFrench Portuguese \
+    Russian Korean TraditionalChinese SimplifiedChinese BrazilianPortuguese; do
+  cp assets/switch/icon.jpg control/icon_$language.dat
+done
 hacbrewpack -k ~/.switch/prod.keys --titleid 01d2c20000000000 \
   --titlename DKC2Recomp --titlepublisher Flat2VR --noromfs --nologo \
   --exefsdir exefs --controldir control --nspdir nsp
 ```
+
+The HOME menu shows the icon of the console language, so every language
+gets one; it must be a 256x256 baseline JPEG without EXIF data, or the menu
+shows "?". `assets/switch/icon.jpg` is the app icon in that form (the `.nro`
+uses it too).
 
 Installing it requires sigpatches and an installer such as DBI. Never commit
 or share the keys or the packed title.
@@ -147,9 +156,21 @@ Platform differences:
   not fit in memory); the SPC soundtrack plays;
 - no POSIX crash-signal handler or machine report: Atmosphere records crashes.
 - `perf.log` in the data folder records, every 300 presented frames, the
-  frame rate, the mean milliseconds of the recompiled CPU, PPU/HD drawing,
-  audio and presentation, the GL renderer and the HD composition path;
-  `stdout.log` and `stderr.log` beside it keep the console streams.
+  frame rate, the mean milliseconds of the recompiled CPU, drawing (split
+  into the PPU frame and the HD scene), audio and presentation, the GL
+  renderer and the HD composition path; `stdout.log` and `stderr.log` beside
+  it keep the console streams, unless nxlink started the app with `-s`, which
+  receives them instead.
+
+Benchmark: `--bench SECONDS [--hd 0|2-8]` starts without the launcher,
+replays the route recorded in `bench.input` in the data folder, echoes the
+`perf.log` lines to stdout, prints `bench: done result=N` and quits. `--hd`
+sets the HD scale for that run only (0 turns HD off); saves and options are
+not written. From the computer:
+
+```sh
+nxlink -a <switch-ip> -s DKC2Recomp.nro --bench 60 --hd 2
+```
 
 The build boots on hardware (firmware 23.0.1) and holds 60 fps without HD
 (about 2 ms recompiled CPU and 3.6 ms drawing per frame at 1785 MHz). HD at

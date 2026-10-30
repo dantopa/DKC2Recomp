@@ -56,33 +56,39 @@
 
 #ifdef __SWITCH__
 #include <SDL_opengl.h>
+#include <netinet/in.h>
 #include <pthread.h>
+#include <switch.h>
 #include <unistd.h>
 static const char kSwitchDataDirectory[] = "sdmc:/switch/DKC2Recomp";
 
 /* perf.log in the data folder: every kSwitchPerfFrames presented frames, the
- * rate and the mean cost of each stage. The console has no environment to
- * opt in through, so it is always written. */
+ * rate and the mean cost of each stage, draw split into the PPU frame and
+ * the HD scene. The console has no environment to opt in through, so it is
+ * always written; test runs echo it to stdout. */
 enum { kSwitchPerfFrames = 300 };
 
 typedef struct SwitchPerf {
   FILE *file;
+  bool echo;
   uint64_t frequency;
   uint64_t window_start;
-  uint64_t run, draw, audio, present;
+  uint64_t run, draw, ppu, audio, present;
   unsigned emulated, presented;
 } SwitchPerf;
 
 static void SwitchPerfOpen(SwitchPerf *perf, const char *backend,
-                           bool hd_gpu) {
+                           bool hd_gpu, bool echo) {
   memset(perf, 0, sizeof *perf);
   perf->file = fopen("perf.log", "w");
   if (!perf->file) return;
+  perf->echo = echo;
   const GLubyte *renderer = glGetString(GL_RENDERER);
   fprintf(perf->file, "backend: %s\nrenderer: %s\nhd composition: %s\n",
           backend, renderer ? (const char *)renderer : "unknown",
           hd_gpu ? "gpu" : "cpu");
-  fprintf(perf->file, "fps run_ms draw_ms audio_ms present_ms hd\n");
+  fprintf(perf->file,
+          "fps run_ms draw_ms ppu_ms scene_ms audio_ms present_ms hd\n");
   fflush(perf->file);
   perf->frequency = SDL_GetPerformanceFrequency();
   perf->window_start = SDL_GetPerformanceCounter();
@@ -98,19 +104,78 @@ static void SwitchPerfPresented(SwitchPerf *perf, int hd_scale) {
   const uint64_t now = SDL_GetPerformanceCounter();
   const double seconds =
       (double)(now - perf->window_start) / (double)perf->frequency;
-  fprintf(perf->file, "%.1f %.2f %.2f %.2f %.2f %d\n",
-          seconds > 0.0 ? perf->presented / seconds : 0.0,
-          SwitchPerfMs(perf, perf->run, perf->emulated),
-          SwitchPerfMs(perf, perf->draw, perf->emulated),
-          SwitchPerfMs(perf, perf->audio, perf->emulated),
-          SwitchPerfMs(perf, perf->present, perf->presented), hd_scale);
+  char line[128];
+  (void)snprintf(line, sizeof line, "%.1f %.2f %.2f %.2f %.2f %.2f %.2f %d\n",
+                 seconds > 0.0 ? perf->presented / seconds : 0.0,
+                 SwitchPerfMs(perf, perf->run, perf->emulated),
+                 SwitchPerfMs(perf, perf->draw, perf->emulated),
+                 SwitchPerfMs(perf, perf->ppu, perf->emulated),
+                 SwitchPerfMs(perf, perf->draw - perf->ppu, perf->emulated),
+                 SwitchPerfMs(perf, perf->audio, perf->emulated),
+                 SwitchPerfMs(perf, perf->present, perf->presented), hd_scale);
+  fputs(line, perf->file);
   fflush(perf->file);
+  if (perf->echo) fputs(line, stdout);
   FILE *file = perf->file;
+  const bool echo = perf->echo;
   const uint64_t frequency = perf->frequency;
   memset(perf, 0, sizeof *perf);
   perf->file = file;
+  perf->echo = echo;
   perf->frequency = frequency;
   perf->window_start = now;
+}
+
+/* nxlink passes arguments, but the console has no environment to set.
+ * --bench N replays the route in bench.input for N seconds without the
+ * launcher or saves, then quits; --hd S runs it at HD scale S (0: HD off). */
+enum { kSwitchBenchMaxSeconds = 10000 };
+
+typedef struct SwitchBench {
+  unsigned seconds; /* 0 without --bench */
+  int hd_scale;     /* -1 to keep the saved HD options */
+} SwitchBench;
+
+static bool SwitchParseBench(int *argc, char **argv, SwitchBench *bench) {
+  bench->seconds = 0;
+  bench->hd_scale = -1;
+  int kept = 1;
+  for (int i = 1; i < *argc; i++) {
+    const bool seconds = strcmp(argv[i], "--bench") == 0;
+    if (!seconds && strcmp(argv[i], "--hd") != 0) {
+      argv[kept++] = argv[i];
+      continue;
+    }
+    if (++i == *argc) return false;
+    char *end = NULL;
+    const long value = strtol(argv[i], &end, 10);
+    if (!end || *end) return false;
+    if (seconds) {
+      if (value < 1 || value > kSwitchBenchMaxSeconds) return false;
+      bench->seconds = (unsigned)value;
+    } else {
+      if (value != 0 && (value < kDkc2HdMinScale || value > kDkc2HdMaxScale))
+        return false;
+      bench->hd_scale = (int)value;
+    }
+  }
+  *argc = kept;
+  /* --hd alone would be saved into the options. */
+  return bench->hd_scale < 0 || bench->seconds;
+}
+
+/* Maps the bench onto the desktop test controls and the in-memory HD
+ * options; the caller skips saving the options afterwards. */
+static void SwitchApplyBench(const SwitchBench *bench) {
+  char frames[16];
+  (void)snprintf(frames, sizeof frames, "%u", bench->seconds * 60u);
+  (void)setenv("DKC2_DESKTOP_TEST_FRAMES", frames, 1);
+  (void)setenv("SNESRECOMP_NO_LAUNCHER", "1", 1);
+  (void)setenv("DKC2_DESKTOP_DISABLE_SRAM", "1", 1);
+  (void)setenv("SNESRECOMP_INPUT_PLAY", "bench.input", 1);
+  if (bench->hd_scale < 0) return;
+  Dkc2LauncherSetHdEnabled(bench->hd_scale != 0);
+  if (bench->hd_scale) Dkc2LauncherSetHdScale(bench->hd_scale);
 }
 #endif
 
@@ -194,6 +259,9 @@ typedef struct SdlHost {
   const uint8_t *rom;
   size_t rom_size;
   const uint32_t *hd_pixels;
+#ifdef __SWITCH__
+  uint64_t perf_ppu_end; /* when the last DrawFrame finished the PPU frame */
+#endif
   int hd_width;
   int hd_height;
   /* With the GPU path the last frame is a scene the presenter draws, and
@@ -218,6 +286,9 @@ typedef struct SdlHost {
 static void DrawFrame(SdlHost *host) {
   Dkc2HdBeginFrame(host->hd, g_ppu, Dkc2VideoWidth());
   Dkc2DrawPpuFrame();
+#ifdef __SWITCH__
+  host->perf_ppu_end = SDL_GetPerformanceCounter();
+#endif
   const size_t pitch = (size_t)Dkc2VideoWidth() * kBytesPerPixel;
   if (host->hd_gpu) {
     host->hd_scene =
@@ -1395,7 +1466,8 @@ static int RunGame(const char *rom_path,
 #endif
 #ifdef __SWITCH__
   SwitchPerf perf;
-  SwitchPerfOpen(&perf, host.presenter.backend, host.hd_gpu);
+  SwitchPerfOpen(&perf, host.presenter.backend, host.hd_gpu,
+                 test_frame_limit != 0);
 #endif
   Dkc2DesktopFpsCounter fps_counter;
   uint64_t deadline = SDL_GetPerformanceCounter();
@@ -1762,6 +1834,7 @@ static int RunGame(const char *rom_path,
 #ifdef __SWITCH__
         const uint64_t perf_audio_start = SDL_GetPerformanceCounter();
         perf.draw += perf_audio_start - perf_draw_start;
+        perf.ppu += host.perf_ppu_end - perf_draw_start;
 #endif
 #ifdef __APPLE__
         emulate_seconds += (double)(SDL_GetPerformanceCounter() - emulate_start) /
@@ -2044,6 +2117,14 @@ static int RunGame(const char *rom_path,
 
 static int HostMain(int argc, char **argv) {
   SDL_SetMainReady();
+#ifdef __SWITCH__
+  SwitchBench bench;
+  if (!SwitchParseBench(&argc, argv, &bench)) {
+    fprintf(stderr, "Usage: %s [--bench SECONDS [--hd 0|2-8]] [ROM.smc]\n",
+            argv[0]);
+    return 2;
+  }
+#endif
   bool force_launcher = false;
   int rom_argument = 1;
   if (argc >= 2 && strcmp(argv[1], "--launcher") == 0) {
@@ -2075,9 +2156,16 @@ static int HostMain(int argc, char **argv) {
   (void)DKC2_MKDIR(kSwitchDataDirectory);
   if (chdir(kSwitchDataDirectory) != 0)
     fprintf(stderr, "warning: cannot enter %s\n", kSwitchDataDirectory);
-  /* Nothing shows the console streams; keep them beside perf.log. */
-  if (freopen("stdout.log", "w", stdout)) setvbuf(stdout, NULL, _IOLBF, 0);
-  (void)freopen("stderr.log", "w", stderr);
+  /* Launched by nxlink -s, the streams go to the host; otherwise nothing
+   * shows them, so they are kept beside perf.log. */
+  const bool nxlink_stdio = __nxlink_host.s_addr != 0 &&
+                            R_SUCCEEDED(socketInitializeDefault()) &&
+                            nxlinkStdio() >= 0;
+  if (!nxlink_stdio) {
+    (void)freopen("stdout.log", "w", stdout);
+    (void)freopen("stderr.log", "w", stderr);
+  }
+  setvbuf(stdout, NULL, _IOLBF, 0);
 #else
   (void)snesrecomp_anchor_to_exe_dir();
 #endif
@@ -2093,6 +2181,13 @@ static int HostMain(int argc, char **argv) {
   /* The console has no file picker: the ROM sits in the data folder. */
   if (!rom_path[0])
     (void)snprintf(rom_path, sizeof rom_path, "%s", "dkc2.smc");
+  if (bench.seconds) {
+    SwitchApplyBench(&bench);
+    const int result = RunGame(rom_path, &settings);
+    fprintf(stdout, "bench: done result=%d\n", result);
+    fflush(stdout);
+    return result;
+  }
 #endif
   bool suppress_launcher = EnvironmentEnabled("SNESRECOMP_NO_LAUNCHER") ||
                            EnvironmentEnabled("DKC2_DESKTOP_TEST_HIDDEN");
