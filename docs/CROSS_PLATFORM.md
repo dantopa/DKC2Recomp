@@ -138,8 +138,8 @@ hacbrewpack -k ~/.switch/prod.keys --titleid 01d2c20000000000 \
 
 The HOME menu shows the icon of the console language, so every language
 gets one; it must be a 256x256 baseline JPEG without EXIF data, or the menu
-shows "?". `assets/switch/icon.jpg` is the app icon in that form (the `.nro`
-uses it too).
+shows "?". `assets/switch/icon.jpg` is the Switch icon in that form (original art
+generated for this port; the `.nro` uses it too).
 
 Installing it requires sigpatches and an installer such as DBI. Never commit
 or share the keys or the packed title.

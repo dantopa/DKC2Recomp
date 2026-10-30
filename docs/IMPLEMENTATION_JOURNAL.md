@@ -6747,6 +6747,6 @@ into the PPU frame and the HD scene.
 
 The installed title showed "?" on the HOME menu: the control data had only
 an English icon, libnx's default. The HOME menu uses the console language's
-icon, so the NSP now carries `assets/switch/icon.jpg` (the app icon as a
-256x256 baseline JPEG, EXIF removed) under every language; the `.nro` uses
+icon, so the NSP now carries `assets/switch/icon.jpg` (original art made
+with Gemini, as a 256x256 baseline JPEG with EXIF removed) under every language; the `.nro` uses
 the same icon. Not yet checked on hardware.
