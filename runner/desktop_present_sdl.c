@@ -65,6 +65,17 @@ typedef struct Dkc2GlShaderApi {
 } Dkc2GlShaderApi;
 
 static Dkc2GlShaderApi s_gl;
+static Dkc2SdlPresenterGlStats s_gl_stats;
+
+static void CountGlUpload(int width, int height, unsigned bytes_per_pixel) {
+  s_gl_stats.uploads++;
+  s_gl_stats.upload_bytes += (uint64_t)width * (uint64_t)height * bytes_per_pixel;
+}
+
+void Dkc2SdlPresenterTakeGlStats(Dkc2SdlPresenterGlStats *stats) {
+  *stats = s_gl_stats;
+  memset(&s_gl_stats, 0, sizeof s_gl_stats);
+}
 
 static bool LoadShaderApi(Dkc2GlProcLoader load) {
 #define DKC2_GL_LOAD(name, proc) \
@@ -907,6 +918,7 @@ void Dkc2SdlPresenterSetWindowSize(Dkc2SdlPresenter *presenter, int width,
 static void DrawFrameQuad(bool flip) {
   const float top = flip ? 0.0f : 1.0f;
   const float bottom = flip ? 1.0f : 0.0f;
+  s_gl_stats.draws++;
   glBegin(GL_QUADS);
   glTexCoord2f(0.0f, bottom);
   glVertex2f(-1.0f, -1.0f);
@@ -929,16 +941,6 @@ static void Uniform1i(GLuint program, const char *name, int value) {
 
 static void Uniform2f(GLuint program, const char *name, float x, float y) {
   s_gl.Uniform2f(s_gl.GetUniformLocation(program, name), x, y);
-}
-
-static void Uniform3f(GLuint program, const char *name, float x, float y,
-                      float z) {
-  s_gl.Uniform3f(s_gl.GetUniformLocation(program, name), x, y, z);
-}
-
-static void Uniform4f(GLuint program, const char *name, float x, float y,
-                      float z, float w) {
-  s_gl.Uniform4f(s_gl.GetUniformLocation(program, name), x, y, z, w);
 }
 
 static void BindTextureUnit(int unit, GLuint texture) {
@@ -1220,6 +1222,7 @@ bool Dkc2SdlPresenterPresent(Dkc2SdlPresenter *presenter,
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, source_width, source_height,
                     GL_BGRA, GL_UNSIGNED_BYTE, pixels);
   }
+  CountGlUpload(source_width, source_height, 4);
   ShowFrame(presenter, presenter->texture, source_width, source_height,
             overlay_draw, overlay_user);
   return true;
@@ -1253,6 +1256,7 @@ static void UploadHdInput(GLuint texture, const uint32_t *pixels, int width,
   glBindTexture(GL_TEXTURE_2D, texture);
   glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_BGRA,
                   GL_UNSIGNED_BYTE, pixels);
+  CountGlUpload(width, height, 4);
 }
 
 /* The slot holding an image id, or the free slot where it goes. Image ids
@@ -1311,6 +1315,7 @@ static GLuint HdImageTexture(Dkc2SdlPresenter *presenter,
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, image->width, image->height, 0,
                GL_BGRA, GL_UNSIGNED_BYTE, image->pixels);
+  CountGlUpload(image->width, image->height, 4);
   presenter->hd_images[slot] =
       (Dkc2GlHdImage){image->id, texture, presenter->hd_serial};
   presenter->hd_image_count++;
@@ -1337,30 +1342,38 @@ static void DrawHdQuads(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene,
             (float)scene->height);
   Uniform1f(program, "scale", (float)scene->scale);
   Uniform1i(program, "kind", kind);
+  /* Looked up once per pass: a quad pass can draw hundreds of quads. */
+  const GLint image_size = s_gl.GetUniformLocation(program, "image_size");
+  const GLint source = s_gl.GetUniformLocation(program, "source");
+  const GLint add = s_gl.GetUniformLocation(program, "add");
   const GLint rect = s_gl.GetUniformLocation(program, "rect");
+  const GLint flip = s_gl.GetUniformLocation(program, "flip");
+  const GLint brightness = s_gl.GetUniformLocation(program, "brightness");
+  const GLint rank = s_gl.GetUniformLocation(program, "rank");
+  const GLint index = s_gl.GetUniformLocation(program, "index");
   for (unsigned q = 0; q < count; q++) {
     const Dkc2HdQuad *quad = &quads[q];
     const GLuint texture = HdImageTexture(presenter, quad->image);
     if (!texture) continue;
     BindTextureUnit(0, texture);
-    Uniform2f(program, "image_size", (float)quad->image->width,
-              (float)quad->image->height);
+    s_gl.Uniform2f(image_size, (float)quad->image->width,
+                   (float)quad->image->height);
     const bool whole = quad->source_width == 0;
-    Uniform4f(program, "source", whole ? 0.0f : (float)quad->source_x,
-              whole ? 0.0f : (float)quad->source_y,
-              (float)(whole ? quad->image->width : quad->source_width),
-              (float)(whole ? quad->image->height : quad->source_height));
+    s_gl.Uniform4f(source, whole ? 0.0f : (float)quad->source_x,
+                   whole ? 0.0f : (float)quad->source_y,
+                   (float)(whole ? quad->image->width : quad->source_width),
+                   (float)(whole ? quad->image->height : quad->source_height));
     /* Each 5-bit channel expanded to 8 bits as the PPU does. */
-    Uniform3f(program, "add", HdExpand5(quad->add_color & 0x1fu),
-              HdExpand5((quad->add_color >> 5) & 0x1fu),
-              HdExpand5((quad->add_color >> 10) & 0x1fu));
+    s_gl.Uniform3f(add, HdExpand5(quad->add_color & 0x1fu),
+                   HdExpand5((quad->add_color >> 5) & 0x1fu),
+                   HdExpand5((quad->add_color >> 10) & 0x1fu));
     s_gl.Uniform4f(rect, (float)quad->x, (float)quad->y, (float)quad->width,
                    (float)quad->height);
-    Uniform2f(program, "flip", quad->flip_x ? 1.0f : 0.0f,
-              quad->flip_y ? 1.0f : 0.0f);
-    Uniform1f(program, "brightness", (float)quad->brightness);
-    Uniform1f(program, "rank", (float)quad->rank);
-    Uniform1f(program, "index", (float)quad->index);
+    s_gl.Uniform2f(flip, quad->flip_x ? 1.0f : 0.0f,
+                   quad->flip_y ? 1.0f : 0.0f);
+    s_gl.Uniform1f(brightness, (float)quad->brightness);
+    s_gl.Uniform1f(rank, (float)quad->rank);
+    s_gl.Uniform1f(index, (float)quad->index);
     /* Output row 0 is the target's first row (texture coordinate 0). */
     const float left = 2.0f * (float)quad->x / (float)width - 1.0f;
     const float right =
@@ -1368,6 +1381,7 @@ static void DrawHdQuads(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene,
     const float bottom = 2.0f * (float)quad->y / (float)height - 1.0f;
     const float top =
         2.0f * (float)(quad->y + quad->height) / (float)height - 1.0f;
+    s_gl_stats.draws++;
     glBegin(GL_QUADS);
     glVertex2f(left, bottom);
     glVertex2f(right, bottom);
@@ -1415,6 +1429,7 @@ static bool ComposeHd(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene) {
     glBindTexture(GL_TEXTURE_2D, inputs[3]);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, scene->width, scene->height,
                     GL_LUMINANCE, GL_UNSIGNED_BYTE, scene->tile_mask);
+    CountGlUpload(scene->width, scene->height, 1);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
   }
   glDisable(GL_DEPTH_TEST);

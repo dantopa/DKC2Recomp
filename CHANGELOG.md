@@ -8,6 +8,11 @@
   replays `bench.input` and writes the per-stage timings (drawing now split
   into PPU frame and HD scene) to `stdout.log`; the `.nro` and `.nsp` carry
   an original icon in every HOME menu language.
+- Switch: `perf.log` also counts GL draw calls, texture uploads and
+  uploaded kilobytes per frame; after a vsynced swap the loop no longer
+  waits again on the 60.0988 Hz host clock. The HD quad passes look up
+  their uniforms once per pass, and the recompiled bus reads its
+  diagnostic environment switches once.
 - HD pack images load with one read instead of one per pixel: about 9x
   faster on the Mac, and the main HD slowdown on the Switch, where art loads
   from the SD card as it first appears.

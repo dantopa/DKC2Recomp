@@ -195,6 +195,16 @@ void *Dkc2SdlPresenterNativeWindow(const Dkc2SdlPresenter *presenter);
 
 bool Dkc2SdlPresenterUsesSoftwarePacing(
     const Dkc2SdlPresenter *presenter);
+
+/* GL work issued by the presenters since the last call: draw calls and
+ * texture uploads (glTexImage2D/glTexSubImage2D with data). Copies the
+ * counts into stats and clears them, for per-frame profiling. */
+typedef struct Dkc2SdlPresenterGlStats {
+  unsigned draws;
+  unsigned uploads;
+  uint64_t upload_bytes;
+} Dkc2SdlPresenterGlStats;
+void Dkc2SdlPresenterTakeGlStats(Dkc2SdlPresenterGlStats *stats);
 void Dkc2SdlPresenterDestroy(Dkc2SdlPresenter *presenter);
 
 #endif

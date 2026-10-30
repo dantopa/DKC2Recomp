@@ -6786,3 +6786,22 @@ runner instead of the menu. Over nxlink `-s` the bench sent nothing in
 150 s while the game ran; since the runner reads the SD card, the streams
 now always go to `stdout.log` and `stderr.log` and the nxlink redirection
 is gone.
+
+## 2026-10-29 - Switch HD frame cost
+
+On hardware the HD 2x route falls from 40-46 fps to 22-24 fps in its last
+stretch, with 24-27 ms drawing (16-20 ms of it the HD scene) and 13 ms
+presenting. Three cheap costs went first. After a vsynced swap the loop
+also waited for the next 60.0988 Hz host deadline; on the Switch it now
+re-anchors that deadline instead. Each HD quad set eight uniforms through
+helpers that looked their locations up by name; the locations are now read
+once per pass. The recompiled bus called `getenv` for its diagnostic
+switches on APU port accesses and yields; snesrecomp now caches them.
+
+Each HD quad is still its own immediate-mode draw with its own uniforms
+and texture bind, which costs driver CPU time under Mesa on the Tegra. To
+measure it, `perf.log` now adds the draw calls, texture uploads and
+uploaded kilobytes per presented frame. HD pack textures stay resident and
+upload once; per frame the scene uploads its native-size base, occlusion,
+layer and tile mask. Nothing reads pixels back during a frame except an
+armed screenshot, and the HD targets are built once per size.

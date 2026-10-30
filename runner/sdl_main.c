@@ -74,6 +74,7 @@ typedef struct SwitchPerf {
   uint64_t window_start;
   uint64_t run, draw, ppu, audio, present;
   unsigned emulated, presented;
+  uint64_t draws, uploads, upload_bytes;
 } SwitchPerf;
 
 static void SwitchPerfOpen(SwitchPerf *perf, const char *backend,
@@ -87,7 +88,8 @@ static void SwitchPerfOpen(SwitchPerf *perf, const char *backend,
           backend, renderer ? (const char *)renderer : "unknown",
           hd_gpu ? "gpu" : "cpu");
   fprintf(perf->file,
-          "fps run_ms draw_ms ppu_ms scene_ms audio_ms present_ms hd\n");
+          "fps run_ms draw_ms ppu_ms scene_ms audio_ms present_ms hd "
+          "draws uploads upload_kb\n");
   fflush(perf->file);
   perf->frequency = SDL_GetPerformanceFrequency();
   perf->window_start = SDL_GetPerformanceCounter();
@@ -99,19 +101,30 @@ static double SwitchPerfMs(const SwitchPerf *perf, uint64_t ticks,
 }
 
 static void SwitchPerfPresented(SwitchPerf *perf, int hd_scale) {
-  if (!perf->file || ++perf->presented < kSwitchPerfFrames) return;
+  if (!perf->file) return;
+  Dkc2SdlPresenterGlStats gl;
+  Dkc2SdlPresenterTakeGlStats(&gl);
+  perf->draws += gl.draws;
+  perf->uploads += gl.uploads;
+  perf->upload_bytes += gl.upload_bytes;
+  if (++perf->presented < kSwitchPerfFrames) return;
   const uint64_t now = SDL_GetPerformanceCounter();
   const double seconds =
       (double)(now - perf->window_start) / (double)perf->frequency;
-  char line[128];
-  (void)snprintf(line, sizeof line, "%.1f %.2f %.2f %.2f %.2f %.2f %.2f %d\n",
+  /* GL work per presented frame. */
+  const double frames = (double)perf->presented;
+  char line[160];
+  (void)snprintf(line, sizeof line,
+                 "%.1f %.2f %.2f %.2f %.2f %.2f %.2f %d %.1f %.1f %.1f\n",
                  seconds > 0.0 ? perf->presented / seconds : 0.0,
                  SwitchPerfMs(perf, perf->run, perf->emulated),
                  SwitchPerfMs(perf, perf->draw, perf->emulated),
                  SwitchPerfMs(perf, perf->ppu, perf->emulated),
                  SwitchPerfMs(perf, perf->draw - perf->ppu, perf->emulated),
                  SwitchPerfMs(perf, perf->audio, perf->emulated),
-                 SwitchPerfMs(perf, perf->present, perf->presented), hd_scale);
+                 SwitchPerfMs(perf, perf->present, perf->presented), hd_scale,
+                 (double)perf->draws / frames, (double)perf->uploads / frames,
+                 (double)perf->upload_bytes / 1024.0 / frames);
   fputs(line, perf->file);
   fflush(perf->file);
   if (perf->echo) fputs(line, stdout);
@@ -2040,11 +2053,20 @@ static int RunGame(const char *rom_path,
         Dkc2SdlPresenterArmCapture(&host.presenter, NULL, 0, 0);
       }
     }
-    if (should_pace &&
+#ifdef __SWITCH__
+    /* A vsynced swap has already waited for the display; a second wait on
+     * the host clock only delays the next frame after a late one. */
+    const bool swap_paced =
+        frame_ready && Dkc2SdlPresenterVsyncStatus(&host.presenter) ==
+                           kDkc2DesktopVsyncEnabled;
+#else
+    const bool swap_paced = false;
+#endif
+    if (should_pace && !swap_paced &&
         (!Dkc2SdlPresenterUsesSoftwarePacing(&host.presenter) ||
          !frame_ready))
       PaceFrame(&host, &deadline, &deadline_fraction);
-    else if (!should_pace) {
+    else if (!should_pace || swap_paced) {
       deadline = SDL_GetPerformanceCounter();
       deadline_fraction = 0.0;
     }

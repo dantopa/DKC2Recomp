@@ -161,7 +161,9 @@ Platform differences:
 - `perf.log` in the data folder records, every 300 presented frames, the
   frame rate, the mean milliseconds of the recompiled CPU, drawing (split
   into the PPU frame and the HD scene), audio and presentation, the GL
-  renderer and the HD composition path; `stdout.log` and `stderr.log` beside
+  draw calls, texture uploads and uploaded kilobytes per frame, the GL
+  renderer and the HD composition path; after a vsynced swap the loop does
+  not wait again on the host clock; `stdout.log` and `stderr.log` beside
   it keep the console streams.
 
 Benchmark: `--bench SECONDS [--hd 0|2-8] [--aspect 4:3|16:10|16:9|21:9]
