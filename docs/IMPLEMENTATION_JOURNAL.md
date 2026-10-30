@@ -6750,3 +6750,23 @@ an English icon, libnx's default. The HOME menu uses the console language's
 icon, so the NSP now carries `assets/switch/icon.jpg` (original art made
 with Gemini, as a 256x256 baseline JPEG with EXIF removed) under every language; the `.nro` uses
 the same icon. Not yet checked on hardware.
+
+## 2026-10-29 - Missing enemy and object art
+
+Of the graphics whose palette a dump has seen, 199 still had no pack art
+for at least one palette (inventory of 2026-10-24, rechecked against the
+pack). Leaving the Kongs aside, the 120 others form 15 grids by character
+type. Five were not sent: 8x8 dark debris, tiny Kong icons with broken
+colors, and white smoke, which the cut cannot separate from the white
+background; the filter keeps drawing them. The other ten (Squawks, Zinger,
+the ghost crocodile pirate, the DK coin, plain, star and plus barrels, the
+fused shell enemy, the pirate flag, Diddy flying) went in one Gemini batch,
+two variants each, with prompts naming the subject (about US$1.30).
+
+Every variant was cut into a trial pack and the one with the better mean
+silhouette overlap (0.83-0.96) kept, then checked by eye. 54 frames entered
+the private pack (none replaced; list in
+`private/hdpack_backup_20261029_enemies.installed.txt`); the flag sheet's
+rope ladder and two coin frames were rejected by the cut. The Pirate Panic
+route runs through with the pack; these graphics appear elsewhere, so they
+are not yet seen in play.
