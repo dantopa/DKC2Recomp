@@ -293,6 +293,8 @@ struct Dkc2Hd {
   bool tile_layout_new;
   uint8_t tile_mask[kMaxPixels];
   Dkc2HdScene scene;
+  uint64_t (*clock)(void); /* NULL: scene building is not timed */
+  Dkc2HdTimings timings;
   uint32_t *output;
 };
 
@@ -567,6 +569,19 @@ void Dkc2HdDestroy(Dkc2Hd *hd) {
   free(hd);
 }
 
+void Dkc2HdSetClock(Dkc2Hd *hd, uint64_t (*now)(void)) {
+  if (hd) hd->clock = now;
+}
+
+void Dkc2HdTakeTimings(Dkc2Hd *hd, Dkc2HdTimings *timings) {
+  if (!hd) {
+    memset(timings, 0, sizeof *timings);
+    return;
+  }
+  *timings = hd->timings;
+  memset(&hd->timings, 0, sizeof hd->timings);
+}
+
 void Dkc2HdBeginFrame(Dkc2Hd *hd, Ppu *ppu, int frame_width) {
   if (!hd || !ppu)
     return;
@@ -710,8 +725,19 @@ static bool ListPack(Dkc2Hd *hd) {
   return ok;
 }
 
+static uint64_t Now(const Dkc2Hd *hd) {
+  return hd->clock ? hd->clock() : 0;
+}
+
+/* Adds the time since start to *phase and returns the time now. */
+static uint64_t Lap(const Dkc2Hd *hd, uint64_t *phase, uint64_t start) {
+  const uint64_t now = Now(hd);
+  *phase += now - start;
+  return now;
+}
+
 /* Pack file `name`, read only when the pack listing has it. */
-static HdImage *LoadPackImage(const Dkc2Hd *hd, const char *name) {
+static HdImage *LoadPackImage(Dkc2Hd *hd, const char *name) {
   const uint64_t hash = NameHash(name);
   if (!hd->pack_file_count ||
       !bsearch(&hash, hd->pack_files, hd->pack_file_count,
@@ -719,7 +745,10 @@ static HdImage *LoadPackImage(const Dkc2Hd *hd, const char *name) {
     return NULL;
   char path[kPathMax + 32];
   snprintf(path, sizeof path, "%s/%s", hd->pack_dir, name);
-  return LoadImage(path);
+  const uint64_t start = Now(hd);
+  HdImage *image = LoadImage(path);
+  (void)Lap(hd, &hd->timings.load, start);
+  return image;
 }
 
 static bool WriteFrameImage(const char *path,
@@ -2325,6 +2354,7 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
       frame_pitch < (size_t)hd->width * 4u)
     return NULL;
   hd->origin = (hd->width - kNativeWidth) / 2 - ppu->wsPresentationXBias;
+  uint64_t lap = Now(hd);
   if (hd->cache_count >= kCacheFlush)
     FlushCache(hd);
   /* The displayed OAM was built from the previous game update. */
@@ -2333,6 +2363,7 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
   PrepareLoose(hd, ppu);
   memcpy(hd->previous_wram, ram, sizeof hd->previous_wram);
   hd->has_previous = true;
+  lap = Lap(hd, &hd->timings.prepare, lap);
 
   /* With terrain art BG1 is not in the frame: objects are restored by rank
    * against BG2/BG3 and the HD BG1 layer is drawn by priority afterwards. */
@@ -2394,6 +2425,7 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
         hd->layer_source[i] = Opaque(hd->bg[0][i]);
     }
   }
+  lap = Lap(hd, &hd->timings.pixels, lap);
   hd->art_count = 0;
   const ScreenEntry *screen = layered ? MatchScreen(hd) : NULL;
   if (layered)
@@ -2409,7 +2441,9 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
       if (hd->bg1_rank[i] > hd->base_rank[i])
         hd->occlusion[i] |= 0xff000000u;
   }
+  lap = Lap(hd, &hd->timings.art, lap);
   ProcessTiles(hd, ppu, lines);
+  lap = Lap(hd, &hd->timings.tiles, lap);
   hd->quad_count = 0;
   for (unsigned position = 0; position < hd->order_count; position++) {
     const DrawItem item = hd->order[position];
@@ -2420,6 +2454,7 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
       AddSprite(hd, ppu, item.item, position);
     }
   }
+  (void)Lap(hd, &hd->timings.sprites, lap);
   hd->scene = (Dkc2HdScene){
       .serial = ++last_serial,
       .width = hd->width,

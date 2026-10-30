@@ -74,6 +74,7 @@ typedef struct SwitchPerf {
   uint64_t window_start;
   uint64_t run, draw, ppu, audio, present;
   uint64_t run_max; /* the slowest single frame of the recompiled CPU */
+  Dkc2HdTimings hd; /* scene building, within draw */
   unsigned emulated, presented;
   uint64_t draws, uploads, upload_bytes;
 } SwitchPerf;
@@ -91,7 +92,8 @@ static void SwitchPerfOpen(SwitchPerf *perf, const char *backend,
           hd_gpu ? "gpu" : "cpu");
   fprintf(perf->file,
           "fps run_ms run_max_ms draw_ms ppu_ms scene_ms audio_ms present_ms hd "
-          "draws uploads upload_kb\n");
+          "draws uploads upload_kb hd_prepare_ms hd_pixels_ms hd_art_ms "
+          "hd_tiles_ms hd_sprites_ms hd_load_ms\n");
   fflush(perf->file);
   perf->frequency = SDL_GetPerformanceFrequency();
   perf->window_start = SDL_GetPerformanceCounter();
@@ -115,9 +117,10 @@ static void SwitchPerfPresented(SwitchPerf *perf, int hd_scale) {
       (double)(now - perf->window_start) / (double)perf->frequency;
   /* GL work per presented frame. */
   const double frames = (double)perf->presented;
-  char line[160];
+  char line[256];
   (void)snprintf(line, sizeof line,
-                 "%.1f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %d %.1f %.1f %.1f\n",
+                 "%.1f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %d %.1f %.1f %.1f "
+                 "%.2f %.2f %.2f %.2f %.2f %.2f\n",
                  seconds > 0.0 ? perf->presented / seconds : 0.0,
                  SwitchPerfMs(perf, perf->run, perf->emulated),
                  SwitchPerfMs(perf, perf->run_max, 1),
@@ -127,7 +130,13 @@ static void SwitchPerfPresented(SwitchPerf *perf, int hd_scale) {
                  SwitchPerfMs(perf, perf->audio, perf->emulated),
                  SwitchPerfMs(perf, perf->present, perf->presented), hd_scale,
                  (double)perf->draws / frames, (double)perf->uploads / frames,
-                 (double)perf->upload_bytes / 1024.0 / frames);
+                 (double)perf->upload_bytes / 1024.0 / frames,
+                 SwitchPerfMs(perf, perf->hd.prepare, perf->emulated),
+                 SwitchPerfMs(perf, perf->hd.pixels, perf->emulated),
+                 SwitchPerfMs(perf, perf->hd.art, perf->emulated),
+                 SwitchPerfMs(perf, perf->hd.tiles, perf->emulated),
+                 SwitchPerfMs(perf, perf->hd.sprites, perf->emulated),
+                 SwitchPerfMs(perf, perf->hd.load, perf->emulated));
   fputs(line, perf->file);
   fflush(perf->file);
   if (perf->echo) fputs(line, stdout);
@@ -347,6 +356,8 @@ static void DrawFrame(SdlHost *host) {
   Dkc2DrawPpuFrame();
 #ifdef __SWITCH__
   host->perf_ppu_end = SDL_GetPerformanceCounter();
+  /* perf.log splits the scene building; set here so reloads keep it. */
+  Dkc2HdSetClock(host->hd, SDL_GetPerformanceCounter);
 #endif
   const size_t pitch = (size_t)Dkc2VideoWidth() * kBytesPerPixel;
   if (host->hd_gpu) {
@@ -1900,6 +1911,14 @@ static int RunGame(const char *rom_path,
         const uint64_t perf_audio_start = SDL_GetPerformanceCounter();
         perf.draw += perf_audio_start - perf_draw_start;
         perf.ppu += host.perf_ppu_end - perf_draw_start;
+        Dkc2HdTimings hd_timings;
+        Dkc2HdTakeTimings(host.hd, &hd_timings);
+        perf.hd.prepare += hd_timings.prepare;
+        perf.hd.pixels += hd_timings.pixels;
+        perf.hd.art += hd_timings.art;
+        perf.hd.tiles += hd_timings.tiles;
+        perf.hd.sprites += hd_timings.sprites;
+        perf.hd.load += hd_timings.load;
 #endif
 #ifdef __APPLE__
         emulate_seconds += (double)(SDL_GetPerformanceCounter() - emulate_start) /

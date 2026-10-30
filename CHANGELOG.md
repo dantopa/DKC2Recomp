@@ -12,7 +12,8 @@
   (`--renderer deko3d`): flat presentation and the HD composition on the
   console's native graphics API, without the in-game menu yet. `--shot`
   saves chosen frames to compare it with OpenGL, and `perf.log` adds the
-  slowest recompiled-CPU frame of each window (`run_max_ms`).
+  slowest recompiled-CPU frame of each window (`run_max_ms`) and the HD
+  scene building by phase (`hd_*_ms`).
 - Switch: `perf.log` also counts GL draw calls, texture uploads and
   uploaded kilobytes per frame; after a vsynced swap the loop no longer
   waits again on the 60.0988 Hz host clock. The HD quad passes look up

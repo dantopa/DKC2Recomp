@@ -204,6 +204,20 @@ Dkc2Hd *Dkc2HdCreate(const Dkc2HdConfig *config, const uint8_t *rom,
                      size_t rom_size);
 void Dkc2HdDestroy(Dkc2Hd *hd);
 
+/* CPU time spent building scenes since the last Dkc2HdTakeTimings, in ticks
+ * of the clock given to Dkc2HdSetClock (without one nothing is measured). */
+typedef struct Dkc2HdTimings {
+  uint64_t prepare; /* OAM, sprite states and loose objects */
+  uint64_t pixels;  /* the per-pixel base, occlusion and tile mask */
+  uint64_t art;     /* BG1 terrain or screen art, and BG1's rank */
+  uint64_t tiles;   /* tile quads */
+  uint64_t sprites; /* sprite and loose-object quads */
+  uint64_t load;    /* pack files read, part of the phases above */
+} Dkc2HdTimings;
+void Dkc2HdSetClock(Dkc2Hd *hd, uint64_t (*now)(void));
+/* Copies the timings into *timings (zeros for a NULL hd) and clears them. */
+void Dkc2HdTakeTimings(Dkc2Hd *hd, Dkc2HdTimings *timings);
+
 /* Call before Dkc2DrawPpuFrame with the width it renders (256 plus both
  * widescreen margins). Routes the frame through the HD path when the scene
  * is supported; otherwise leaves the PPU untouched. */

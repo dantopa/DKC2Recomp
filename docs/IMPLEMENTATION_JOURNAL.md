@@ -6848,3 +6848,13 @@ frames that miss the deadline without HD.
 
 Verified so far: the Switch build compiles without new warnings and the
 shaders compile with `uam`. The renderer has not run on hardware yet.
+
+A correction to the reading above: `perf.log`'s `scene_ms` is not the GPU
+draws. It is `Dkc2HdEndFrameScene` on the CPU, building the scene; the GL
+draws run inside `present_ms`. So the 16-24 ms that grows with the quad
+count in the last stretch is scene building, which deko3d does not touch.
+`Dkc2HdSetClock` and `Dkc2HdTakeTimings` now time its phases with the
+host's clock (only the Switch host passes one): sprite preparation, the
+per-pixel base, occlusion and tile mask, BG1 art and rank, tile quads,
+sprite quads, and the pack reads inside them. `perf.log` reports each in
+milliseconds per emulated frame, to find which one to move or cut.
