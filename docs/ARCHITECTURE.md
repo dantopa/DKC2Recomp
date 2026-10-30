@@ -1855,3 +1855,16 @@ scene element. The scanline register record (`Dkc2HdmaLineState`) carries
 CGWSEL, CGADSUB and the fixed color; on lines that add the fixed color to
 the panorama layer the tile mask also takes that layer's pixels with the
 color added (flag `kDkc2HdTileMath`), and the quads add it to the art.
+
+Unresolved scenes (2026-10-30): the per-pixel maps (base, tile mask,
+occlusion, BG1 layer) are pure functions of the captures, so a GPU
+executor derives them itself. `Dkc2HdEndFrameScene(..., resolve)` with
+resolve off skips the per-pixel loop, BG1's rank and the panorama mask, and
+hands over `Dkc2HdSceneInputs` instead: the frame, the BG1-BG3 and object
+captures, the sprite-table owner, record pixel and loose-object claim per
+pixel, and three small tables (per record: replaced and draw position; per
+line: the panorama's added fixed color; per channel value: its brightness
+level and the brightness table). A resolve program draws the four maps at
+1x from them, one pass per map, before the composition passes; GL and
+deko3d share the GLSL. The CPU executor keeps resolving on the CPU, and
+the parity test compares the two.

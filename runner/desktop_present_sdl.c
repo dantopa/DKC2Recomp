@@ -453,6 +453,99 @@ static const char kHdCompositeFragmentSource[] =
     "  gl_FragColor = color;\n"
     "}\n";
 
+/* An unresolved scene's 1x maps (dkc2_hd.h Dkc2HdSceneInputs), as
+ * Dkc2HdEndFrameScene's per-pixel loop, BG1 rank and panorama lines make
+ * them on the CPU; map picks the one written: 0 base, 1 occlusion, 2 tile
+ * mask, 3 BG1 layer. Values are bytes (0-255); table words upload as BGRA,
+ * so their byte 0 reads as b, 1 as g, 2 as r and 3 as a. */
+static const char kHdResolveFragmentSource[] =
+    "#version 120\n"
+    "uniform sampler2D frame;\n"
+    "uniform sampler2D bg1;\n"
+    "uniform sampler2D bg2;\n"
+    "uniform sampler2D bg3;\n"
+    "uniform sampler2D obj;\n"
+    "uniform sampler2D native;\n"
+    "uniform sampler2D owner;\n"
+    "uniform sampler2D loose;\n"
+    "uniform sampler2D records;\n"
+    "uniform sampler2D lines;\n"
+    "uniform sampler2D math;\n"
+    "uniform vec2 native_size;\n"
+    "uniform vec2 shown;\n"
+    "uniform vec2 screen;\n"
+    "uniform float layered;\n"
+    "uniform int map;\n"
+    "vec4 bytes(sampler2D image, vec2 at, vec2 size) {\n"
+    "  return floor(texture2D(image, (at + 0.5) / size) * 255.0 + 0.5);\n"
+    "}\n"
+    "vec4 at(sampler2D image, vec2 p) { return bytes(image, p, native_size); }\n"
+    "bool present(vec4 c) { return c != vec4(0.0); }\n"
+    "float added(float value, float five) {\n"
+    "  float level = bytes(math, vec2(value, 0.0), vec2(256.0, 1.0)).b;\n"
+    "  return bytes(math, vec2(level + five, 0.0), vec2(256.0, 1.0)).g;\n"
+    "}\n"
+    "bool math_shows(vec4 c, float rank, vec3 pixel, float add) {\n"
+    "  if (add == 0.0 || !present(c) || c.a != rank) return false;\n"
+    "  vec3 five = vec3(mod(add, 32.0), mod(floor(add / 32.0), 32.0),\n"
+    "                   floor(add / 1024.0));\n"
+    "  return pixel == c.rgb ||\n"
+    "         pixel == vec3(added(c.r, five.r), added(c.g, five.g),\n"
+    "                       added(c.b, five.b));\n"
+    "}\n"
+    "void main() {\n"
+    "  vec2 p = floor(gl_FragCoord.xy);\n"
+    "  vec4 b1 = at(bg1, p), b2 = at(bg2, p), b3 = at(bg3, p);\n"
+    "  vec3 pixel = at(frame, p).rgb;\n"
+    "  float background = max(b1.a, max(b2.a, b3.a));\n"
+    "  float rank = max(b2.a, b3.a);\n"
+    "  if (layered == 0.0) rank = max(rank, b1.a);\n"
+    "  if (p.x < shown.x || p.x >= shown.y) background = 255.0;\n"
+    "  vec4 hide = vec4(background, 0.0, 0.0, 0.0);\n"
+    "  vec4 object = at(obj, p);\n"
+    "  float own = at(owner, p).r;\n"
+    "  bool own_pixel = own > 0.0 && object.rgb == at(native, p).rgb;\n"
+    "  vec4 record = bytes(records, vec2(own, 0.0), vec2(256.0, 1.0));\n"
+    "  if (present(object) && !(own_pixel && record.b > 0.0) &&\n"
+    "      at(loose, p).r == 0.0) {\n"
+    "    if (own_pixel) hide.b = record.g; else hide.g = object.a;\n"
+    "    if (object.a > rank) { pixel = object.rgb; rank = object.a; }\n"
+    "  }\n"
+    "  if (layered > 0.0 && present(b1) && b1.a > rank) pixel = b1.rgb;\n"
+    "  float mask = 0.0;\n"
+    "  if (present(b2) && b2.a == rank && b2.rgb == pixel) mask = 2.0;\n"
+    "  if (present(b3) && b3.a == rank && b3.rgb == pixel) mask = 3.0;\n"
+    "  vec4 line = bytes(lines, vec2(0.0, p.y), vec2(1.0, native_size.y));\n"
+    "  if (math_shows(b2, rank, pixel, line.b + line.g * 256.0)) mask = 130.0;\n"
+    "  if (math_shows(b3, rank, pixel, line.r + line.a * 256.0)) mask = 131.0;\n"
+    "  if (layered > 0.0) {\n"
+    "    float bg1_rank = b1.a;\n"
+    "    if (!present(b1)) {\n"
+    "      vec2 around[4];\n"
+    "      around[0] = vec2(1.0, 0.0);\n"
+    "      around[1] = vec2(-1.0, 0.0);\n"
+    "      around[2] = vec2(0.0, 1.0);\n"
+    "      around[3] = vec2(0.0, -1.0);\n"
+    "      for (int n = 0; n < 4; n++) {\n"
+    "        vec2 q = p + around[n];\n"
+    "        if (q.x < 0.0 || q.y < 0.0 || q.x >= native_size.x ||\n"
+    "            q.y >= native_size.y) continue;\n"
+    "        vec4 c = at(bg1, q);\n"
+    "        if (present(c) && c.a > bg1_rank) bg1_rank = c.a;\n"
+    "      }\n"
+    "    }\n"
+    "    if (bg1_rank == 0.0 && p.x >= screen.x && p.x < screen.y)\n"
+    "      bg1_rank = 1.0;\n"
+    "    if (bg1_rank > rank) hide.a = 255.0;\n"
+    "  }\n"
+    "  vec4 result = hide;\n"
+    "  if (map == 0) result = vec4(pixel, 255.0);\n"
+    "  else if (map == 2) result = vec4(mask, 0.0, 0.0, 0.0);\n"
+    "  else if (map == 3)\n"
+    "    result = present(b1) ? vec4(b1.rgb, 255.0) : vec4(0.0);\n"
+    "  gl_FragColor = result / 255.0;\n"
+    "}\n";
+
 static GLuint CompileShader(GLenum kind, const char *source,
                             const char *name, char *error,
                             size_t capacity) {
@@ -554,9 +647,9 @@ static void BuildCrtPrograms(Dkc2SdlPresenter *presenter) {
 static void BuildHdPrograms(Dkc2SdlPresenter *presenter) {
   static const char *const sources[kDkc2HdPassCount] = {
       kHdUpscaleFragmentSource, kHdQuadFragmentSource,
-      kHdCompositeFragmentSource};
+      kHdCompositeFragmentSource, kHdResolveFragmentSource};
   static const char *const names[kDkc2HdPassCount] = {
-      "hd upscale", "hd quad", "hd composite"};
+      "hd upscale", "hd quad", "hd composite", "hd resolve"};
   if (!s_gl.fbo) {
     SetError(presenter->hd_error, sizeof presenter->hd_error,
              "gpu hd unavailable: framebuffer objects missing");
@@ -575,8 +668,8 @@ static void BuildHdPrograms(Dkc2SdlPresenter *presenter) {
     }
   }
   for (int set = 0; set < kDkc2HdInputSets; set++) {
-    glGenTextures(4, presenter->hd_input[set]);
-    for (int input = 0; input < 4; input++) {
+    glGenTextures(kDkc2HdInputCount, presenter->hd_input[set]);
+    for (int input = 0; input < kDkc2HdInputCount; input++) {
       glBindTexture(GL_TEXTURE_2D, presenter->hd_input[set][input]);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -1448,12 +1541,106 @@ static void DrawHdQuads(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene,
   }
 }
 
+/* A set's 1x input textures: a resolved scene's maps, then an unresolved
+ * scene's inputs (Dkc2HdSceneInputs) in the resolve program's order. */
+enum {
+  kHdInputBase, kHdInputOcclusion, kHdInputLayer, kHdInputTiles,
+  kHdInputFrame, kHdInputBg1, kHdInputBg2, kHdInputBg3, kHdInputObj,
+  kHdInputNative, kHdInputOwner, kHdInputLoose, kHdInputRecords,
+  kHdInputLines, kHdInputMath, kHdInputCount
+};
+_Static_assert((int)kHdInputCount == (int)kDkc2HdInputCount, "HD input count");
+
+/* Gives a set's textures storage for scene width (tables keep theirs). */
+static void SizeHdInputs(const GLuint *inputs, int width, int height) {
+  for (int input = 0; input < kHdInputCount; input++) {
+    const bool bytes = input == kHdInputTiles || input == kHdInputOwner ||
+                       input == kHdInputLoose;
+    int w = width, h = height;
+    if (input == kHdInputRecords) {
+      w = kDkc2HdRecordEntries;
+      h = 1;
+    } else if (input == kHdInputMath) {
+      w = kDkc2HdMathEntries;
+      h = 1;
+    } else if (input == kHdInputLines) {
+      w = 1;
+    }
+    glBindTexture(GL_TEXTURE_2D, inputs[input]);
+    glTexImage2D(GL_TEXTURE_2D, 0, bytes ? GL_LUMINANCE8 : GL_RGBA8, w, h, 0,
+                 bytes ? GL_LUMINANCE : GL_BGRA, GL_UNSIGNED_BYTE, NULL);
+  }
+}
+
+/* One byte per pixel: rows are not 4-byte aligned. */
+static void UploadHdBytes(GLuint texture, const uint8_t *pixels, int width,
+                          int height) {
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  glBindTexture(GL_TEXTURE_2D, texture);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_LUMINANCE,
+                  GL_UNSIGNED_BYTE, pixels);
+  CountGlUpload(width, height, 1);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+}
+
+/* Uploads an unresolved scene's inputs and draws its maps into
+ * hd_resolved. False when the targets cannot be built. */
+static bool ResolveHd(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene,
+                      const GLuint *inputs) {
+  const Dkc2HdSceneInputs *in = scene->inputs;
+  for (int map = 0; map < kDkc2HdResolvedMaps; map++) {
+    Dkc2GlTarget *target = &presenter->hd_resolved[map];
+    if (target->width == scene->width && target->height == scene->height)
+      continue;
+    DestroyTarget(target);
+    if (!CreateTarget(target, scene->width, scene->height, GL_RGBA8,
+                      GL_NEAREST))
+      return false;
+  }
+  const int w = scene->width, h = scene->height;
+  UploadHdInput(inputs[kHdInputFrame], in->frame, w, h);
+  for (int layer = 0; layer < 3; layer++)
+    UploadHdInput(inputs[kHdInputBg1 + layer], in->bg[layer], w, h);
+  UploadHdInput(inputs[kHdInputObj], in->obj, w, h);
+  UploadHdInput(inputs[kHdInputNative], in->native, w, h);
+  UploadHdBytes(inputs[kHdInputOwner], in->owner, w, h);
+  UploadHdBytes(inputs[kHdInputLoose], in->loose, w, h);
+  UploadHdInput(inputs[kHdInputRecords], in->records, kDkc2HdRecordEntries,
+                1);
+  UploadHdInput(inputs[kHdInputLines], in->lines, 1, h);
+  UploadHdInput(inputs[kHdInputMath], in->math, kDkc2HdMathEntries, 1);
+  static const char *const kSamplers[] = {
+      "frame", "bg1",   "bg2",   "bg3",   "obj", "native",
+      "owner", "loose", "records", "lines", "math"};
+  const GLuint program = presenter->hd_program[kDkc2HdPassResolve];
+  s_gl.UseProgram(program);
+  for (int unit = 0; unit < (int)(sizeof kSamplers / sizeof kSamplers[0]);
+       unit++) {
+    Uniform1i(program, kSamplers[unit], unit);
+    BindTextureUnit(unit, inputs[kHdInputFrame + unit]);
+  }
+  Uniform2f(program, "native_size", (float)w, (float)h);
+  Uniform2f(program, "shown", (float)in->shown_first, (float)in->shown_end);
+  Uniform2f(program, "screen", (float)in->screen_first,
+            (float)in->screen_end);
+  Uniform1f(program, "layered", scene->layered ? 1.0f : 0.0f);
+  const GLint map = s_gl.GetUniformLocation(program, "map");
+  for (int m = 0; m < kDkc2HdResolvedMaps; m++) {
+    s_gl.UseProgram(program);
+    s_gl.Uniform1i(map, m);
+    DrawIntoTarget(program, &presenter->hd_resolved[m]);
+  }
+  for (int unit = (int)(sizeof kSamplers / sizeof kSamplers[0]); unit-- > 0;)
+    BindTextureUnit(unit, 0);
+  return true;
+}
+
 /* Draws a scene into hd_output in the order dkc2_hd.h gives. False when
  * the targets cannot be built. */
 static bool ComposeHd(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene) {
   const int width = scene->width * scene->scale;
   const int height = scene->height * scene->scale;
-  if (!PrepareHdTargets(presenter, width, height, scene->layer != NULL))
+  if (!PrepareHdTargets(presenter, width, height, scene->layered))
     return false;
   presenter->hd_serial = scene->serial;
   const unsigned set = presenter->hd_input_set;
@@ -1462,36 +1649,30 @@ static bool ComposeHd(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene) {
   /* All inputs get storage together, so a later scene with a layer or
    * tiles finds its texture sized even when earlier ones had none. */
   if (presenter->hd_input_width[set] != scene->width) {
-    for (int input = 0; input < 3; input++) {
-      glBindTexture(GL_TEXTURE_2D, inputs[input]);
-      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, scene->width, scene->height,
-                   0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
-    }
-    glBindTexture(GL_TEXTURE_2D, inputs[3]);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE8, scene->width,
-                 scene->height, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
+    SizeHdInputs(inputs, scene->width, scene->height);
     presenter->hd_input_width[set] = scene->width;
   }
   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-  UploadHdInput(inputs[0], scene->base, scene->width,
-                scene->height);
-  UploadHdInput(inputs[1], scene->occlusion, scene->width,
-                scene->height);
-  if (scene->layer)
-    UploadHdInput(inputs[2], scene->layer, scene->width,
-                  scene->height);
-  if (scene->tile_count) {
-    /* One byte per pixel: rows are not 4-byte aligned. */
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glBindTexture(GL_TEXTURE_2D, inputs[3]);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, scene->width, scene->height,
-                    GL_LUMINANCE, GL_UNSIGNED_BYTE, scene->tile_mask);
-    CountGlUpload(scene->width, scene->height, 1);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-  }
   glDisable(GL_DEPTH_TEST);
   glDisable(GL_BLEND);
   glEnable(GL_TEXTURE_2D);
+  /* The 1x maps: uploaded, or resolved from the inputs. */
+  GLuint base = inputs[kHdInputBase], occlusion = inputs[kHdInputOcclusion];
+  GLuint layer = inputs[kHdInputLayer], tiles = inputs[kHdInputTiles];
+  if (scene->inputs) {
+    if (!ResolveHd(presenter, scene, inputs)) return false;
+    base = presenter->hd_resolved[0].texture;
+    occlusion = presenter->hd_resolved[1].texture;
+    tiles = presenter->hd_resolved[2].texture;
+    layer = presenter->hd_resolved[3].texture;
+  } else {
+    UploadHdInput(base, scene->base, scene->width, scene->height);
+    UploadHdInput(occlusion, scene->occlusion, scene->width, scene->height);
+    if (scene->layer)
+      UploadHdInput(layer, scene->layer, scene->width, scene->height);
+    if (scene->tile_count)
+      UploadHdBytes(tiles, scene->tile_mask, scene->width, scene->height);
+  }
 
   const GLuint upscale = presenter->hd_program[kDkc2HdPassUpscale];
   s_gl.UseProgram(upscale);
@@ -1501,11 +1682,11 @@ static bool ComposeHd(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene) {
   Uniform1f(upscale, "scale", (float)scene->scale);
   Uniform1i(upscale, "smooth",
             scene->background == kDkc2HdFilterSmooth);
-  BindTextureUnit(0, inputs[0]);
+  BindTextureUnit(0, base);
   DrawIntoTarget(upscale, &presenter->hd_output);
-  BindTextureUnit(1, inputs[1]);
+  BindTextureUnit(1, occlusion);
   /* The quad program declares the tile mask in every pass. */
-  BindTextureUnit(2, inputs[3]);
+  BindTextureUnit(2, tiles);
   /* Blended passes keep the output opaque, as the CPU blend does. */
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
@@ -1515,8 +1696,8 @@ static bool ComposeHd(Dkc2SdlPresenter *presenter, const Dkc2HdScene *scene) {
                 kHdQuadTile, width, height);
     glDisable(GL_BLEND);
   }
-  if (scene->layer) {
-    BindTextureUnit(0, inputs[2]);
+  if (scene->layered) {
+    BindTextureUnit(0, layer);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     DrawIntoTarget(upscale, &presenter->hd_layer);
     DrawHdQuads(presenter, scene, scene->art, scene->art_count, kHdQuadArt,
@@ -1650,7 +1831,7 @@ void Dkc2GlPipelineDestroy(Dkc2SdlPresenter *presenter) {
   }
   for (int set = 0; set < kDkc2HdInputSets; set++)
     if (presenter->hd_input[set][0])
-      glDeleteTextures(4, presenter->hd_input[set]);
+      glDeleteTextures(kDkc2HdInputCount, presenter->hd_input[set]);
   memset(presenter->hd_input, 0, sizeof presenter->hd_input);
   for (unsigned i = 0; i < kDkc2HdImageSlots; i++)
     if (presenter->hd_images[i].id)
@@ -1659,6 +1840,8 @@ void Dkc2GlPipelineDestroy(Dkc2SdlPresenter *presenter) {
   presenter->hd_image_count = 0;
   DestroyTarget(&presenter->hd_output);
   DestroyTarget(&presenter->hd_layer);
+  for (int map = 0; map < kDkc2HdResolvedMaps; map++)
+    DestroyTarget(&presenter->hd_resolved[map]);
 }
 
 void Dkc2SdlPresenterDestroy(Dkc2SdlPresenter *presenter) {

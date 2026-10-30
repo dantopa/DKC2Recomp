@@ -365,7 +365,7 @@ static void DrawFrame(SdlHost *host) {
   if (host->hd_gpu) {
     host->hd_scene =
         Dkc2HdEndFrameScene(host->hd, g_ppu, g_ram, Dkc2GetFrameLines(),
-                            host->pixels, pitch);
+                            host->pixels, pitch, false);
     return;
   }
   host->hd_pixels = Dkc2HdEndFrame(host->hd, g_ppu, g_ram, Dkc2GetFrameLines(),

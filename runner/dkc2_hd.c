@@ -292,6 +292,12 @@ struct Dkc2Hd {
   size_t tile_layout_length;
   bool tile_layout_new;
   uint8_t tile_mask[kMaxPixels];
+  /* An unresolved scene's tables (see Dkc2HdSceneInputs). */
+  uint32_t record_info[kDkc2HdRecordEntries];
+  uint32_t panorama_lines[kHeight];
+  uint32_t math[kDkc2HdMathEntries];
+  Dkc2HdSceneInputs inputs;
+  bool resolve; /* this frame fills the per-pixel maps */
   Dkc2HdScene scene;
   uint64_t (*clock)(void); /* NULL: scene building is not timed */
   Dkc2HdTimings timings;
@@ -2093,6 +2099,13 @@ static void AddPanoramaLines(Dkc2Hd *hd, const Ppu *ppu,
   uint8_t rank = (uint8_t)(layer + 1);
   if (add) {
     rank |= kDkc2HdTileMath;
+    const unsigned shift = (layer - kTileFirstLayer) * 16u;
+    for (int y = first; y < end; y++)
+      hd->panorama_lines[y] =
+          (hd->panorama_lines[y] & ~(0xffffu << shift)) |
+          (uint32_t)add << shift;
+  }
+  if (add && hd->resolve) {
     for (int y = first; y < end; y++) {
       for (int x = 0; x < hd->width; x++) {
         const size_t i = (size_t)y * (size_t)hd->width + (size_t)x;
@@ -2161,6 +2174,7 @@ static void ProcessTiles(Dkc2Hd *hd, const Ppu *ppu,
   hd->tile_count = 0;
   hd->tile_layout_length = 0;
   hd->tile_layout_new = false;
+  memset(hd->panorama_lines, 0, sizeof hd->panorama_lines);
   if (!lines || !hd->tile_pass)
     return;
   for (unsigned layer = kTileFirstLayer; layer < kBgLayers; layer++) {
@@ -2344,15 +2358,56 @@ static void BuildBg1Rank(Dkc2Hd *hd) {
   }
 }
 
+/* An unresolved scene's inputs: the captures as they are, and the tables
+ * the per-pixel loop above reads from the frame state. */
+static void PrepareInputs(Dkc2Hd *hd, const Ppu *ppu, const uint8_t *frame,
+                          int shown_first, int shown_end, bool screen) {
+  for (unsigned owner = 0; owner < kDkc2HdRecordEntries; owner++) {
+    const unsigned k = owner - 1u;
+    hd->record_info[owner] =
+        owner && k < hd->sprite_count
+            ? (hd->sprites[k].replaced ? 1u : 0u) |
+                  (uint32_t)(uint8_t)(hd->record_position[k] + 1u) << 8
+            : 0;
+  }
+  for (unsigned value = 0; value < kDkc2HdMathEntries; value++) {
+    unsigned level = 0;
+    while (level < 31u && ppu->brightnessMult[level] != value)
+      level++;
+    const size_t last = sizeof ppu->brightnessMult - 1u;
+    hd->math[value] = level |
+                      (uint32_t)ppu->brightnessMult[value < last ? value
+                                                                 : last]
+                          << 8;
+  }
+  hd->inputs = (Dkc2HdSceneInputs){
+      .frame = (const uint32_t *)(const void *)frame,
+      .bg = {hd->bg[0], hd->bg[1], hd->bg[2]},
+      .obj = hd->obj,
+      .native = hd->native,
+      .owner = hd->owner,
+      .loose = hd->loose_owner,
+      .records = hd->record_info,
+      .lines = hd->panorama_lines,
+      .math = hd->math,
+      .shown_first = shown_first,
+      .shown_end = shown_end,
+      .screen_first = screen ? hd->origin : 0,
+      .screen_end = screen ? hd->origin + kNativeWidth : 0,
+  };
+}
+
 const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
                                        const uint8_t *ram,
                                        const Dkc2HdmaLines *lines,
                                        const uint8_t *frame,
-                                       size_t frame_pitch) {
+                                       size_t frame_pitch, bool resolve) {
   static uint64_t last_serial;
   if (!hd || !hd->active || !ppu || !ram || !frame ||
       frame_pitch < (size_t)hd->width * 4u)
     return NULL;
+  /* An executor reads the frame as packed rows. */
+  hd->resolve = resolve || frame_pitch != (size_t)hd->width * 4u;
   hd->origin = (hd->width - kNativeWidth) / 2 - ppu->wsPresentationXBias;
   uint64_t lap = Now(hd);
   if (hd->cache_count >= kCacheFlush)
@@ -2373,7 +2428,7 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
   const int extra = (hd->width - kNativeWidth) / 2;
   const int shown_first = extra - ppu->extraLeftCur;
   const int shown_end = extra + kNativeWidth + ppu->extraRightCur;
-  for (int y = 0; y < kHeight; y++) {
+  for (int y = 0; y < kHeight && hd->resolve; y++) {
     for (int x = 0; x < hd->width; x++) {
       const size_t i = (size_t)y * (size_t)hd->width + (size_t)x;
       const uint8_t *bgra = frame + (size_t)y * frame_pitch + (size_t)x * 4u;
@@ -2428,7 +2483,7 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
   lap = Lap(hd, &hd->timings.pixels, lap);
   hd->art_count = 0;
   const ScreenEntry *screen = layered ? MatchScreen(hd) : NULL;
-  if (layered)
+  if (layered && hd->resolve)
     BuildBg1Rank(hd);
   if (screen)
     AddScreenArt(hd, screen, ppu->brightnessMult[31]);
@@ -2436,7 +2491,7 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
     ProcessTerrain(hd, ppu, ram);
   if (hd->dump_dir[0])
     DumpScreen(hd, ppu, ram);
-  if (layered) {
+  if (layered && hd->resolve) {
     for (size_t i = 0; i < (size_t)hd->width * kHeight; i++)
       if (hd->bg1_rank[i] > hd->base_rank[i])
         hd->occlusion[i] |= 0xff000000u;
@@ -2455,18 +2510,23 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
     }
   }
   (void)Lap(hd, &hd->timings.sprites, lap);
+  if (!hd->resolve)
+    PrepareInputs(hd, ppu, frame, shown_first, shown_end, screen != NULL);
+  const bool resolved = hd->resolve;
   hd->scene = (Dkc2HdScene){
       .serial = ++last_serial,
       .width = hd->width,
       .height = kHeight,
       .scale = hd->scale,
       .background = hd->background,
-      .base = hd->base,
+      .inputs = resolved ? NULL : &hd->inputs,
+      .layered = layered,
+      .base = resolved ? hd->base : NULL,
       .tiles = hd->tiles,
       .tile_count = hd->tile_count,
-      .tile_mask = hd->tile_mask,
-      .occlusion = hd->occlusion,
-      .layer = layered ? hd->layer_source : NULL,
+      .tile_mask = resolved ? hd->tile_mask : NULL,
+      .occlusion = resolved ? hd->occlusion : NULL,
+      .layer = resolved && layered ? hd->layer_source : NULL,
       .art = hd->art,
       .art_count = hd->art_count,
       .sprites = hd->quads,
@@ -2480,7 +2540,7 @@ const uint32_t *Dkc2HdEndFrame(Dkc2Hd *hd, const Ppu *ppu, const uint8_t *ram,
                                const uint8_t *frame, size_t frame_pitch,
                                int *width, int *height) {
   const Dkc2HdScene *scene =
-      Dkc2HdEndFrameScene(hd, ppu, ram, lines, frame, frame_pitch);
+      Dkc2HdEndFrameScene(hd, ppu, ram, lines, frame, frame_pitch, true);
   if (!scene)
     return NULL;
   Upscale(hd, scene->base, hd->output);

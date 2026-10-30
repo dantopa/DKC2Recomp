@@ -11,6 +11,7 @@
 #include "flat_fsh_dksh.h"
 #include "hd_composite_fsh_dksh.h"
 #include "hd_quad_fsh_dksh.h"
+#include "hd_resolve_fsh_dksh.h"
 #include "hd_upscale_fsh_dksh.h"
 #include "rect_vsh_dksh.h"
 
@@ -35,16 +36,24 @@ enum {
   /* Image descriptors: HD images by table slot, then the fixed images. */
   kDescriptorSource = kDkc2HdImageSlots,
   kDescriptorInput = kDescriptorSource + kFrames,
-  kDescriptorOutput = kDescriptorInput + kFrames * 4,
+  kDescriptorOutput = kDescriptorInput + kFrames * kDkc2HdInputCount,
   kDescriptorLayer = kDescriptorOutput + 1,
-  kDescriptorCount = kDescriptorLayer + 1,
+  kDescriptorResolved = kDescriptorLayer + 1,
+  kDescriptorCount = kDescriptorResolved + kDkc2HdResolvedMaps,
   kSamplerNearest = 0,
   kSamplerLinear = 1,
   kSamplerCount = 2,
 };
 
-/* The 1x scene inputs, as the OpenGL presenter numbers them. */
-enum { kInputBase = 0, kInputOcclusion = 1, kInputLayer = 2, kInputTiles = 3 };
+/* A frame's 1x scene inputs, as the OpenGL presenter numbers them: a
+ * resolved scene's maps, then an unresolved scene's inputs in the resolve
+ * shader's binding order. */
+enum {
+  kInputBase, kInputOcclusion, kInputLayer, kInputTiles, kInputFrame,
+  kInputBg1, kInputBg2, kInputBg3, kInputObj, kInputNative, kInputOwner,
+  kInputLoose, kInputRecords, kInputLines, kInputMath, kInputCount
+};
+_Static_assert((int)kInputCount == (int)kDkc2HdInputCount, "HD input count");
 
 /* rect_vsh.glsl's uniform block. */
 typedef struct DekoDraw {
@@ -84,7 +93,8 @@ struct Dkc2Deko3d {
   DkImage swapchain_images[kFrames];
   DkSwapchain swapchain;
   DkMemBlock code_memory;
-  DkShader rect_vsh, flat_fsh, upscale_fsh, quad_fsh, composite_fsh;
+  DkShader rect_vsh, flat_fsh, upscale_fsh, quad_fsh, composite_fsh,
+      resolve_fsh;
   /* Descriptors and the uniform block, CPU-written. */
   DkMemBlock data_memory;
   DkImageDescriptor *image_descriptors;
@@ -97,9 +107,10 @@ struct Dkc2Deko3d {
   bool fence_pending[kFrames];
   unsigned frame;
   DekoTexture source[kFrames];
-  DekoTexture inputs[kFrames][4];
+  DekoTexture inputs[kFrames][kInputCount];
   DekoTexture hd_output;
   DekoTexture hd_layer;
+  DekoTexture hd_resolved[kDkc2HdResolvedMaps]; /* unresolved scenes' maps */
   uint64_t hd_serial;
   int hd_width, hd_height; /* the composed scene's output size */
   DkMemBlock pool[kPoolBlocks];
@@ -430,6 +441,8 @@ Dkc2Deko3d *Dkc2Deko3dCreate(Dkc2SdlPresenterGlStats *stats, char *error,
              hd_quad_fsh_dksh_size);
   LoadShader(deko, &deko->composite_fsh, &code_offset,
              hd_composite_fsh_dksh, hd_composite_fsh_dksh_size);
+  LoadShader(deko, &deko->resolve_fsh, &code_offset, hd_resolve_fsh_dksh,
+             hd_resolve_fsh_dksh_size);
 
   const uint32_t sampler_offset =
       kDescriptorCount * (uint32_t)sizeof(DkImageDescriptor);
@@ -504,11 +517,13 @@ void Dkc2Deko3dDestroy(Dkc2Deko3d *deko) {
   if (deko->cmdbuf) dkCmdBufDestroy(deko->cmdbuf);
   for (unsigned i = 0; i < kFrames; i++) {
     TextureDestroy(&deko->source[i]);
-    for (unsigned input = 0; input < 4; input++)
+    for (unsigned input = 0; input < kInputCount; input++)
       TextureDestroy(&deko->inputs[i][input]);
   }
   TextureDestroy(&deko->hd_output);
   TextureDestroy(&deko->hd_layer);
+  for (unsigned map = 0; map < kDkc2HdResolvedMaps; map++)
+    TextureDestroy(&deko->hd_resolved[map]);
   for (unsigned i = 0; i < deko->pool_created; i++)
     dkMemBlockDestroy(deko->pool[i]);
   if (deko->capture_memory) dkMemBlockDestroy(deko->capture_memory);
@@ -677,22 +692,40 @@ static bool PrepareHd(Dkc2Deko3d *deko, const Dkc2HdScene *scene) {
                       deko->inputs[0][0].height != scene->height;
   const bool targets =
       deko->hd_output.width != width || deko->hd_output.height != height;
-  const bool layer = scene->layer &&
+  const bool layer = scene->layered &&
                      (targets || deko->hd_layer.width != width);
   if (!inputs && !targets && !layer) return true;
   dkQueueWaitIdle(deko->queue);
   if (inputs) {
     for (unsigned i = 0; i < kFrames; i++) {
-      for (unsigned input = 0; input < 4; input++) {
+      for (unsigned input = 0; input < kInputCount; input++) {
+        const bool bytes = input == kInputTiles || input == kInputOwner ||
+                           input == kInputLoose;
+        int w = scene->width, h = scene->height;
+        if (input == kInputRecords || input == kInputMath) {
+          w = input == kInputRecords ? kDkc2HdRecordEntries
+                                     : kDkc2HdMathEntries;
+          h = 1;
+        } else if (input == kInputLines) {
+          w = 1;
+        }
         DekoTexture *texture = &deko->inputs[i][input];
         TextureDestroy(texture);
         if (!TextureCreate(deko, texture,
-                           input == kInputTiles ? DkImageFormat_R8_Unorm
-                                                : DkImageFormat_BGRA8_Unorm,
-                           0, scene->width, scene->height,
-                           kDescriptorInput + i * 4 + input))
+                           bytes ? DkImageFormat_R8_Unorm
+                                 : DkImageFormat_BGRA8_Unorm,
+                           0, w, h,
+                           kDescriptorInput + i * kInputCount + input))
           return false;
       }
+    }
+    for (unsigned map = 0; map < kDkc2HdResolvedMaps; map++) {
+      TextureDestroy(&deko->hd_resolved[map]);
+      if (!TextureCreate(deko, &deko->hd_resolved[map],
+                         DkImageFormat_RGBA8_Unorm, DkImageFlags_UsageRender,
+                         scene->width, scene->height,
+                         kDescriptorResolved + map))
+        return false;
     }
   }
   if (targets) {
@@ -703,12 +736,58 @@ static bool PrepareHd(Dkc2Deko3d *deko, const Dkc2HdScene *scene) {
                        kDescriptorOutput))
       return false;
   }
-  if (scene->layer && !deko->hd_layer.memory &&
+  if (scene->layered && !deko->hd_layer.memory &&
       !TextureCreate(deko, &deko->hd_layer, DkImageFormat_RGBA8_Unorm,
                      DkImageFlags_UsageRender, width, height,
                      kDescriptorLayer))
     return false;
   return true;
+}
+
+/* An unresolved scene's inputs, uploaded into the frame's textures. */
+static bool UploadSceneInputs(Dkc2Deko3d *deko, const Dkc2HdScene *scene,
+                              DekoTexture *inputs) {
+  const Dkc2HdSceneInputs *in = scene->inputs;
+  const int w = scene->width, h = scene->height;
+  for (unsigned layer = 0; layer < 3; layer++)
+    if (!Upload(deko, &inputs[kInputBg1 + layer].view, in->bg[layer], w, h,
+                4))
+      return false;
+  return Upload(deko, &inputs[kInputFrame].view, in->frame, w, h, 4) &&
+         Upload(deko, &inputs[kInputObj].view, in->obj, w, h, 4) &&
+         Upload(deko, &inputs[kInputNative].view, in->native, w, h, 4) &&
+         Upload(deko, &inputs[kInputOwner].view, in->owner, w, h, 1) &&
+         Upload(deko, &inputs[kInputLoose].view, in->loose, w, h, 1) &&
+         Upload(deko, &inputs[kInputRecords].view, in->records,
+                kDkc2HdRecordEntries, 1, 4) &&
+         Upload(deko, &inputs[kInputLines].view, in->lines, 1, h, 4) &&
+         Upload(deko, &inputs[kInputMath].view, in->math, kDkc2HdMathEntries,
+                1, 4);
+}
+
+/* desktop_present_sdl.c ResolveHd: draws an unresolved scene's maps into
+ * hd_resolved from the inputs at descriptor input. */
+static void ResolveHd(Dkc2Deko3d *deko, const Dkc2HdScene *scene,
+                      uint32_t input) {
+  const Dkc2HdSceneInputs *in = scene->inputs;
+  DekoDraw draw = WholeTarget(scene->width, scene->height);
+  draw.source[0] = (float)in->shown_first;
+  draw.source[1] = (float)in->shown_end;
+  draw.source[2] = (float)in->screen_first;
+  draw.source[3] = (float)in->screen_end;
+  draw.native[0] = (float)scene->width;
+  draw.native[1] = (float)scene->height;
+  draw.native[2] = scene->layered ? 1.0f : 0.0f;
+  for (uint32_t unit = 0; unit < kInputCount - kInputFrame; unit++)
+    BindTexture(deko, unit, input + kInputFrame + unit, kSamplerNearest);
+  for (unsigned map = 0; map < kDkc2HdResolvedMaps; map++) {
+    BindTarget(deko, &deko->hd_resolved[map].view, scene->width,
+               scene->height);
+    BindPass(deko, &deko->resolve_fsh, false, DkColorMask_RGBA);
+    draw.native[3] = (float)map;
+    Draw(deko, &draw);
+  }
+  dkCmdBufBarrier(deko->cmdbuf, DkBarrier_Fragments, DkInvalidateFlags_Image);
 }
 
 /* desktop_present_sdl.c ComposeHd: draws the scene into hd_output. */
@@ -734,21 +813,34 @@ static bool ComposeHd(Dkc2Deko3d *deko, const Dkc2HdScene *scene) {
   if (!resident) return false;
   const unsigned set = deko->frame % kFrames;
   DekoTexture *inputs = deko->inputs[set];
-  if (!Upload(deko, &inputs[kInputBase].view, scene->base, scene->width,
-              scene->height, 4) ||
-      !Upload(deko, &inputs[kInputOcclusion].view, scene->occlusion,
-              scene->width, scene->height, 4) ||
-      (scene->layer &&
-       !Upload(deko, &inputs[kInputLayer].view, scene->layer, scene->width,
-               scene->height, 4)) ||
-      (scene->tile_count &&
-       !Upload(deko, &inputs[kInputTiles].view, scene->tile_mask,
-               scene->width, scene->height, 1)))
-    return false;
+  const bool uploaded =
+      scene->inputs
+          ? UploadSceneInputs(deko, scene, inputs)
+          : Upload(deko, &inputs[kInputBase].view, scene->base, scene->width,
+                   scene->height, 4) &&
+                Upload(deko, &inputs[kInputOcclusion].view, scene->occlusion,
+                       scene->width, scene->height, 4) &&
+                (!scene->layer ||
+                 Upload(deko, &inputs[kInputLayer].view, scene->layer,
+                        scene->width, scene->height, 4)) &&
+                (!scene->tile_count ||
+                 Upload(deko, &inputs[kInputTiles].view, scene->tile_mask,
+                        scene->width, scene->height, 1));
+  if (!uploaded) return false;
   dkCmdBufBarrier(deko->cmdbuf, DkBarrier_Full,
                   DkInvalidateFlags_Image | DkInvalidateFlags_Descriptors);
 
-  const uint32_t input = kDescriptorInput + set * 4;
+  /* The 1x maps' descriptors: uploaded, or resolved from the inputs. */
+  const uint32_t input = kDescriptorInput + set * kInputCount;
+  uint32_t base = input + kInputBase, occlusion = input + kInputOcclusion;
+  uint32_t layer = input + kInputLayer, tiles = input + kInputTiles;
+  if (scene->inputs) {
+    ResolveHd(deko, scene, input);
+    base = kDescriptorResolved + 0;
+    occlusion = kDescriptorResolved + 1;
+    tiles = kDescriptorResolved + 2;
+    layer = kDescriptorResolved + 3;
+  }
   DekoDraw upscale = WholeTarget(width, height);
   upscale.native[0] = (float)scene->width;
   upscale.native[1] = (float)scene->height;
@@ -756,20 +848,20 @@ static bool ComposeHd(Dkc2Deko3d *deko, const Dkc2HdScene *scene) {
   upscale.native[3] = scene->background == kDkc2HdFilterSmooth ? 1.0f : 0.0f;
   BindTarget(deko, &deko->hd_output.view, width, height);
   BindPass(deko, &deko->upscale_fsh, false, DkColorMask_RGBA);
-  BindTexture(deko, 0, input + kInputBase, kSamplerNearest);
+  BindTexture(deko, 0, base, kSamplerNearest);
   Draw(deko, &upscale);
-  BindTexture(deko, 1, input + kInputOcclusion, kSamplerNearest);
-  BindTexture(deko, 2, input + kInputTiles, kSamplerNearest);
+  BindTexture(deko, 1, occlusion, kSamplerNearest);
+  BindTexture(deko, 2, tiles, kSamplerNearest);
   /* Blended passes keep the output opaque, as the CPU blend does. */
   if (scene->tile_count) {
     BindPass(deko, &deko->quad_fsh, true, DkColorMask_RGB);
     DrawHdQuads(deko, scene, scene->tiles, scene->tile_count, 2, width,
                 height);
   }
-  if (scene->layer) {
+  if (scene->layered) {
     BindTarget(deko, &deko->hd_layer.view, width, height);
     BindPass(deko, &deko->upscale_fsh, false, DkColorMask_RGBA);
-    BindTexture(deko, 0, input + kInputLayer, kSamplerNearest);
+    BindTexture(deko, 0, layer, kSamplerNearest);
     Draw(deko, &upscale);
     BindPass(deko, &deko->quad_fsh, false, DkColorMask_RGBA);
     DrawHdQuads(deko, scene, scene->art, scene->art_count, 0, width, height);

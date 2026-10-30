@@ -451,7 +451,7 @@ if(DKC2_BUILD_SNESRECOMP)
         enable_language(ASM)
         set(_dkc2_deko3d_shaders "")
         foreach(_dkc2_shader rect_vsh:vert flat_fsh:frag hd_upscale_fsh:frag
-                hd_quad_fsh:frag hd_composite_fsh:frag)
+                hd_quad_fsh:frag hd_composite_fsh:frag hd_resolve_fsh:frag)
             string(REPLACE ":" ";" _dkc2_shader "${_dkc2_shader}")
             list(GET _dkc2_shader 0 _dkc2_shader_name)
             list(GET _dkc2_shader 1 _dkc2_shader_stage)

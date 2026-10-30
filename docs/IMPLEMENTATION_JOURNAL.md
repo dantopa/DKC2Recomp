@@ -6868,3 +6868,35 @@ from the top. Whole-target passes hid it (they read only `gl_FragCoord`),
 the final flat draw flipped the frame, and the quad passes looked up their
 image rows from the wrong place and clamped to an edge row. `rect_vsh`
 now negates clip-space y. Not yet run on hardware.
+
+## 2026-10-30 - HD per-pixel maps on the GPU
+
+The Switch's HD frame spends most of its CPU time building the scene, and
+deko3d did not touch that. Timing the phases on the Mac with the console's
+pack (the four pack indexes hash the same) put the cost in per-pixel work:
+in Pirate Panic's last stretch about 60% of `hd_tiles` is the panorama's
+fixed-color mask (a search of the brightness table per channel of every
+pixel on lines with color math), plus the base/occlusion/tile-mask loop and
+BG1's rank. Cell matching (decode, hash, pack lookup) is the remainder and
+stays on the CPU.
+
+Those maps depend only on the captures and a few tables, so an executor
+that can run shaders now resolves them: `Dkc2HdEndFrameScene` takes a
+`resolve` flag, and without it fills `Dkc2HdSceneInputs` (captures as they
+are, owner and loose-claim bytes, and per-record, per-line and per-value
+tables) instead of the maps. The resolve program writes base, occlusion,
+tile mask and BG1 layer into four 1x RGBA8 targets, one pass each (no
+multiple render targets, so GL 2.1 framebuffer objects suffice); the
+composition passes read those targets instead of uploads. The tables keep
+the shader free of the brightness search: one lookup gives a channel's
+level, a second the value with the fixed color added.
+
+A first parity run differed only on the Pirate Panic title screen: screen
+art lifts BG1's rank to 1 over the native area (so the art covers the
+backdrop), which the inputs now carry as a column range.
+
+Verified on the Mac: `hd_gpu_parity.py` with the panorama pack on the
+Pirate Panic route (frames 600, 1300, 2400, 3000, 3200, 3400, 3550) matches
+the CPU executor exactly (largest channel difference 1); the suite passes.
+The deko3d port compiles; it has not run on hardware yet. Uploads grow from
+about 1 MB to 1.8 MB per frame at 16:9.

@@ -14,6 +14,11 @@
   saves chosen frames to compare it with OpenGL, and `perf.log` adds the
   slowest recompiled-CPU frame of each window (`run_max_ms`) and the HD
   scene building by phase (`hd_*_ms`).
+- HD on the GPU (OpenGL and the Switch deko3d renderer) now derives the
+  per-pixel base, occlusion, tile mask and BG1 layer on the GPU from the
+  layer captures; the CPU no longer builds them for the GPU path, which
+  was most of the HD scene time on the Switch (panorama lines with color
+  math above all).
 - Switch: `perf.log` also counts GL draw calls, texture uploads and
   uploaded kilobytes per frame; after a vsynced swap the loop no longer
   waits again on the 60.0988 Hz host clock. The HD quad passes look up

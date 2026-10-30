@@ -161,11 +161,44 @@ enum { kDkc2HdTileMath = 0x80 };
  *     order, each output pixel hidden when, for the occlusion R, G, B of its
  *     1x pixel, rank <= R, or G && G >= rank, or B && B - 1 > index.
  * Valid until the next frame call or Dkc2HdDestroy.
+ *
+ * An unresolved scene (inputs set) leaves base, tile_mask, occlusion and
+ * layer NULL: the executor derives them per pixel from inputs, as
+ * Dkc2HdEndFrameScene does on the CPU for a resolved one.
  */
+typedef struct Dkc2HdSceneInputs {
+  const uint32_t *frame; /* the rendered frame, ARGB (alpha ignored) */
+  /* BG1-BG3 and object captures: alpha the composition rank, 0 where the
+   * layer is absent. */
+  const uint32_t *bg[3];
+  const uint32_t *obj;
+  const uint32_t *native; /* a record's own pixel where owner is set */
+  const uint8_t *owner;   /* the sprite-table record + 1 there, or 0 */
+  const uint8_t *loose;   /* nonzero where a loose object claims it */
+  /* kDkc2HdRecordEntries, by owner value: byte 0 1 when the record is
+   * replaced, byte 1 its draw-order position + 1. */
+  const uint32_t *records;
+  /* One per row: the BGR555 fixed color a BG2 (low half) or BG3 (high
+   * half) panorama adds on that line and joins the tile mask with, or 0. */
+  const uint32_t *lines;
+  /* 256 entries: byte 0 the first brightness level showing channel value
+   * i (31 when none does), byte 1 the PPU brightness table at i (its last
+   * entry past 62). */
+  const uint32_t *math;
+  int shown_first, shown_end; /* the columns the PPU shows */
+  /* Columns where screen art lifts BG1's rank to at least 1 (empty when
+   * the scene shows none). */
+  int screen_first, screen_end;
+} Dkc2HdSceneInputs;
+
+enum { kDkc2HdRecordEntries = 256, kDkc2HdMathEntries = 256 };
+
 typedef struct Dkc2HdScene {
   uint64_t serial; /* differs for every scene */
   int width, height, scale;
   Dkc2HdFilter background;
+  const Dkc2HdSceneInputs *inputs; /* unresolved scenes only */
+  bool layered; /* the BG1 layer is drawn (layer set when resolved) */
   const uint32_t *base;
   const Dkc2HdQuad *tiles;
   unsigned tile_count;
@@ -233,12 +266,14 @@ const uint32_t *Dkc2HdEndFrame(Dkc2Hd *hd, const Ppu *ppu, const uint8_t *ram,
                                const uint8_t *frame, size_t frame_pitch,
                                int *width, int *height);
 
-/* The same frame as a scene for an external executor, or NULL as above. */
+/* The same frame as a scene for an external executor, or NULL as above.
+ * Unless resolve is set (or the frame rows are not tightly packed) the
+ * per-pixel maps are left to the executor (Dkc2HdScene.inputs). */
 const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
                                        const uint8_t *ram,
                                        const Dkc2HdmaLines *lines,
                                        const uint8_t *frame,
-                                       size_t frame_pitch);
+                                       size_t frame_pitch, bool resolve);
 
 /* Fills *probe for pixel (x, y) of the last composed frame. False when the
  * last frame was not composed or the pixel is outside it. */
