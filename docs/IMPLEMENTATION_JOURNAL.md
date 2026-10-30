@@ -6729,3 +6729,10 @@ First run on hardware crashed (Data Abort, 2168-0002) while compiling the
 first GLSL shader: Mesa's GLSL preprocessor overflowed the 1 MiB main-thread
 stack (backtrace glcpp_parser_parse -> vsnprintf). On Switch `main()` now
 runs the host on an 8 MiB thread.
+
+With the HD pack on the SD card, HD at 2x fell to 24-32 fps on the Switch
+(drawing 20-31 ms, composition on the GPU). Pack images were read four bytes
+per `fread`, a million calls for a 4 MiB image, and art loads the first time
+each graphic appears, so the cost spread over play. One read per image and
+an in-place conversion load the whole Mac pack in 0.41 s instead of 3.58 s
+(same pixels); the console gap is larger.

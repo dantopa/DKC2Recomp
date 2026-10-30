@@ -634,13 +634,17 @@ static HdImage *LoadImage(const char *path) {
     const int height = header[6] | header[7] << 8;
     if (width > 0 && height > 0)
       image = NewImage(width, height);
-    for (int i = 0; image && i < width * height; i++) {
-      uint8_t rgba[4];
-      if (fread(rgba, 1, sizeof rgba, file) != sizeof rgba) {
-        free(image);
-        image = NULL;
-        break;
-      }
+    /* One read for the whole image, converted in place: art loads on first
+     * sight during play, and per-pixel reads cost several times more (most
+     * on the console's SD card). */
+    const size_t count = (size_t)width * (size_t)height;
+    if (image &&
+        fread(image->pixels, sizeof *image->pixels, count, file) != count) {
+      free(image);
+      image = NULL;
+    }
+    for (size_t i = 0; image && i < count; i++) {
+      const uint8_t *rgba = (const uint8_t *)&image->pixels[i];
       image->pixels[i] = (uint32_t)rgba[3] << 24 | (uint32_t)rgba[0] << 16 |
                          (uint32_t)rgba[1] << 8 | rgba[2];
     }

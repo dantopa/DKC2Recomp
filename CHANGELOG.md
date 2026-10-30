@@ -2,6 +2,9 @@
 
 ## Unreleased (fork: HD presentation)
 
+- HD pack images load with one read instead of one per pixel: about 9x
+  faster on the Mac, and the main HD slowdown on the Switch, where art loads
+  from the SD card as it first appears.
 - Added an experimental Nintendo Switch homebrew build of the SDL host
   (`dkc2_snesrecomp_sdl_nro`, built with the devkitPro Docker image). It
   reads `dkc2.smc` beside the `.nro`; MSU-1 PCM is unavailable there. Not yet
