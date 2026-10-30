@@ -18,6 +18,9 @@ layout (location = 0) out vec2 out_uv;
 void main() {
   vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));
   vec2 pixel = rect.xy + corner * rect.zw;
-  gl_Position = vec4(pixel / target.xy * 2.0 - 1.0, 0.0, 1.0);
+  /* Clip-space y grows upward while the upper-left origin puts row 0 (and
+   * gl_FragCoord.y 0) at the top, so pixel rows map to y from +1 down. */
+  vec2 ndc = pixel / target.xy * 2.0 - 1.0;
+  gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
   out_uv = mix(uv.xy, uv.zw, corner);
 }

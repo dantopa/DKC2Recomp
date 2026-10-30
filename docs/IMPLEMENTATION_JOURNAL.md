@@ -6858,3 +6858,13 @@ host's clock (only the Switch host passes one): sprite preparation, the
 per-pixel base, occlusion and tile mask, BG1 art and rank, tile quads,
 sprite quads, and the pack reads inside them. `perf.log` reports each in
 milliseconds per emulated frame, to find which one to move or cut.
+
+First hardware run (4f4fa89): present fell from 8.5 ms to under 1 ms and
+HD 2x 4:3 gained 5-8 fps, but the picture was wrong. The capture came out
+upside down and every HD quad as vertical streaks. The upper-left origin
+only moves the window origin: clip-space y still grows upward, so the
+vertex shader put pixel row 0 at the bottom while `gl_FragCoord.y` counted
+from the top. Whole-target passes hid it (they read only `gl_FragCoord`),
+the final flat draw flipped the frame, and the quad passes looked up their
+image rows from the wrong place and clamped to an edge row. `rect_vsh`
+now negates clip-space y. Not yet run on hardware.
