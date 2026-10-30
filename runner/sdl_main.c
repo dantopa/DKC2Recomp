@@ -88,7 +88,9 @@ static void SwitchPerfOpen(SwitchPerf *perf, const char *backend,
   /* deko3d leaves no OpenGL context to ask. */
   const GLubyte *renderer = gl ? glGetString(GL_RENDERER) : NULL;
   fprintf(perf->file, "backend: %s\nrenderer: %s\nhd composition: %s\n",
-          backend, renderer ? (const char *)renderer : "unknown",
+          backend,
+          renderer ? (const char *)renderer
+                   : gl ? "unknown" : "deko3d, Tegra X1",
           hd_gpu ? "gpu" : "cpu");
   fprintf(perf->file,
           "fps run_ms run_max_ms draw_ms ppu_ms scene_ms audio_ms present_ms hd "
@@ -1883,6 +1885,11 @@ static int RunGame(const char *rom_path,
         const uint64_t perf_run = SDL_GetPerformanceCounter() - perf_run_start;
         perf.run += perf_run;
         if (perf_run > perf.run_max) perf.run_max = perf_run;
+        /* A recompiled-CPU frame longer than a display frame, to find what
+         * the game did then (a level load runs in one host frame). */
+        if (perf.file && perf_run > perf.frequency / 60u)
+          fprintf(stdout, "slow run: frame %llu, %.1f ms\n", host_frame,
+                  1000.0 * (double)perf_run / (double)perf.frequency);
 #endif
         PulseHaptics(&host, Dkc2CoopTakeStompEvents(), false);
         if (g_fail || !Dkc2LastLleResult()) {
