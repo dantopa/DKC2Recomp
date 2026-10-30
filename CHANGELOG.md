@@ -2,6 +2,8 @@
 
 ## Unreleased (fork: HD presentation)
 
+- Switch: the game starts without the launcher, and a new configuration
+  defaults to 16:9 with HD at 2x.
 - Switch: `--bench SECONDS [--hd S]` replays `bench.input` and prints the
   per-stage timings (drawing now split into PPU frame and HD scene) to
   stdout, which nxlink receives; the `.nro` and `.nsp` carry the app icon in

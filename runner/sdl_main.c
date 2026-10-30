@@ -2191,8 +2191,13 @@ static int HostMain(int argc, char **argv) {
 #endif
   bool suppress_launcher = EnvironmentEnabled("SNESRECOMP_NO_LAUNCHER") ||
                            EnvironmentEnabled("DKC2_DESKTOP_TEST_HIDDEN");
+#ifdef __SWITCH__
+  /* The ROM is always known, and the launcher is only for --launcher. */
+  bool show_launcher = !suppress_launcher && force_launcher;
+#else
   bool show_launcher = !suppress_launcher &&
       (force_launcher || !settings.skip_launcher || !rom_path[0]);
+#endif
   if (show_launcher) {
     char selected_rom[kPathCapacity] = {0};
     int action = Dkc2LauncherRun(&settings, rom_path, selected_rom,

@@ -150,6 +150,9 @@ Platform differences:
   the presenter keeps its GL 2.1 context, and the fixed-function calls the
   static Mesa library does not export are resolved from that context
   (`runner/switch_host.c`);
+- the game starts without the launcher (`--launcher` still opens it); a new
+  configuration defaults to 16:9 and HD at 2x, which the 720p screen (1080p
+  docked) shows in full, and the in-game menu changes either;
 - file dialogs report a cancel, so paths come from the ROM default above and
   the saved configuration;
 - MSU-1 PCM tracks are unavailable (Horizon cannot map files and the set does

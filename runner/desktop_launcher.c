@@ -105,9 +105,14 @@ void Dkc2LauncherSetCrt(const Dkc2CrtSettings *crt) {
 }
 
 /* HD presentation (dkc2_hd.h), on by default at 4x with smooth sprites and
- * background and the HD pack's art. */
+ * background and the HD pack's art. The Switch defaults to 2x: its screen
+ * is 720p (1080p docked), where 4x adds cost without visible detail. */
 static int s_hd_enabled = 1;
+#ifdef __SWITCH__
+static int s_hd_scale = 2;
+#else
 static int s_hd_scale = 4;
+#endif
 static int s_hd_sprites = kDkc2HdFilterSmooth;
 static int s_hd_background = kDkc2HdFilterSmooth;
 static int s_hd_art = 1;
@@ -157,6 +162,13 @@ void Dkc2LauncherSettingsDefault(RecompLauncherCSettings *settings) {
   settings->deadzone[0] = 24;
   settings->deadzone[1] = 24;
   settings->assist_tools = 0;
+#ifdef __SWITCH__
+  /* A 16:9 screen with no launcher: start the game straight away and fill
+   * it. The in-game menu still changes everything. */
+  settings->widescreen = 1;
+  settings->aspect_index = kDkc2VideoAspect16x9;
+  settings->skip_launcher = 1;
+#endif
   const int keyboard[kDkc2BindingCount] = {
       SDL_SCANCODE_UP, SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT,
       SDL_SCANCODE_RIGHT, SDL_SCANCODE_X, SDL_SCANCODE_Z,
