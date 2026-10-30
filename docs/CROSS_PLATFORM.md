@@ -148,10 +148,12 @@ Platform differences:
 - no POSIX crash-signal handler or machine report: Atmosphere records crashes.
 - `perf.log` in the data folder records, every 300 presented frames, the
   frame rate, the mean milliseconds of the recompiled CPU, PPU/HD drawing,
-  audio and presentation, and the GL renderer.
+  audio and presentation, the GL renderer and the HD composition path;
+  `stdout.log` and `stderr.log` beside it keep the console streams.
 
-The build boots on hardware (firmware 23.0.1) but runs too slowly; the
-perf log is being used to find where the time goes.
+The build boots on hardware (firmware 23.0.1) and holds 60 fps without HD
+(about 2 ms recompiled CPU and 3.6 ms drawing per frame at 1785 MHz). HD at
+2x/4x drops to 43-59 fps: drawing grows to 9-13 ms.
 
 ## Native acceptance required
 

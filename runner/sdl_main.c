@@ -73,13 +73,15 @@ typedef struct SwitchPerf {
   unsigned emulated, presented;
 } SwitchPerf;
 
-static void SwitchPerfOpen(SwitchPerf *perf, const char *backend) {
+static void SwitchPerfOpen(SwitchPerf *perf, const char *backend,
+                           bool hd_gpu) {
   memset(perf, 0, sizeof *perf);
   perf->file = fopen("perf.log", "w");
   if (!perf->file) return;
   const GLubyte *renderer = glGetString(GL_RENDERER);
-  fprintf(perf->file, "backend: %s\nrenderer: %s\n", backend,
-          renderer ? (const char *)renderer : "unknown");
+  fprintf(perf->file, "backend: %s\nrenderer: %s\nhd composition: %s\n",
+          backend, renderer ? (const char *)renderer : "unknown",
+          hd_gpu ? "gpu" : "cpu");
   fprintf(perf->file, "fps run_ms draw_ms audio_ms present_ms hd\n");
   fflush(perf->file);
   perf->frequency = SDL_GetPerformanceFrequency();
@@ -1393,7 +1395,7 @@ static int RunGame(const char *rom_path,
 #endif
 #ifdef __SWITCH__
   SwitchPerf perf;
-  SwitchPerfOpen(&perf, host.presenter.backend);
+  SwitchPerfOpen(&perf, host.presenter.backend, host.hd_gpu);
 #endif
   Dkc2DesktopFpsCounter fps_counter;
   uint64_t deadline = SDL_GetPerformanceCounter();
@@ -2073,6 +2075,9 @@ static int HostMain(int argc, char **argv) {
   (void)DKC2_MKDIR(kSwitchDataDirectory);
   if (chdir(kSwitchDataDirectory) != 0)
     fprintf(stderr, "warning: cannot enter %s\n", kSwitchDataDirectory);
+  /* Nothing shows the console streams; keep them beside perf.log. */
+  if (freopen("stdout.log", "w", stdout)) setvbuf(stdout, NULL, _IOLBF, 0);
+  (void)freopen("stderr.log", "w", stderr);
 #else
   (void)snesrecomp_anchor_to_exe_dir();
 #endif
