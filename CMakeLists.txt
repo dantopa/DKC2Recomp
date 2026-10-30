@@ -422,7 +422,7 @@ if(DKC2_BUILD_SNESRECOMP)
     if(APPLE)
         set_target_properties(dkc2_snesrecomp_sdl PROPERTIES
             MACOSX_BUNDLE TRUE
-            MACOSX_BUNDLE_BUNDLE_NAME "DKC2Recomp"
+            MACOSX_BUNDLE_BUNDLE_NAME "Donkey Kong Country 2 HD"
             MACOSX_BUNDLE_ICON_FILE "DKC2Recomp.icns"
             MACOSX_BUNDLE_GUI_IDENTIFIER "com.flat2vr.dkc2recomp"
             MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
@@ -465,7 +465,7 @@ if(DKC2_BUILD_SNESRECOMP)
         target_link_libraries(dkc2_snesrecomp_sdl PRIVATE dkc2_deko3d_shaders deko3d)
         target_link_libraries(dkc2_snesrecomp_sdl PRIVATE GLESv2 EGL glapi drm_nouveau nx)
         nx_generate_nacp(DKC2Recomp.nacp
-            NAME "DKC2Recomp"
+            NAME "Donkey Kong Country 2 HD"
             AUTHOR "Flat2VR"
             VERSION "${PROJECT_VERSION}")
         nx_create_nro(dkc2_snesrecomp_sdl NACP DKC2Recomp.nacp

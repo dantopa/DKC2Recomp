@@ -7,7 +7,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define DKC2_PRODUCT_TITLE "DKC2 Recomp Alpha Pre-Release"
+#define DKC2_PRODUCT_TITLE "Donkey Kong Country 2 HD"
 
 #ifdef __cplusplus
 extern "C" {

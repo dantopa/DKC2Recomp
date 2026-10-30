@@ -2,6 +2,20 @@
 
 ## Unreleased (fork: HD presentation)
 
+- The game is now titled "Donkey Kong Country 2 HD" (window, macOS menu
+  and bundle, Switch HOME menu); data folders keep the DKC2Recomp name.
+- HD pack art is read into memory behind a loading screen with a progress
+  bar whenever HD starts, so play never waits on storage (about 8 s for a
+  160 MB pack on the Switch at 1785 MHz). The Switch reads ahead only as an
+  application, with a 1 GB budget; past it, and in applet mode, art loads
+  on first sight as before. `perf.log` counts pack files read during play
+  (`hd_pack_reads`).
+- Switch: `perf.log` also records audio queue underruns, its lowest and
+  highest fill, clipped samples and the emulated frame rate; audio is now
+  queued before the frame is drawn.
+- The interpreter bridge skips its quiescence scan while the APU port
+  handshake is polling, which halved the slow recompiled-CPU frames on the
+  Switch (411 to 208 at 1020 MHz).
 - Switch: the game starts without the launcher, and a new configuration
   defaults to 16:9 with HD at 2x.
 - Switch: `--bench SECONDS [--hd S] [--aspect A] [--return APP.nro]`

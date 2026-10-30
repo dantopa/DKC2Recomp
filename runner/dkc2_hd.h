@@ -237,6 +237,19 @@ Dkc2Hd *Dkc2HdCreate(const Dkc2HdConfig *config, const uint8_t *rom,
                      size_t rom_size);
 void Dkc2HdDestroy(Dkc2Hd *hd);
 
+/* Reads a pack's play art ahead so play never waits on storage: create on
+ * the main thread, step on one other thread until a step returns false (all
+ * read, or budget bytes of pixels spent), then hand the art to a compositor
+ * on the same pack with Dkc2HdAdoptPack on the main thread. Art not read
+ * ahead loads on first sight. NULL without a pack or budget. */
+typedef struct Dkc2HdPackReader Dkc2HdPackReader;
+Dkc2HdPackReader *Dkc2HdPackReaderCreate(const char *pack_dir, size_t budget);
+bool Dkc2HdPackReaderStep(Dkc2HdPackReader *reader);
+/* Thousandths of the reading done, for the thread that steps. */
+unsigned Dkc2HdPackReaderProgress(const Dkc2HdPackReader *reader);
+void Dkc2HdAdoptPack(Dkc2Hd *hd, Dkc2HdPackReader *reader);
+void Dkc2HdPackReaderDestroy(Dkc2HdPackReader *reader);
+
 /* CPU time spent building scenes since the last Dkc2HdTakeTimings, in ticks
  * of the clock given to Dkc2HdSetClock (without one nothing is measured). */
 typedef struct Dkc2HdTimings {
@@ -246,6 +259,7 @@ typedef struct Dkc2HdTimings {
   uint64_t tiles;   /* tile quads */
   uint64_t sprites; /* sprite and loose-object quads */
   uint64_t load;    /* pack files read, part of the phases above */
+  uint64_t reads;   /* pack files read from storage (a count, not time) */
 } Dkc2HdTimings;
 void Dkc2HdSetClock(Dkc2Hd *hd, uint64_t (*now)(void));
 /* Copies the timings into *timings (zeros for a NULL hd) and clears them. */

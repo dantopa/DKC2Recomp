@@ -6900,3 +6900,42 @@ Pirate Panic route (frames 600, 1300, 2400, 3000, 3200, 3400, 3550) matches
 the CPU executor exactly (largest channel difference 1); the suite passes.
 The deko3d port compiles; it has not run on hardware yet. Uploads grow from
 about 1 MB to 1.8 MB per frame at 16:9.
+
+## 2026-10-30 - Switch audio counters, APU polls and the HD pack in memory
+
+Audio on the Switch broke up whenever emulation fell below 60 fps:
+`RtlRenderAudio` is tied to the emulated frame, so a slow frame is a short
+queue. `perf.log` now counts underruns (an empty queue after priming), the
+queue's lowest and highest fill and clipped samples, plus the emulated
+frame rate, and the frame's audio is queued before it is drawn. A skipped
+draw was tried and removed: `Dkc2DrawPpuFrame` also runs the per-line HDMA
+and the vblank OAM reload, and skipping it made sprites vanish, while the
+hardware runs showed no gain.
+
+Slow recompiled-CPU frames came from the SPC upload routines polling the
+APU ports mid-loop after a frame-deadline yield. Each poll bumps the
+continuous-read epoch, so the bridge's 64-entry quiescence scan could
+never match yet ran on every step; it now runs only when neither epoch has
+moved since the previous step, and the cooperative-loop detectors read
+their opcode bytes only when they can fire. On hardware: 411 slow runs to
+208 at 1020 MHz, 5-10 at 1785 MHz.
+
+The remaining HD dips lined up with pack art read from the SD card on
+first sight. A `Dkc2HdPackReader` lists the pack's play art (not screens or
+panoramas, which creation reads), a worker thread reads it within a byte
+budget, and `Dkc2HdAdoptPack` hands the images to the compositor, whose
+listing keeps each until a table asks for it. Images read on the worker
+get no id: the id sequence stays on the main thread, assigned on adoption.
+Reading during the intro left 150-260 ms hitches at the handover and
+competed with emulation at 1020 MHz, so the host now waits behind a
+progress bar whenever HD starts. The budget is 1 GB, and none in Switch
+applet mode.
+
+On hardware (1785 MHz, 160 MB pack): the loading screen takes about 8 s;
+`hd_pack_reads` is 0 in every window; HD 2x runs at 60 fps at 4:3 with no
+underruns and 59.7-60 at 16:9 with 5. At 1020 MHz HD still drops to 38-52
+fps with hundreds of underruns: interpreter slow runs and the HD scene's
+CPU cost remain. `hd_gpu_parity.py` passes against its golden frames with
+the pack they were made from; the golden frames predate the current pack.
+The six co-op integration tests fail with and without these changes.
+

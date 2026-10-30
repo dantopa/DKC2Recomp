@@ -77,6 +77,13 @@ typedef struct SwitchPerf {
   Dkc2HdTimings hd; /* scene building, within draw */
   unsigned emulated, presented;
   uint64_t draws, uploads, upload_bytes;
+  /* Audio queue, sampled as each emulated frame arrives: frames that found
+   * it empty after priming, its lowest and highest fill, and the mixed
+   * samples at full scale. */
+  unsigned audio_underruns;
+  double audio_fill_min_ms, audio_fill_max_ms;
+  bool audio_fill_seen;
+  uint64_t audio_clipped;
 } SwitchPerf;
 
 static void SwitchPerfOpen(SwitchPerf *perf, const char *backend,
@@ -95,7 +102,9 @@ static void SwitchPerfOpen(SwitchPerf *perf, const char *backend,
   fprintf(perf->file,
           "fps run_ms run_max_ms draw_ms ppu_ms scene_ms audio_ms present_ms hd "
           "draws uploads upload_kb hd_prepare_ms hd_pixels_ms hd_art_ms "
-          "hd_tiles_ms hd_sprites_ms hd_load_ms\n");
+          "hd_tiles_ms hd_sprites_ms hd_load_ms audio_underruns "
+          "audio_fill_min_ms audio_fill_max_ms audio_clipped emulated_fps "
+          "hd_pack_reads\n");
   fflush(perf->file);
   perf->frequency = SDL_GetPerformanceFrequency();
   perf->window_start = SDL_GetPerformanceCounter();
@@ -104,6 +113,20 @@ static void SwitchPerfOpen(SwitchPerf *perf, const char *backend,
 static double SwitchPerfMs(const SwitchPerf *perf, uint64_t ticks,
                            unsigned count) {
   return count ? 1000.0 * (double)ticks / (double)perf->frequency / count : 0.0;
+}
+
+static void SwitchPerfAudio(SwitchPerf *perf, const int16_t *samples,
+                            size_t sample_count, double queued_ms,
+                            bool primed) {
+  if (primed && queued_ms <= 0.0) perf->audio_underruns++;
+  if (!perf->audio_fill_seen || queued_ms < perf->audio_fill_min_ms)
+    perf->audio_fill_min_ms = queued_ms;
+  if (!perf->audio_fill_seen || queued_ms > perf->audio_fill_max_ms)
+    perf->audio_fill_max_ms = queued_ms;
+  perf->audio_fill_seen = true;
+  for (size_t i = 0; i < sample_count; i++)
+    if (samples[i] == INT16_MAX || samples[i] == INT16_MIN)
+      perf->audio_clipped++;
 }
 
 static void SwitchPerfPresented(SwitchPerf *perf, int hd_scale) {
@@ -119,10 +142,10 @@ static void SwitchPerfPresented(SwitchPerf *perf, int hd_scale) {
       (double)(now - perf->window_start) / (double)perf->frequency;
   /* GL work per presented frame. */
   const double frames = (double)perf->presented;
-  char line[256];
+  char line[320];
   (void)snprintf(line, sizeof line,
                  "%.1f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %d %.1f %.1f %.1f "
-                 "%.2f %.2f %.2f %.2f %.2f %.2f\n",
+                 "%.2f %.2f %.2f %.2f %.2f %.2f %u %.1f %.1f %llu %.1f %llu\n",
                  seconds > 0.0 ? perf->presented / seconds : 0.0,
                  SwitchPerfMs(perf, perf->run, perf->emulated),
                  SwitchPerfMs(perf, perf->run_max, 1),
@@ -138,7 +161,12 @@ static void SwitchPerfPresented(SwitchPerf *perf, int hd_scale) {
                  SwitchPerfMs(perf, perf->hd.art, perf->emulated),
                  SwitchPerfMs(perf, perf->hd.tiles, perf->emulated),
                  SwitchPerfMs(perf, perf->hd.sprites, perf->emulated),
-                 SwitchPerfMs(perf, perf->hd.load, perf->emulated));
+                 SwitchPerfMs(perf, perf->hd.load, perf->emulated),
+                 perf->audio_underruns, perf->audio_fill_min_ms,
+                 perf->audio_fill_max_ms,
+                 (unsigned long long)perf->audio_clipped,
+                 seconds > 0.0 ? perf->emulated / seconds : 0.0,
+                 (unsigned long long)perf->hd.reads);
   fputs(line, perf->file);
   fflush(perf->file);
   if (perf->echo) fputs(line, stdout);
@@ -283,6 +311,17 @@ static const double kAudioFillWeight = 0.02;
 static const double kDisplayLockTolerance = 0.02;
 static const double kDisplayTickTimeoutSeconds = 0.05;
 
+/* Flags shared with the HD pack worker thread. */
+#if SNESRECOMP_SDL3
+typedef SDL_AtomicInt HostAtomicInt;
+#define HostAtomicGet SDL_GetAtomicInt
+#define HostAtomicSet SDL_SetAtomicInt
+#else
+typedef SDL_atomic_t HostAtomicInt;
+#define HostAtomicGet SDL_AtomicGet
+#define HostAtomicSet SDL_AtomicSet
+#endif
+
 typedef struct SdlHost {
   Dkc2SdlPresenter presenter;
   Dkc2DesktopColorFilter color_filter;
@@ -324,6 +363,11 @@ typedef struct SdlHost {
    * of the last draw, or NULL to present the authentic frame in pixels. */
   Dkc2Hd *hd;
   Dkc2HdConfig hd_config;
+  /* The pack art a worker thread reads for hd behind the loading screen. */
+  Dkc2HdPackReader *hd_reader;
+  SDL_Thread *hd_reader_thread;
+  HostAtomicInt hd_reader_cancel, hd_reader_done;
+  HostAtomicInt hd_reader_progress; /* thousandths, for the loading bar */
   const char *hd_pack_dir; /* used while the HD art pack option is on */
   bool hd_environment;
   const uint8_t *rom;
@@ -981,7 +1025,94 @@ static uint32_t ApplyWindowsCommands(SdlHost *host,
 }
 #endif
 
+/* Pack art read while HD starts, so play never waits on storage. Applet
+ * mode on the console leaves too little memory for it. */
+static size_t HdPreloadBytes(void) {
+#ifdef __SWITCH__
+  if (appletGetAppletType() != AppletType_Application) return 0;
+#endif
+  return (size_t)1 << 30;
+}
+
+static int ReadHdPack(void *data) {
+  SdlHost *host = (SdlHost *)data;
+  while (!HostAtomicGet(&host->hd_reader_cancel) &&
+         Dkc2HdPackReaderStep(host->hd_reader))
+    HostAtomicSet(&host->hd_reader_progress,
+                  (int)Dkc2HdPackReaderProgress(host->hd_reader));
+  HostAtomicSet(&host->hd_reader_done, 1);
+  return 0;
+}
+
+/* Starts reading the new compositor's pack art on a worker thread. */
+static void StartHdPackRead(SdlHost *host) {
+  host->hd_reader =
+      Dkc2HdPackReaderCreate(host->hd_config.pack_dir, HdPreloadBytes());
+  if (!host->hd_reader) return;
+  HostAtomicSet(&host->hd_reader_cancel, 0);
+  HostAtomicSet(&host->hd_reader_done, 0);
+  HostAtomicSet(&host->hd_reader_progress, 0);
+  host->hd_reader_thread = SDL_CreateThread(ReadHdPack, "hd pack", host);
+  if (!host->hd_reader_thread) {
+    Dkc2HdPackReaderDestroy(host->hd_reader);
+    host->hd_reader = NULL;
+  }
+}
+
+/* Hands the art over once the worker is done, or drops it when cancel is
+ * set. */
+static void FinishHdPackRead(SdlHost *host, bool cancel) {
+  if (!host->hd_reader_thread) return;
+  if (cancel)
+    HostAtomicSet(&host->hd_reader_cancel, 1);
+  else if (!HostAtomicGet(&host->hd_reader_done))
+    return;
+  SDL_WaitThread(host->hd_reader_thread, NULL);
+  if (!cancel) Dkc2HdAdoptPack(host->hd, host->hd_reader);
+  Dkc2HdPackReaderDestroy(host->hd_reader);
+  host->hd_reader = NULL;
+  host->hd_reader_thread = NULL;
+}
+
+/* A progress bar across the middle of an otherwise black frame. */
+static void DrawLoadingBar(uint8_t *pixels, int width, int height,
+                           unsigned thousandths) {
+  const int left = width / 8, right = width - width / 8;
+  const int top = height / 2 - 4, bottom = height / 2 + 4;
+  const int filled = left + (int)((right - left) * (long)thousandths / 1000);
+  for (int y = 0; y < height; y++)
+    for (int x = 0; x < width; x++) {
+      const bool bar = y >= top && y < bottom && x >= left && x < right;
+      const uint32_t color = !bar ? 0xff000000u
+                             : x < filled ? 0xffffffffu
+                                          : 0xff404040u;
+      memcpy(&pixels[((size_t)y * (size_t)width + (size_t)x) * kBytesPerPixel],
+             &color, sizeof color);
+    }
+}
+
+/* Reads the compositor's whole pack behind a loading screen before the game
+ * goes on, so play never waits on storage. */
+static void LoadHdPack(SdlHost *host) {
+  StartHdPackRead(host);
+  const int width = Dkc2VideoWidth();
+  while (host->hd_reader_thread && !HostAtomicGet(&host->hd_reader_done)) {
+    PumpEvents(host);
+    if (!host->running) {
+      FinishHdPackRead(host, true);
+      return;
+    }
+    DrawLoadingBar(host->filtered_pixels, width, kFrameHeight,
+                   (unsigned)HostAtomicGet(&host->hd_reader_progress));
+    if (!Dkc2SdlPresenterPresent(&host->presenter, host->filtered_pixels,
+                                 width, kFrameHeight, NULL, NULL))
+      SDL_Delay(16);
+  }
+  FinishHdPackRead(host, false);
+}
+
 static void DestroyHd(SdlHost *host) {
+  FinishHdPackRead(host, true);
   if (!host->hd) return;
   PpuClearOverlayBindings(g_ppu);
   Dkc2HdDestroy(host->hd);
@@ -1015,6 +1146,7 @@ static void ReloadHdWhenAsked(SdlHost *host) {
   host->hd_reload = false;
   DestroyHd(host);
   host->hd = Dkc2HdCreate(&host->hd_config, host->rom, host->rom_size);
+  if (host->hd) LoadHdPack(host);
   if (host->hd)
     fprintf(stdout, "HD pack reloaded\n");
   else
@@ -1108,6 +1240,7 @@ static void UpdateHd(SdlHost *host) {
   if (!enabled) return;
   host->hd = Dkc2HdCreate(&config, host->rom, host->rom_size);
   if (host->hd) {
+    LoadHdPack(host);
     fprintf(stdout, "HD presentation: %dx\n", config.scale);
   } else {
     fprintf(stderr, "warning: HD presentation could not be initialized\n");
@@ -1643,6 +1776,7 @@ static int RunGame(const char *rom_path,
   if (host.hd_environment) {
     host.hd = Dkc2HdCreate(&host.hd_config, rom, rom_size);
     if (host.hd) {
+      LoadHdPack(&host);
       fprintf(stdout, "HD presentation: %dx\n", host.hd_config.scale);
     } else {
       ShowError("HD presentation could not be initialized");
@@ -1909,37 +2043,27 @@ static int RunGame(const char *rom_path,
               !Dkc2RewindHistoryPush(&rewind_history, rewind_scratch))
             rewind_available = false;
         }
-#ifdef __SWITCH__
-        const uint64_t perf_draw_start = SDL_GetPerformanceCounter();
-#endif
-        DrawFrame(&host);
-        frame_ready = true;
+        /* The frame's audio is queued before it is drawn, so a slow draw
+         * cannot hold back samples the queue is already waiting for. */
 #ifdef __SWITCH__
         const uint64_t perf_audio_start = SDL_GetPerformanceCounter();
-        perf.draw += perf_audio_start - perf_draw_start;
-        perf.ppu += host.perf_ppu_end - perf_draw_start;
-        Dkc2HdTimings hd_timings;
-        Dkc2HdTakeTimings(host.hd, &hd_timings);
-        perf.hd.prepare += hd_timings.prepare;
-        perf.hd.pixels += hd_timings.pixels;
-        perf.hd.art += hd_timings.art;
-        perf.hd.tiles += hd_timings.tiles;
-        perf.hd.sprites += hd_timings.sprites;
-        perf.hd.load += hd_timings.load;
-#endif
-#ifdef __APPLE__
-        emulate_seconds += (double)(SDL_GetPerformanceCounter() - emulate_start) /
-                           (double)frequency;
 #endif
         audio_fraction += (double)kAudioRate / kVideoRate;
         int audio_frames = (int)audio_fraction;
         audio_fraction -= audio_frames;
         RtlRenderAudio(frame_audio, audio_frames, kAudioChannels);
         Dkc2MusicMix(frame_audio, audio_frames, 32040);
+        const double queued_audio = AudioQueuedFrames(&host);
+#ifdef __SWITCH__
+        if (mode == kSdlSpeedNormal && host.audio_available)
+          SwitchPerfAudio(&perf, frame_audio,
+                          (size_t)audio_frames * kAudioChannels,
+                          1000.0 * queued_audio / kAudioRate,
+                          host.audio_primed);
+#endif
         if (mode == kSdlSpeedNormal) {
           host.audio_fill_average = Dkc2AudioFillAverage(
-              host.audio_fill_average, AudioQueuedFrames(&host),
-              kAudioFillWeight);
+              host.audio_fill_average, queued_audio, kAudioFillWeight);
           audio_ratio = host.audio_primed
               ? Dkc2AudioRateRatio(host.audio_fill_average,
                                    AudioTargetFrames(&host),
@@ -1951,8 +2075,28 @@ static int RunGame(const char *rom_path,
           }
         }
 #ifdef __SWITCH__
-        perf.audio += SDL_GetPerformanceCounter() - perf_audio_start;
+        const uint64_t perf_draw_start = SDL_GetPerformanceCounter();
+        perf.audio += perf_draw_start - perf_audio_start;
         perf.emulated++;
+#endif
+        DrawFrame(&host);
+        frame_ready = true;
+#ifdef __SWITCH__
+        perf.draw += SDL_GetPerformanceCounter() - perf_draw_start;
+        perf.ppu += host.perf_ppu_end - perf_draw_start;
+        Dkc2HdTimings hd_timings;
+        Dkc2HdTakeTimings(host.hd, &hd_timings);
+        perf.hd.prepare += hd_timings.prepare;
+        perf.hd.pixels += hd_timings.pixels;
+        perf.hd.art += hd_timings.art;
+        perf.hd.tiles += hd_timings.tiles;
+        perf.hd.sprites += hd_timings.sprites;
+        perf.hd.load += hd_timings.load;
+        perf.hd.reads += hd_timings.reads;
+#endif
+#ifdef __APPLE__
+        emulate_seconds += (double)(SDL_GetPerformanceCounter() - emulate_start) /
+                           (double)frequency;
 #endif
         if (test_frame_limit && host_frame >= test_frame_limit) {
           host.running = false;

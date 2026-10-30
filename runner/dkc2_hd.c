@@ -179,6 +179,29 @@ typedef struct SpriteState {
   int left, top, width, height;
 } SpriteState;
 
+typedef struct PackFile {
+  uint64_t hash; /* of the name */
+  /* Art a pack reader read ahead (Dkc2HdAdoptPack), until a table takes
+   * it; play then never waits on storage for it. */
+  HdImage *image;
+  bool asked; /* a table asked for it, so it is not adopted afterwards */
+} PackFile;
+
+/* A play art file read ahead; names longer than the loaders' are never
+ * asked for. */
+typedef struct PackRead {
+  char name[32];
+  HdImage *image;
+} PackRead;
+
+struct Dkc2HdPackReader {
+  char pack_dir[kPathMax];
+  PackRead *files;
+  size_t count, capacity;
+  size_t next;   /* the file the next step reads */
+  size_t budget; /* bytes of pixels left to read */
+};
+
 struct Dkc2Hd {
   int scale;
   Dkc2HdFilter filter;
@@ -189,9 +212,9 @@ struct Dkc2Hd {
   int tap_offset[kDkc2HdMaxScale];
   float tap_weight[kDkc2HdMaxScale][4];
   char pack_dir[kPathMax];
-  /* Name hash of every file in the pack directory, sorted: art is opened
+  /* Every file in the pack directory, sorted by name hash: art is opened
    * only when listed, so keys without art never reach the file system. */
-  uint64_t *pack_files;
+  PackFile *pack_files;
   size_t pack_file_count;
   char dump_dir[kPathMax];
   const uint8_t *rom;
@@ -569,6 +592,8 @@ void Dkc2HdDestroy(Dkc2Hd *hd) {
     free(hd->panoramas[i].art);
   free(hd->layer);
   free(hd->rows);
+  for (size_t i = 0; i < hd->pack_file_count; i++)
+    free(hd->pack_files[i].image);
   free(hd->pack_files);
   free(hd->learned);
   free(hd->output);
@@ -631,19 +656,33 @@ void Dkc2HdBeginFrame(Dkc2Hd *hd, Ppu *ppu, int frame_width) {
   PpuSetOverlayOamRange(ppu, 0, 128);
 }
 
-static HdImage *NewImage(int width, int height) {
+static uint64_t NextImageId(void) {
   static uint64_t last_id;
+  return ++last_id;
+}
+
+/* An image without an id: a pack reader's thread leaves it to the main
+ * thread, which owns the id sequence. */
+static HdImage *AllocImage(int width, int height) {
   HdImage *image = (HdImage *)malloc(
       sizeof(HdImage) + sizeof(uint32_t) * (size_t)width * (size_t)height);
   if (image) {
-    image->id = ++last_id;
+    image->id = 0;
     image->width = width;
     image->height = height;
   }
   return image;
 }
 
-static HdImage *LoadImage(const char *path) {
+static HdImage *NewImage(int width, int height) {
+  HdImage *image = AllocImage(width, height);
+  if (image)
+    image->id = NextImageId();
+  return image;
+}
+
+/* Reads a DKHD file into an image without an id. */
+static HdImage *ReadImage(const char *path) {
   FILE *file = fopen(path, "rb");
   if (!file)
     return NULL;
@@ -654,7 +693,7 @@ static HdImage *LoadImage(const char *path) {
     const int width = header[4] | header[5] << 8;
     const int height = header[6] | header[7] << 8;
     if (width > 0 && height > 0)
-      image = NewImage(width, height);
+      image = AllocImage(width, height);
     /* One read for the whole image, converted in place: art loads on first
      * sight during play, and per-pixel reads cost several times more (most
      * on the console's SD card). */
@@ -674,6 +713,13 @@ static HdImage *LoadImage(const char *path) {
   return image;
 }
 
+static HdImage *LoadImage(const char *path) {
+  HdImage *image = ReadImage(path);
+  if (image)
+    image->id = NextImageId();
+  return image;
+}
+
 static uint64_t NameHash(const char *name) {
   uint64_t hash = 14695981039346656037ull;
   for (; *name; name++)
@@ -681,54 +727,178 @@ static uint64_t NameHash(const char *name) {
   return hash;
 }
 
-static int CompareHash(const void *a, const void *b) {
-  const uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+static int ComparePackFile(const void *a, const void *b) {
+  const uint64_t x = ((const PackFile *)a)->hash,
+                 y = ((const PackFile *)b)->hash;
   return (x > y) - (x < y);
 }
 
-static bool AddPackFile(Dkc2Hd *hd, size_t *capacity, const char *name) {
+/* Art that play loads by name: screens and panoramas are read at creation
+ * anyway. */
+static bool PlayArt(const char *name) {
+  const size_t length = strlen(name);
+  return length > 5 && strcmp(name + length - 5, ".rgba") == 0 &&
+         strncmp(name, "s_", 2) != 0 && strncmp(name, "l_", 2) != 0;
+}
+
+typedef struct PackList {
+  Dkc2Hd *hd;
+  size_t capacity;
+} PackList;
+
+static bool AddPackFile(void *context, const char *name) {
+  PackList *list = (PackList *)context;
+  Dkc2Hd *hd = list->hd;
+  size_t *capacity = &list->capacity;
   if (hd->pack_file_count == *capacity) {
     const size_t grown = *capacity ? *capacity * 2 : 1024;
-    uint64_t *files =
-        (uint64_t *)realloc(hd->pack_files, grown * sizeof *files);
+    PackFile *files =
+        (PackFile *)realloc(hd->pack_files, grown * sizeof *files);
     if (!files)
       return false;
     hd->pack_files = files;
     *capacity = grown;
   }
-  hd->pack_files[hd->pack_file_count++] = NameHash(name);
+  PackFile *file = &hd->pack_files[hd->pack_file_count++];
+  file->hash = NameHash(name);
+  file->image = NULL;
+  file->asked = false;
   return true;
+}
+
+/* Calls add with each name in directory; a missing directory has none.
+ * False once add fails (out of memory). */
+static bool ListDirectory(const char *directory_path,
+                          bool (*add)(void *context, const char *name),
+                          void *context) {
+  bool ok = true;
+#ifdef _WIN32
+  char pattern[kPathMax + 4];
+  snprintf(pattern, sizeof pattern, "%s/*", directory_path);
+  struct _finddata_t entry;
+  const intptr_t find = _findfirst(pattern, &entry);
+  if (find != -1) {
+    do
+      ok = add(context, entry.name);
+    while (ok && _findnext(find, &entry) == 0);
+    _findclose(find);
+  }
+#else
+  DIR *directory = opendir(directory_path);
+  if (directory) {
+    const struct dirent *entry;
+    while (ok && (entry = readdir(directory)) != NULL)
+      ok = add(context, entry->d_name);
+    closedir(directory);
+  }
+#endif
+  return ok;
 }
 
 /* Lists the pack directory once. A missing directory lists nothing, which
  * loads no art, as opening each file would. False when out of memory. */
 static bool ListPack(Dkc2Hd *hd) {
-  size_t capacity = 0;
-  bool ok = true;
-#ifdef _WIN32
-  char pattern[kPathMax + 4];
-  snprintf(pattern, sizeof pattern, "%s/*", hd->pack_dir);
-  struct _finddata_t entry;
-  const intptr_t find = _findfirst(pattern, &entry);
-  if (find != -1) {
-    do
-      ok = AddPackFile(hd, &capacity, entry.name);
-    while (ok && _findnext(find, &entry) == 0);
-    _findclose(find);
-  }
-#else
-  DIR *directory = opendir(hd->pack_dir);
-  if (directory) {
-    const struct dirent *entry;
-    while (ok && (entry = readdir(directory)) != NULL)
-      ok = AddPackFile(hd, &capacity, entry->d_name);
-    closedir(directory);
-  }
-#endif
+  PackList list = {hd, 0};
+  const bool ok = ListDirectory(hd->pack_dir, AddPackFile, &list);
   if (hd->pack_file_count)
     qsort(hd->pack_files, hd->pack_file_count, sizeof *hd->pack_files,
-          CompareHash);
+          ComparePackFile);
   return ok;
+}
+
+static bool AddPackRead(void *context, const char *name) {
+  Dkc2HdPackReader *reader = (Dkc2HdPackReader *)context;
+  if (!PlayArt(name) || strlen(name) >= sizeof reader->files->name)
+    return true;
+  if (reader->count == reader->capacity) {
+    const size_t grown = reader->capacity ? reader->capacity * 2 : 1024;
+    PackRead *files =
+        (PackRead *)realloc(reader->files, grown * sizeof *files);
+    if (!files)
+      return false;
+    reader->files = files;
+    reader->capacity = grown;
+  }
+  PackRead *file = &reader->files[reader->count++];
+  memcpy(file->name, name, strlen(name) + 1);
+  file->image = NULL;
+  return true;
+}
+
+Dkc2HdPackReader *Dkc2HdPackReaderCreate(const char *pack_dir,
+                                         size_t budget) {
+  if (!pack_dir || !*pack_dir || !budget)
+    return NULL;
+  Dkc2HdPackReader *reader =
+      (Dkc2HdPackReader *)calloc(1, sizeof *reader);
+  if (!reader)
+    return NULL;
+  if (!CopyPath(reader->pack_dir, pack_dir) ||
+      !ListDirectory(reader->pack_dir, AddPackRead, reader)) {
+    Dkc2HdPackReaderDestroy(reader);
+    return NULL;
+  }
+  reader->budget = budget;
+  return reader;
+}
+
+bool Dkc2HdPackReaderStep(Dkc2HdPackReader *reader) {
+  if (reader->next >= reader->count || !reader->budget)
+    return false;
+  PackRead *file = &reader->files[reader->next++];
+  char path[kPathMax + 32];
+  snprintf(path, sizeof path, "%s/%s", reader->pack_dir, file->name);
+  HdImage *image = ReadImage(path);
+  const size_t bytes =
+      image ? sizeof(uint32_t) * (size_t)image->width * (size_t)image->height
+            : 0;
+  if (bytes > reader->budget) {
+    /* Past the budget the rest loads on first sight. */
+    free(image);
+    reader->budget = 0;
+    return false;
+  }
+  reader->budget -= bytes;
+  file->image = image;
+  return true;
+}
+
+unsigned Dkc2HdPackReaderProgress(const Dkc2HdPackReader *reader) {
+  return reader->count && reader->budget
+             ? (unsigned)(reader->next * 1000u / reader->count)
+             : 1000u;
+}
+
+void Dkc2HdAdoptPack(Dkc2Hd *hd, Dkc2HdPackReader *reader) {
+  const bool same_pack = hd && strcmp(hd->pack_dir, reader->pack_dir) == 0;
+  for (size_t i = 0; i < reader->count; i++) {
+    PackRead *read = &reader->files[i];
+    if (!read->image)
+      continue;
+    const PackFile key = {NameHash(read->name), NULL, false};
+    PackFile *file =
+        same_pack && hd->pack_file_count
+            ? (PackFile *)bsearch(&key, hd->pack_files, hd->pack_file_count,
+                                  sizeof *hd->pack_files, ComparePackFile)
+            : NULL;
+    /* Art play already loaded keeps its first copy. */
+    if (file && !file->asked && !file->image) {
+      file->image = read->image;
+      file->image->id = NextImageId();
+    } else {
+      free(read->image);
+    }
+    read->image = NULL;
+  }
+}
+
+void Dkc2HdPackReaderDestroy(Dkc2HdPackReader *reader) {
+  if (!reader)
+    return;
+  for (size_t i = 0; i < reader->count; i++)
+    free(reader->files[i].image);
+  free(reader->files);
+  free(reader);
 }
 
 static uint64_t Now(const Dkc2Hd *hd) {
@@ -742,18 +912,29 @@ static uint64_t Lap(const Dkc2Hd *hd, uint64_t *phase, uint64_t start) {
   return now;
 }
 
-/* Pack file `name`, read only when the pack listing has it. */
+/* Pack file `name`, handed over from a pack reader, else read when the pack
+ * listing has it. The caller keeps it: each name is asked for once. */
 static HdImage *LoadPackImage(Dkc2Hd *hd, const char *name) {
-  const uint64_t hash = NameHash(name);
-  if (!hd->pack_file_count ||
-      !bsearch(&hash, hd->pack_files, hd->pack_file_count,
-               sizeof *hd->pack_files, CompareHash))
+  const PackFile key = {NameHash(name), NULL, false};
+  PackFile *file =
+      hd->pack_file_count
+          ? (PackFile *)bsearch(&key, hd->pack_files, hd->pack_file_count,
+                                sizeof *hd->pack_files, ComparePackFile)
+          : NULL;
+  if (!file)
     return NULL;
+  file->asked = true;
+  HdImage *image = file->image;
+  if (image) {
+    file->image = NULL;
+    return image;
+  }
   char path[kPathMax + 32];
   snprintf(path, sizeof path, "%s/%s", hd->pack_dir, name);
   const uint64_t start = Now(hd);
-  HdImage *image = LoadImage(path);
+  image = LoadImage(path);
   (void)Lap(hd, &hd->timings.load, start);
+  hd->timings.reads++;
   return image;
 }
 
