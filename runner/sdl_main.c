@@ -79,12 +79,13 @@ typedef struct SwitchPerf {
 } SwitchPerf;
 
 static void SwitchPerfOpen(SwitchPerf *perf, const char *backend,
-                           bool hd_gpu, bool echo) {
+                           bool gl, bool hd_gpu, bool echo) {
   memset(perf, 0, sizeof *perf);
   perf->file = fopen("perf.log", "w");
   if (!perf->file) return;
   perf->echo = echo;
-  const GLubyte *renderer = glGetString(GL_RENDERER);
+  /* deko3d leaves no OpenGL context to ask. */
+  const GLubyte *renderer = gl ? glGetString(GL_RENDERER) : NULL;
   fprintf(perf->file, "backend: %s\nrenderer: %s\nhd composition: %s\n",
           backend, renderer ? (const char *)renderer : "unknown",
           hd_gpu ? "gpu" : "cpu");
@@ -1527,7 +1528,8 @@ static int RunGame(const char *rom_path,
 #endif
 #ifdef __SWITCH__
   SwitchPerf perf;
-  SwitchPerfOpen(&perf, host.presenter.backend, host.hd_gpu,
+  SwitchPerfOpen(&perf, host.presenter.backend,
+                 host.presenter.gl_context != NULL, host.hd_gpu,
                  test_frame_limit != 0);
 #endif
   Dkc2DesktopFpsCounter fps_counter;

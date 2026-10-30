@@ -373,7 +373,12 @@ recomp-ui launcher as the Win32 host. The 4:3 viewport calculation and launcher
 settings/ROM-cache persistence are project-owned host-neutral modules rather
 than duplicated platform behavior. The portable presenter requests an OpenGL
 2.1 compatibility context so the game and recomp-ui overlay share one
-deterministic swap boundary. Its visible context requests SDL swap interval
+deterministic swap boundary. On the Switch the same presenter entry points
+can delegate to a deko3d renderer instead (`runner/switch_present_deko3d.c`,
+selected by `DKC2_RENDERER=deko3d`): it owns the console's window, presents
+and composes HD scenes with the OpenGL presenter's passes ported to GLSL 460,
+and has no OpenGL context, so the overlay stays uninitialized there until it
+gains a deko3d drawer. Its visible context requests SDL swap interval
 one on Windows and reports the accepted state through the same diagnostic
 backend field; hidden automation disables the interval. Visible macOS instead
 uses interval zero and paces on the display itself. The window's display link

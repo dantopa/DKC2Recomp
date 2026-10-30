@@ -475,6 +475,10 @@ Dkc2Deko3d *Dkc2Deko3dCreate(Dkc2SdlPresenterGlStats *stats, char *error,
   queue_maker.flags = DkQueueFlags_Graphics;
   deko->queue = dkQueueCreate(&queue_maker);
   if (!deko->cmdbuf || !deko->queue) goto fail;
+  /* The caller's error buffer is only for creation; later reports go to
+   * stderr alone. */
+  deko->error = NULL;
+  deko->error_capacity = 0;
   return deko;
 
 fail:
