@@ -56,7 +56,6 @@
 
 #ifdef __SWITCH__
 #include <SDL_opengl.h>
-#include <netinet/in.h>
 #include <pthread.h>
 #include <switch.h>
 #include <unistd.h>
@@ -126,42 +125,59 @@ static void SwitchPerfPresented(SwitchPerf *perf, int hd_scale) {
   perf->window_start = now;
 }
 
-/* nxlink passes arguments, but the console has no environment to set.
+/* Launchers pass arguments, but the console has no environment to set.
  * --bench N replays the route in bench.input for N seconds without the
- * launcher or saves, then quits; --hd S runs it at HD scale S (0: HD off). */
+ * launcher or saves, then quits; --hd S runs it at HD scale S (0: HD off),
+ * --aspect A at aspect A (as DKC2_ASPECT), and --return P loads the
+ * homebrew P instead of the menu afterwards. */
 enum { kSwitchBenchMaxSeconds = 10000 };
 
 typedef struct SwitchBench {
-  unsigned seconds; /* 0 without --bench */
-  int hd_scale;     /* -1 to keep the saved HD options */
+  unsigned seconds;        /* 0 without --bench */
+  int hd_scale;            /* -1 to keep the saved HD options */
+  const char *aspect;      /* NULL to keep the saved aspect */
+  const char *return_path; /* NULL to return to the menu */
 } SwitchBench;
 
+static bool SwitchParseNumber(const char *text, long min, long max,
+                              long *value) {
+  char *end = NULL;
+  *value = strtol(text, &end, 10);
+  return end && !*end && *value >= min && *value <= max;
+}
+
 static bool SwitchParseBench(int *argc, char **argv, SwitchBench *bench) {
-  bench->seconds = 0;
-  bench->hd_scale = -1;
+  *bench = (SwitchBench){0, -1, NULL, NULL};
   int kept = 1;
   for (int i = 1; i < *argc; i++) {
-    const bool seconds = strcmp(argv[i], "--bench") == 0;
-    if (!seconds && strcmp(argv[i], "--hd") != 0) {
+    const char *option = argv[i];
+    if (strcmp(option, "--bench") != 0 && strcmp(option, "--hd") != 0 &&
+        strcmp(option, "--aspect") != 0 && strcmp(option, "--return") != 0) {
       argv[kept++] = argv[i];
       continue;
     }
     if (++i == *argc) return false;
-    char *end = NULL;
-    const long value = strtol(argv[i], &end, 10);
-    if (!end || *end) return false;
-    if (seconds) {
-      if (value < 1 || value > kSwitchBenchMaxSeconds) return false;
+    const char *text = argv[i];
+    long value = 0;
+    if (strcmp(option, "--bench") == 0) {
+      if (!SwitchParseNumber(text, 1, kSwitchBenchMaxSeconds, &value))
+        return false;
       bench->seconds = (unsigned)value;
-    } else {
-      if (value != 0 && (value < kDkc2HdMinScale || value > kDkc2HdMaxScale))
+    } else if (strcmp(option, "--hd") == 0) {
+      if (!SwitchParseNumber(text, 0, kDkc2HdMaxScale, &value) ||
+          (value != 0 && value < kDkc2HdMinScale))
         return false;
       bench->hd_scale = (int)value;
+    } else if (strcmp(option, "--aspect") == 0) {
+      bench->aspect = text;
+    } else {
+      bench->return_path = text;
     }
   }
   *argc = kept;
-  /* --hd alone would be saved into the options. */
-  return bench->hd_scale < 0 || bench->seconds;
+  /* Without --bench the overrides would be saved into the options. */
+  return bench->seconds || (bench->hd_scale < 0 && !bench->aspect &&
+                            !bench->return_path);
 }
 
 /* Maps the bench onto the desktop test controls and the in-memory HD
@@ -173,6 +189,7 @@ static void SwitchApplyBench(const SwitchBench *bench) {
   (void)setenv("SNESRECOMP_NO_LAUNCHER", "1", 1);
   (void)setenv("DKC2_DESKTOP_DISABLE_SRAM", "1", 1);
   (void)setenv("SNESRECOMP_INPUT_PLAY", "bench.input", 1);
+  if (bench->aspect) (void)setenv("DKC2_ASPECT", bench->aspect, 1);
   if (bench->hd_scale < 0) return;
   Dkc2LauncherSetHdEnabled(bench->hd_scale != 0);
   if (bench->hd_scale) Dkc2LauncherSetHdScale(bench->hd_scale);
@@ -2120,7 +2137,9 @@ static int HostMain(int argc, char **argv) {
 #ifdef __SWITCH__
   SwitchBench bench;
   if (!SwitchParseBench(&argc, argv, &bench)) {
-    fprintf(stderr, "Usage: %s [--bench SECONDS [--hd 0|2-8]] [ROM.smc]\n",
+    fprintf(stderr,
+            "Usage: %s [--bench SECONDS [--hd 0|2-8] [--aspect 4:3|16:10|"
+            "16:9|21:9] [--return APP.nro]] [ROM.smc]\n",
             argv[0]);
     return 2;
   }
@@ -2156,16 +2175,9 @@ static int HostMain(int argc, char **argv) {
   (void)DKC2_MKDIR(kSwitchDataDirectory);
   if (chdir(kSwitchDataDirectory) != 0)
     fprintf(stderr, "warning: cannot enter %s\n", kSwitchDataDirectory);
-  /* Launched by nxlink -s, the streams go to the host; otherwise nothing
-   * shows them, so they are kept beside perf.log. */
-  const bool nxlink_stdio = __nxlink_host.s_addr != 0 &&
-                            R_SUCCEEDED(socketInitializeDefault()) &&
-                            nxlinkStdio() >= 0;
-  if (!nxlink_stdio) {
-    (void)freopen("stdout.log", "w", stdout);
-    (void)freopen("stderr.log", "w", stderr);
-  }
-  setvbuf(stdout, NULL, _IOLBF, 0);
+  /* Nothing shows the console streams; keep them beside perf.log. */
+  if (freopen("stdout.log", "w", stdout)) setvbuf(stdout, NULL, _IOLBF, 0);
+  (void)freopen("stderr.log", "w", stderr);
 #else
   (void)snesrecomp_anchor_to_exe_dir();
 #endif
@@ -2185,6 +2197,10 @@ static int HostMain(int argc, char **argv) {
     SwitchApplyBench(&bench);
     const int result = RunGame(rom_path, &settings);
     fprintf(stdout, "bench: done result=%d\n", result);
+    if (bench.return_path &&
+        (!envHasNextLoad() ||
+         R_FAILED(envSetNextLoad(bench.return_path, bench.return_path))))
+      fprintf(stderr, "warning: cannot return to %s\n", bench.return_path);
     fflush(stdout);
     return result;
   }

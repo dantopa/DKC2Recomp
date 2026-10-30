@@ -6779,3 +6779,10 @@ and unidentifiable boxes. 13 clean Diddy poses (standing, blowing gum) and
 Diddy frames cut (overlap 0.90); for Dixie the model changed three poses
 and the cut rejected them, so 2 entered. The installed list now holds 69
 frames.
+
+The bench gained `--aspect` (to compare with the 4:3 runs) and `--return`,
+which calls libnx `envSetNextLoad` so the homebrew loader starts a test
+runner instead of the menu. Over nxlink `-s` the bench sent nothing in
+150 s while the game ran; since the runner reads the SD card, the streams
+now always go to `stdout.log` and `stderr.log` and the nxlink redirection
+is gone.

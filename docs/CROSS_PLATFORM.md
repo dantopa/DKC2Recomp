@@ -162,18 +162,15 @@ Platform differences:
   frame rate, the mean milliseconds of the recompiled CPU, drawing (split
   into the PPU frame and the HD scene), audio and presentation, the GL
   renderer and the HD composition path; `stdout.log` and `stderr.log` beside
-  it keep the console streams, unless nxlink started the app with `-s`, which
-  receives them instead.
+  it keep the console streams.
 
-Benchmark: `--bench SECONDS [--hd 0|2-8]` starts without the launcher,
-replays the route recorded in `bench.input` in the data folder, echoes the
-`perf.log` lines to stdout, prints `bench: done result=N` and quits. `--hd`
-sets the HD scale for that run only (0 turns HD off); saves and options are
-not written. From the computer:
-
-```sh
-nxlink -a <switch-ip> -s DKC2Recomp.nro --bench 60 --hd 2
-```
+Benchmark: `--bench SECONDS [--hd 0|2-8] [--aspect 4:3|16:10|16:9|21:9]
+[--return APP.nro]` starts without the launcher, replays the route recorded
+in `bench.input` in the data folder, writes the `perf.log` lines to
+`stdout.log` too, ends it with `bench: done result=N` and quits. `--hd` and
+`--aspect` apply to that run only (`--hd 0` turns HD off); saves and
+options are not written. `--return` asks the homebrew loader to start that
+`.nro` next instead of the menu.
 
 The build boots on hardware (firmware 23.0.1) and holds 60 fps without HD
 (about 2 ms recompiled CPU and 3.6 ms drawing per frame at 1785 MHz). HD at
