@@ -6770,3 +6770,12 @@ the private pack (none replaced; list in
 rope ladder and two coin frames were rejected by the cut. The Pirate Panic
 route runs through with the pack; these graphics appear elsewhere, so they
 are not yet seen in play.
+
+The 93 missing Kong frames were mostly not worth sending: loose sprite
+pieces, Dixie poses seen with Diddy's palette and the reverse, Diddy with
+the cap apart and no face (a missing sprite part the model would invent),
+and unidentifiable boxes. 13 clean Diddy poses (standing, blowing gum) and
+5 Dixie poses went in a second batch with the approved references. All 13
+Diddy frames cut (overlap 0.90); for Dixie the model changed three poses
+and the cut rejected them, so 2 entered. The installed list now holds 69
+frames.
