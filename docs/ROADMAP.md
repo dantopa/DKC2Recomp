@@ -143,6 +143,9 @@
 - [ ] Run the experimental Switch homebrew build on hardware: boot and 60 fps
       native are confirmed; check audio, Joy-Con/Pro Controller input and
       saves, and bring HD 2x to a steady 60 fps (measure with `--bench`).
+- [ ] Switch deko3d renderer: bench it against OpenGL (`--renderer`,
+      `--shot`), draw the in-game menu with it, then make it the Switch
+      default.
 - [x] Create and locally validate the native Apple-silicon application bundle,
       AppKit menu/icon, bundled SDL2, Application Support persistence, and
       ad-hoc signing verification.

@@ -446,6 +446,23 @@ if(DKC2_BUILD_SNESRECOMP)
             LNG_GLES2=1
             IMGUI_IMPL_OPENGL_ES2=1
             IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
+        # The deko3d renderer (switch_present_deko3d.c, --renderer deko3d):
+        # its GLSL is compiled with uam and embedded in the executable.
+        enable_language(ASM)
+        set(_dkc2_deko3d_shaders "")
+        foreach(_dkc2_shader rect_vsh:vert flat_fsh:frag hd_upscale_fsh:frag
+                hd_quad_fsh:frag hd_composite_fsh:frag)
+            string(REPLACE ":" ";" _dkc2_shader "${_dkc2_shader}")
+            list(GET _dkc2_shader 0 _dkc2_shader_name)
+            list(GET _dkc2_shader 1 _dkc2_shader_stage)
+            nx_add_shader_program(dkc2_${_dkc2_shader_name}
+                runner/switch_shaders/${_dkc2_shader_name}.glsl ${_dkc2_shader_stage}
+                OUTPUT ${_dkc2_shader_name}.dksh)
+            list(APPEND _dkc2_deko3d_shaders dkc2_${_dkc2_shader_name})
+        endforeach()
+        dkp_add_embedded_binary_library(dkc2_deko3d_shaders ${_dkc2_deko3d_shaders})
+        target_sources(dkc2_snesrecomp_sdl PRIVATE runner/switch_present_deko3d.c)
+        target_link_libraries(dkc2_snesrecomp_sdl PRIVATE dkc2_deko3d_shaders deko3d)
         target_link_libraries(dkc2_snesrecomp_sdl PRIVATE GLESv2 EGL glapi drm_nouveau nx)
         nx_generate_nacp(DKC2Recomp.nacp
             NAME "DKC2Recomp"

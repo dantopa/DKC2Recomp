@@ -8,6 +8,11 @@
   replays `bench.input` and writes the per-stage timings (drawing now split
   into PPU frame and HD scene) to `stdout.log`; the `.nro` and `.nsp` carry
   an original icon in every HOME menu language.
+- Switch: an experimental deko3d renderer for the bench
+  (`--renderer deko3d`): flat presentation and the HD composition on the
+  console's native graphics API, without the in-game menu yet. `--shot`
+  saves chosen frames to compare it with OpenGL, and `perf.log` adds the
+  slowest recompiled-CPU frame of each window (`run_max_ms`).
 - Switch: `perf.log` also counts GL draw calls, texture uploads and
   uploaded kilobytes per frame; after a vsynced swap the loop no longer
   waits again on the 60.0988 Hz host clock. The HD quad passes look up

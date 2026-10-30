@@ -122,6 +122,11 @@ typedef struct Dkc2SdlPresenter {
   Dkc2GlHdImage hd_images[kDkc2HdImageSlots]; /* id 0: free slot */
   unsigned int hd_image_count;
   char hd_error[160];
+#ifdef __SWITCH__
+  /* The deko3d renderer (switch_present_deko3d.h), when it replaces
+   * OpenGL: window and gl_context stay NULL. */
+  struct Dkc2Deko3d *deko3d;
+#endif
 } Dkc2SdlPresenter;
 
 typedef void (*Dkc2SdlOverlayDraw)(void *user, int width, int height);

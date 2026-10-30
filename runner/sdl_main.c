@@ -73,6 +73,7 @@ typedef struct SwitchPerf {
   uint64_t frequency;
   uint64_t window_start;
   uint64_t run, draw, ppu, audio, present;
+  uint64_t run_max; /* the slowest single frame of the recompiled CPU */
   unsigned emulated, presented;
   uint64_t draws, uploads, upload_bytes;
 } SwitchPerf;
@@ -88,7 +89,7 @@ static void SwitchPerfOpen(SwitchPerf *perf, const char *backend,
           backend, renderer ? (const char *)renderer : "unknown",
           hd_gpu ? "gpu" : "cpu");
   fprintf(perf->file,
-          "fps run_ms draw_ms ppu_ms scene_ms audio_ms present_ms hd "
+          "fps run_ms run_max_ms draw_ms ppu_ms scene_ms audio_ms present_ms hd "
           "draws uploads upload_kb\n");
   fflush(perf->file);
   perf->frequency = SDL_GetPerformanceFrequency();
@@ -115,9 +116,10 @@ static void SwitchPerfPresented(SwitchPerf *perf, int hd_scale) {
   const double frames = (double)perf->presented;
   char line[160];
   (void)snprintf(line, sizeof line,
-                 "%.1f %.2f %.2f %.2f %.2f %.2f %.2f %d %.1f %.1f %.1f\n",
+                 "%.1f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %d %.1f %.1f %.1f\n",
                  seconds > 0.0 ? perf->presented / seconds : 0.0,
                  SwitchPerfMs(perf, perf->run, perf->emulated),
+                 SwitchPerfMs(perf, perf->run_max, 1),
                  SwitchPerfMs(perf, perf->draw, perf->emulated),
                  SwitchPerfMs(perf, perf->ppu, perf->emulated),
                  SwitchPerfMs(perf, perf->draw - perf->ppu, perf->emulated),
@@ -141,14 +143,18 @@ static void SwitchPerfPresented(SwitchPerf *perf, int hd_scale) {
 /* Launchers pass arguments, but the console has no environment to set.
  * --bench N replays the route in bench.input for N seconds without the
  * launcher or saves, then quits; --hd S runs it at HD scale S (0: HD off),
- * --aspect A at aspect A (as DKC2_ASPECT), and --return P loads the
- * homebrew P instead of the menu afterwards. */
+ * --aspect A at aspect A (as DKC2_ASPECT), --renderer R draws with R (gl
+ * or deko3d), --shot F1,F2,... writes the presented frames F1, F2, ... to
+ * shot-R-F.ppm, and --return P loads the homebrew P instead of the menu
+ * afterwards. */
 enum { kSwitchBenchMaxSeconds = 10000 };
 
 typedef struct SwitchBench {
   unsigned seconds;        /* 0 without --bench */
   int hd_scale;            /* -1 to keep the saved HD options */
   const char *aspect;      /* NULL to keep the saved aspect */
+  const char *renderer;    /* "gl" or "deko3d" */
+  const char *shots;       /* frame numbers separated by commas, or NULL */
   const char *return_path; /* NULL to return to the menu */
 } SwitchBench;
 
@@ -160,12 +166,13 @@ static bool SwitchParseNumber(const char *text, long min, long max,
 }
 
 static bool SwitchParseBench(int *argc, char **argv, SwitchBench *bench) {
-  *bench = (SwitchBench){0, -1, NULL, NULL};
+  *bench = (SwitchBench){0, -1, NULL, "gl", NULL, NULL};
   int kept = 1;
   for (int i = 1; i < *argc; i++) {
     const char *option = argv[i];
     if (strcmp(option, "--bench") != 0 && strcmp(option, "--hd") != 0 &&
-        strcmp(option, "--aspect") != 0 && strcmp(option, "--return") != 0) {
+        strcmp(option, "--aspect") != 0 && strcmp(option, "--renderer") != 0 &&
+        strcmp(option, "--shot") != 0 && strcmp(option, "--return") != 0) {
       argv[kept++] = argv[i];
       continue;
     }
@@ -183,14 +190,23 @@ static bool SwitchParseBench(int *argc, char **argv, SwitchBench *bench) {
       bench->hd_scale = (int)value;
     } else if (strcmp(option, "--aspect") == 0) {
       bench->aspect = text;
+    } else if (strcmp(option, "--renderer") == 0) {
+      if (strcmp(text, "gl") != 0 && strcmp(text, "deko3d") != 0)
+        return false;
+      bench->renderer = text;
+    } else if (strcmp(option, "--shot") == 0) {
+      if (!*text || strspn(text, "0123456789,") != strlen(text)) return false;
+      bench->shots = text;
     } else {
       bench->return_path = text;
     }
   }
   *argc = kept;
   /* Without --bench the overrides would be saved into the options. */
-  return bench->seconds || (bench->hd_scale < 0 && !bench->aspect &&
-                            !bench->return_path);
+  return bench->seconds ||
+         (bench->hd_scale < 0 && !bench->aspect &&
+          strcmp(bench->renderer, "gl") == 0 && !bench->shots &&
+          !bench->return_path);
 }
 
 /* Maps the bench onto the desktop test controls and the in-memory HD
@@ -203,6 +219,18 @@ static void SwitchApplyBench(const SwitchBench *bench) {
   (void)setenv("DKC2_DESKTOP_DISABLE_SRAM", "1", 1);
   (void)setenv("SNESRECOMP_INPUT_PLAY", "bench.input", 1);
   if (bench->aspect) (void)setenv("DKC2_ASPECT", bench->aspect, 1);
+  (void)setenv("DKC2_RENDERER", bench->renderer, 1);
+  if (bench->shots) {
+    /* One frame names its file itself; several get "-<frame>" added. */
+    char path[64];
+    if (strchr(bench->shots, ','))
+      (void)snprintf(path, sizeof path, "shot-%s.ppm", bench->renderer);
+    else
+      (void)snprintf(path, sizeof path, "shot-%s-%s.ppm", bench->renderer,
+                     bench->shots);
+    (void)setenv("DKC2_DESKTOP_SCREENSHOT", path, 1);
+    (void)setenv("DKC2_DESKTOP_SCREENSHOT_FRAME", bench->shots, 1);
+  }
   if (bench->hd_scale < 0) return;
   Dkc2LauncherSetHdEnabled(bench->hd_scale != 0);
   if (bench->hd_scale) Dkc2LauncherSetHdScale(bench->hd_scale);
@@ -1391,9 +1419,12 @@ static int RunGame(const char *rom_path,
       fprintf(stderr, "warning: %s; using flat\n", host.presenter.crt_error);
   }
   host.overlay = Dkc2DesktopOverlayCreate(settings);
+  /* The Switch deko3d renderer has no OpenGL context for the overlay: it
+   * runs without the in-game menu, which stays closed. */
   if (!host.overlay ||
-      !Dkc2DesktopOverlayInitSdl(
-          host.overlay, host.presenter.window, host.presenter.gl_context)) {
+      (host.presenter.gl_context &&
+       !Dkc2DesktopOverlayInitSdl(
+           host.overlay, host.presenter.window, host.presenter.gl_context))) {
     free(rom);
     ShutdownHost(&host);
     ShowError("Unable to initialize the in-game overlay");
@@ -1836,7 +1867,9 @@ static int RunGame(const char *rom_path,
 #endif
         (void)RtlRunFrame(controls.controller);
 #ifdef __SWITCH__
-        perf.run += SDL_GetPerformanceCounter() - perf_run_start;
+        const uint64_t perf_run = SDL_GetPerformanceCounter() - perf_run_start;
+        perf.run += perf_run;
+        if (perf_run > perf.run_max) perf.run_max = perf_run;
 #endif
         PulseHaptics(&host, Dkc2CoopTakeStompEvents(), false);
         if (g_fail || !Dkc2LastLleResult()) {
@@ -2161,7 +2194,8 @@ static int HostMain(int argc, char **argv) {
   if (!SwitchParseBench(&argc, argv, &bench)) {
     fprintf(stderr,
             "Usage: %s [--bench SECONDS [--hd 0|2-8] [--aspect 4:3|16:10|"
-            "16:9|21:9] [--return APP.nro]] [ROM.smc]\n",
+            "16:9|21:9] [--renderer gl|deko3d] [--shot F1,F2,...] "
+            "[--return APP.nro]] [ROM.smc]\n",
             argv[0]);
     return 2;
   }

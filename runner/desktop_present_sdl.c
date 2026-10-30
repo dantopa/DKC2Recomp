@@ -16,6 +16,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __SWITCH__
+#include "switch_present_deko3d.h"
+#endif
+
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
 #endif
@@ -726,6 +730,47 @@ bool Dkc2GlPipelineCrtAvailable(const Dkc2SdlPresenter *presenter) {
   return presenter && CrtProgramsReady(presenter);
 }
 
+static void SetPresenterDefaults(Dkc2SdlPresenter *presenter,
+                                 bool linear_filter) {
+  presenter->linear_filter = linear_filter;
+  presenter->upscaler = linear_filter ? kDkc2UpscalerBilinear
+                                      : kDkc2UpscalerNearest;
+  presenter->reconstruct_mode = 3;
+  presenter->reconstruct_strength = 1.0f;
+  presenter->reconstruct_softness = 0.5f;
+  presenter->reconstruct_shading = 0.6f;
+  presenter->display = kDkc2DisplayFlat;
+  Dkc2CrtSettingsDefault(&presenter->crt);
+}
+
+#ifdef __SWITCH__
+/* DKC2_RENDERER=deko3d (the bench's --renderer) draws with deko3d instead
+ * of OpenGL. False without it, or when deko3d cannot start. */
+static bool InitDeko3d(Dkc2SdlPresenter *presenter, bool linear_filter) {
+  const char *renderer = getenv("DKC2_RENDERER");
+  if (!renderer || strcmp(renderer, "deko3d") != 0) return false;
+  char error[160];
+  Dkc2Deko3d *deko = Dkc2Deko3dCreate(&s_gl_stats, error, sizeof error);
+  if (!deko) {
+    fprintf(stderr, "warning: %s; using OpenGL\n", error);
+    return false;
+  }
+  presenter->deko3d = deko;
+  presenter->vsync_status = kDkc2DesktopVsyncEnabled;
+  (void)snprintf(presenter->backend, sizeof presenter->backend,
+                 "deko3d; vsync=%s; pacing=swap",
+                 Dkc2DesktopVsyncStatusName(presenter->vsync_status));
+  SetPresenterDefaults(presenter, linear_filter);
+  return true;
+}
+
+static Dkc2Deko3dCapture Deko3dCapture(Dkc2SdlPresenter *presenter) {
+  return (Dkc2Deko3dCapture){presenter->capture_rgb, presenter->capture_width,
+                             presenter->capture_height,
+                             &presenter->capture_done};
+}
+#endif
+
 bool Dkc2SdlPresenterInit(Dkc2SdlPresenter *presenter, int window_scale,
                           int fullscreen, bool hidden, bool linear_filter,
                           int source_width, int source_height,
@@ -736,6 +781,9 @@ bool Dkc2SdlPresenterInit(Dkc2SdlPresenter *presenter, int window_scale,
     return false;
   }
   memset(presenter, 0, sizeof *presenter);
+#ifdef __SWITCH__
+  if (InitDeko3d(presenter, linear_filter)) return true;
+#endif
   (void)SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
   (void)SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
   (void)SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
@@ -805,15 +853,7 @@ bool Dkc2SdlPresenterInit(Dkc2SdlPresenter *presenter, int window_scale,
   presenter->window = window;
   presenter->gl_context = context;
   presenter->texture = texture;
-  presenter->linear_filter = linear_filter;
-  presenter->upscaler = linear_filter ? kDkc2UpscalerBilinear
-                                      : kDkc2UpscalerNearest;
-  presenter->reconstruct_mode = 3;
-  presenter->reconstruct_strength = 1.0f;
-  presenter->reconstruct_softness = 0.5f;
-  presenter->reconstruct_shading = 0.6f;
-  presenter->display = kDkc2DisplayFlat;
-  Dkc2CrtSettingsDefault(&presenter->crt);
+  SetPresenterDefaults(presenter, linear_filter);
   Dkc2GlPipelineInitialize(presenter, LoadSdlGlProcedure);
   return true;
 }
@@ -891,6 +931,12 @@ void Dkc2SdlPresenterDrawableSize(Dkc2SdlPresenter *presenter, int *width,
                                   int *height) {
   if (width) *width = 0;
   if (height) *height = 0;
+#ifdef __SWITCH__
+  if (presenter && presenter->deko3d) {
+    Dkc2Deko3dOutputSize(presenter->deko3d, width, height);
+    return;
+  }
+#endif
   if (!presenter || !presenter->window) return;
   snesrecomp_sdl_get_drawable_size((SDL_Window *)presenter->window, width,
                                    height);
@@ -1203,6 +1249,14 @@ bool Dkc2SdlPresenterPresent(Dkc2SdlPresenter *presenter,
                              int source_height,
                              Dkc2SdlOverlayDraw overlay_draw,
                              void *overlay_user) {
+#ifdef __SWITCH__
+  if (presenter && presenter->deko3d) {
+    const Dkc2Deko3dCapture capture = Deko3dCapture(presenter);
+    return Dkc2Deko3dPresent(presenter->deko3d, pixels, source_width,
+                             source_height, presenter->linear_filter,
+                             &capture);
+  }
+#endif
   if (!presenter || !presenter->window || !presenter->gl_context ||
       !presenter->texture || !pixels || source_width <= 0 ||
       source_height <= 0)
@@ -1229,6 +1283,9 @@ bool Dkc2SdlPresenterPresent(Dkc2SdlPresenter *presenter,
 }
 
 bool Dkc2SdlPresenterHdAvailable(const Dkc2SdlPresenter *presenter) {
+#ifdef __SWITCH__
+  if (presenter && presenter->deko3d) return true;
+#endif
   return presenter && presenter->hd_program[0] != 0;
 }
 
@@ -1497,6 +1554,13 @@ bool Dkc2SdlPresenterPresentHd(Dkc2SdlPresenter *presenter,
                                const Dkc2HdScene *scene,
                                Dkc2SdlOverlayDraw overlay_draw,
                                void *overlay_user) {
+#ifdef __SWITCH__
+  if (presenter && presenter->deko3d) {
+    const Dkc2Deko3dCapture capture = Deko3dCapture(presenter);
+    return Dkc2Deko3dPresentHd(presenter->deko3d, scene,
+                               presenter->linear_filter, &capture);
+  }
+#endif
   if (!Dkc2SdlPresenterHdAvailable(presenter) || !presenter->window ||
       !presenter->gl_context || !scene)
     return false;
@@ -1599,6 +1663,13 @@ void Dkc2GlPipelineDestroy(Dkc2SdlPresenter *presenter) {
 
 void Dkc2SdlPresenterDestroy(Dkc2SdlPresenter *presenter) {
   if (!presenter) return;
+#ifdef __SWITCH__
+  if (presenter->deko3d) {
+    Dkc2Deko3dDestroy(presenter->deko3d);
+    memset(presenter, 0, sizeof *presenter);
+    return;
+  }
+#endif
   if (presenter->window && presenter->gl_context)
     (void)MakeSdlContextCurrent((SDL_Window *)presenter->window,
                                 (SDL_GLContext)presenter->gl_context);

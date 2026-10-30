@@ -167,12 +167,25 @@ Platform differences:
   it keep the console streams.
 
 Benchmark: `--bench SECONDS [--hd 0|2-8] [--aspect 4:3|16:10|16:9|21:9]
-[--return APP.nro]` starts without the launcher, replays the route recorded
-in `bench.input` in the data folder, writes the `perf.log` lines to
-`stdout.log` too, ends it with `bench: done result=N` and quits. `--hd` and
-`--aspect` apply to that run only (`--hd 0` turns HD off); saves and
-options are not written. `--return` asks the homebrew loader to start that
-`.nro` next instead of the menu.
+[--renderer gl|deko3d] [--shot F1,F2,...] [--return APP.nro]` starts
+without the launcher, replays the route recorded in `bench.input` in the
+data folder, writes the `perf.log` lines to `stdout.log` too, ends it with
+`bench: done result=N` and quits. `--hd` and `--aspect` apply to that run
+only (`--hd 0` turns HD off); saves and options are not written.
+`--renderer deko3d` draws with deko3d instead of OpenGL (falling back to
+OpenGL when it cannot start). `--shot` writes the presented image of each
+listed frame to `shot-<renderer>-<frame>.ppm`, to compare the renderers.
+`--return` asks the homebrew loader to start that `.nro` next instead of
+the menu.
+
+The deko3d renderer (`runner/switch_present_deko3d.c`, shaders in
+`runner/switch_shaders/` compiled with `uam` and embedded) owns the
+console's default window, so no SDL window or OpenGL context exists beside
+it and the in-game menu is not drawn yet: it is for the bench until that
+lands. It presents flat (nearest or bilinear) at 1920x1080 docked or
+1280x720 handheld, chosen at start, and composes HD scenes with the
+OpenGL presenter's three passes (one draw per quad, uniforms pushed in the
+command buffer, pack images uploaded once into pooled GPU memory).
 
 The build boots on hardware (firmware 23.0.1) and holds 60 fps without HD
 (about 2 ms recompiled CPU and 3.6 ms drawing per frame at 1785 MHz). HD at

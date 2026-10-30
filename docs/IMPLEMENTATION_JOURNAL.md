@@ -6805,3 +6805,46 @@ uploaded kilobytes per presented frame. HD pack textures stay resident and
 upload once; per frame the scene uploads its native-size base, occlusion,
 layer and tile mask. Nothing reads pixels back during a frame except an
 armed screenshot, and the HD targets are built once per size.
+
+## 2026-10-29 - Switch deko3d renderer
+
+The counters answered the question: in the slow last stretch of the bench
+route the HD scene issues about 300 draw calls a frame and spends 16-24 ms
+on them, some 55-65 microseconds each, which is Mesa's CPU cost per
+immediate-mode quad with its uniforms and texture bind. Patricio chose to
+leave OpenGL on the console rather than batch around the driver.
+
+`runner/switch_present_deko3d.c` draws with deko3d. The presenter entry
+points delegate to it when `DKC2_RENDERER=deko3d` (the bench's
+`--renderer deko3d`); OpenGL stays the default until it reaches parity.
+The device keeps deko3d's upper-left origin, so fragment row 0, memory row
+0 and texture coordinate 0 are the top row everywhere: the HD passes,
+written for targets whose row 0 is texture coordinate 0, port line for
+line to GLSL 460 (`runner/switch_shaders/`, compiled by `uam` and embedded
+with `bin2s`), and the presented image needs no flip. One vertex shader
+draws every rectangle from a pushed uniform block, so a quad costs a
+texture bind, a 128-byte push and a draw, all plain writes into command
+memory.
+
+Three frames are recorded ahead, each with its own command memory,
+staging buffer, 1x scene inputs and fence. HD pack images are uploaded
+once into 32 MB pool blocks and described by their table slot; when the
+table or the pool fills, the GPU finishes and every image starts over.
+Every image a scene uses is made resident before its passes are recorded,
+so a flush never splits a pass.
+
+The renderer owns the console's default window. SDL only takes that window
+when it creates its own, and its event pump still calls `appletMainLoop`
+without one, so HOME and suspend keep working. The in-game menu draws with
+ImGui on OpenGL and stays out for now; the host leaves the overlay
+uninitialized when there is no OpenGL context. The output follows SDL's
+choice at start: 1920x1080 docked, 1280x720 handheld.
+
+`--shot F1,F2,...` maps onto the existing screenshot controls, and the
+deko3d capture copies the presented image to a buffer, so the two
+renderers can be compared on the console. `perf.log` gained `run_max_ms`,
+the slowest recompiled-CPU frame of each window, since the mean hid the
+frames that miss the deadline without HD.
+
+Verified so far: the Switch build compiles without new warnings and the
+shaders compile with `uam`. The renderer has not run on hardware yet.
