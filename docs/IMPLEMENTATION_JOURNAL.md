@@ -6939,3 +6939,36 @@ CPU cost remain. `hd_gpu_parity.py` passes against its golden frames with
 the pack they were made from; the golden frames predate the current pack.
 The six co-op integration tests fail with and without these changes.
 
+## 2026-10-31 - Palette-slot aliases, mode 5 lines and console chords
+
+Patricio saw Zingers switch between HD and the original. A bot replayed
+the routes of 39 levels and counted, per frame, sprites drawn without art
+whose graphic had art under another key: 409 in Parrot Chute Panic, 171 in
+Glimmer's Galleon and 112 in Rambi Rumble. Most came from 1088 files keyed
+by palette slot (`<graphic>_<slot>`): the game puts the same palette in
+another slot when more objects are on screen. The runtime already looked
+art up by palette content first; `aliases.txt` now maps each content key
+seen with a slot-keyed file to that file, resolved once per key and served
+from the image already loaded, so no art is duplicated in memory. 394
+aliases came from the routes. The rest were real color variants with no
+art (a yellow Kutlass, a pink Krusha, black smoke); 17 frames were
+recolored from the existing art, moving each pixel by the difference
+between the target color and the art's mean color for its palette index.
+After: 0 over 33,032 frames and 55,918 drawn sprites.
+
+The Rare logo showed a sliver of garbage and the Nintendo logo stayed
+pixelated. "Nintendo Presents" switches to mode 5 by HDMA at line 151,
+and the fast renderer, which handles modes 1, 2, 3 and 7, drew those lines
+through its mode 7 branch; they now take the scalar renderer. The frame
+also ended in mode 5, so HD judged the next frame by it; the mode of the
+previous frame's first line decides instead. Checked against Mesen 2.1.1
+over 80 frames of the Rare logo and frames 10-145 of the Nintendo logo.
+
+On the console the bug report could not copy the logs (an open file
+cannot be read there), so it writes only the screenshot and the state, and
+events go to `perf.log`. Minus with Plus quits back to the launching
+homebrew.
+
+The six co-op tests and `hd_gpu_parity` still fail, as before these
+changes.
+

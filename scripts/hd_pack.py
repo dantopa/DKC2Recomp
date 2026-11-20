@@ -46,9 +46,10 @@ EDGE_BAND = 3
 # Grid pixels (in 1x pixels) the cut window reaches past each side of a
 # cell: the model often draws a pose off its cell's center.
 CUT_MARGIN = 8
-# A separate part of the 1x frame (a juggled ball) of at least this many
-# pixels must be mostly covered by the art.
-MIN_PART = 3
+# A separate part of the 1x frame at least this many pixels wide and high
+# (a juggled ball, not a thin streak the model leaves out) must be mostly
+# covered by the art.
+MIN_PART = 4
 GRID_LIMIT = 2048
 MAX_CELL_SCALE = 8
 PAD = 2
@@ -399,13 +400,39 @@ def clear_holes(cell, flags, original, width, height, dx, dy):
                 flags[index] = 1
 
 
+def encloses(region, width):
+    """True when the region surrounds pixels outside it (a pupil within an
+    eye's white): pixels of its bounding box unreachable from the box's edge
+    without crossing the region."""
+    xs = [index % width for index in region]
+    ys = [index // width for index in region]
+    left, top = min(xs) - 1, min(ys) - 1
+    box_width, box_height = max(xs) - left + 2, max(ys) - top + 2
+    inside = set(region)
+    reached = bytearray(box_width * box_height)
+    stack = [(x, y) for x in range(box_width) for y in (0, box_height - 1)]
+    stack += [(x, y) for y in range(box_height) for x in (0, box_width - 1)]
+    while stack:
+        x, y = stack.pop()
+        if not (0 <= x < box_width and 0 <= y < box_height):
+            continue
+        if (reached[y * box_width + x] or
+                (top + y) * width + left + x in inside):
+            continue
+        reached[y * box_width + x] = 1
+        stack.extend(((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)))
+    return sum(reached) + len(region) < box_width * box_height
+
+
 def fill_slivers(cell, flags, frame, frame_width, frame_height, grid_scale,
                  origin_x, origin_y, width, height):
     """Background white the model left between limbs and body. The aligned
-    1x frame starts at (origin_x, origin_y) of the cell. Near-white and
-    whitish pixels over a transparent part of the frame are flagged; those
-    over a colored part with no white nearby (so eyes and teeth stay) take
-    the mean of the character pixels around them."""
+    1x frame starts at (origin_x, origin_y) of the cell. A light region
+    (near-white or whitish) lying mostly over a transparent part of the
+    frame is flagged unless it encloses something (an eye's pupil, where
+    the eye bulges past the silhouette). Light pixels left over a colored
+    part with no white nearby (so eyes and teeth stay) take the mean of the
+    character pixels around them."""
     def frame_pixel(fx, fy):
         if 0 <= fx < frame_width and 0 <= fy < frame_height:
             return frame[fy * frame_width + fx]
@@ -413,6 +440,36 @@ def fill_slivers(cell, flags, frame, frame_width, frame_height, grid_scale,
 
     def white(pixel):
         return pixel[3] and min(pixel[:3]) > 160
+
+    def light(index):
+        return not flags[index] and (whitish(cell[index]) or
+                                     not foreground(cell[index]))
+
+    def over_character(index):
+        x, y = index % width, index // width
+        return frame_pixel((x - origin_x) // grid_scale,
+                           (y - origin_y) // grid_scale)[3]
+
+    seen = bytearray(width * height)
+    for start in range(width * height):
+        if seen[start] or not light(start):
+            continue
+        region, stack = [], [start]
+        seen[start] = 1
+        while stack:
+            index = stack.pop()
+            region.append(index)
+            x, y = index % width, index // width
+            for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                neighbour = ny * width + nx
+                if (0 <= nx < width and 0 <= ny < height and
+                        not seen[neighbour] and light(neighbour)):
+                    seen[neighbour] = 1
+                    stack.append(neighbour)
+        if (sum(map(over_character, region)) * 2 < len(region) and
+                not encloses(region, width)):
+            for index in region:
+                flags[index] = 1
 
     reach = grid_scale
     replaced = {}
@@ -424,12 +481,7 @@ def fill_slivers(cell, flags, frame, frame_width, frame_height, grid_scale,
             fx = (x - origin_x) // grid_scale
             fy = (y - origin_y) // grid_scale
             here = frame_pixel(fx, fy)
-            if not here[3] and (whitish(cell[index]) or
-                                not foreground(cell[index])):
-                flags[index] = 1
-                continue
-            if not here[3] or (foreground(cell[index]) and
-                               not whitish(cell[index])):
+            if not here[3] or not light(index):
                 continue
             around = [frame_pixel(fx + i, fy + j)
                       for j in (-1, 0, 1) for i in (-1, 0, 1)]
@@ -479,8 +531,8 @@ def drop_neighbours(flags, width, height, margin):
 
 def missing_part(frame, frame_width, frame_height, flags, grid_scale,
                  origin_x, origin_y, width, height):
-    """True when a separate part of the 1x frame of MIN_PART pixels or more
-    (a juggled ball, a cap's tip) is mostly left out of the art."""
+    """True when a separate part of the 1x frame of at least MIN_PART x
+    MIN_PART pixels (a juggled ball) is mostly left out of the art."""
     seen = bytearray(frame_width * frame_height)
     for start in range(frame_width * frame_height):
         if seen[start] or not frame[start][3]:
@@ -498,7 +550,10 @@ def missing_part(frame, frame_width, frame_height, flags, grid_scale,
                             not seen[neighbour] and frame[neighbour][3]):
                         seen[neighbour] = 1
                         stack.append(neighbour)
-        if len(part) < MIN_PART:
+        xs = [index % frame_width for index in part]
+        ys = [index // frame_width for index in part]
+        if (max(xs) - min(xs) + 1 < MIN_PART or
+                max(ys) - min(ys) + 1 < MIN_PART):
             continue
         covered = 0
         for index in part:

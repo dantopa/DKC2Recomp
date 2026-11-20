@@ -173,13 +173,17 @@ class HdPackTest(unittest.TestCase):
         self.assertEqual(out[7 * out_width + 9], RED)
 
     def test_cut_rejects_art_missing_a_separate_part(self):
-        ball = frame(10, 10, (0, 4, 6, 10))
-        for y in (0, 1):
-            for x in (7, 8):
-                ball[y * 10 + x] = RED
-        hd_pack.write_rgba(os.path.join(self.dump, "0400_1.rgba"), 10, 10, ball)
+        # A body, a 4x4 ball above it and a thin streak beside it.
+        pixels = frame(12, 12, (0, 6, 6, 12))
+        for y in range(4):
+            for x in range(7, 11):
+                pixels[y * 12 + x] = RED
+        for y in range(7, 11):
+            pixels[y * 12 + 10] = RED
+        hd_pack.write_rgba(os.path.join(self.dump, "0400_1.rgba"), 12, 12,
+                           pixels)
         with open(os.path.join(self.dump, "index.txt"), "a") as index:
-            index.write("0400 1 00dd 10 10\n")
+            index.write("0400 1 00dd 12 12\n")
         grids = os.path.join(self.root, "grids")
         base = os.path.join(grids, hd_pack.build_grids(
             self.dump, grids, kinds=["00dd"])[0])
@@ -188,15 +192,19 @@ class HdPackTest(unittest.TestCase):
         cell, scale = manifest["cells"][0], manifest["scale"]
         width, height, pixels = hd_pack.read_png(base + ".png")
         pack = os.path.join(self.root, "pack")
-        self.assertTrue(hd_pack.cut(base + ".json", base + ".png", pack)[0]
-                        ["accepted"])
-        for y in range(cell["y"], cell["y"] + 2 * scale):
-            for x in range(cell["x"] + 7 * scale, cell["x"] + 9 * scale):
-                pixels[y * width + x] = hd_pack.WHITE
-        generated = os.path.join(self.root, "no_ball.png")
-        hd_pack.write_png(generated, width, height, pixels)
-        self.assertFalse(hd_pack.cut(base + ".json", generated, pack)[0]
-                         ["accepted"])
+
+        def without(name, x0, y0, x1, y1):
+            art = list(pixels)
+            for y in range(cell["y"] + y0 * scale, cell["y"] + y1 * scale):
+                for x in range(cell["x"] + x0 * scale,
+                               cell["x"] + x1 * scale):
+                    art[y * width + x] = hd_pack.WHITE
+            generated = os.path.join(self.root, name + ".png")
+            hd_pack.write_png(generated, width, height, art)
+            return hd_pack.cut(base + ".json", generated, pack)[0]["accepted"]
+
+        self.assertTrue(without("no_streak", 10, 7, 11, 11))
+        self.assertFalse(without("no_ball", 7, 0, 11, 4))
 
     def test_cut_clears_whitish_shade_outside_the_character(self):
         base, manifest = self.build()

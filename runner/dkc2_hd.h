@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "dkc2_hdma.h"
 #include "snes/ppu.h"
@@ -27,7 +28,10 @@ extern "C" {
  *    a hash of the palette's colors 1-15) in the pack directory, for
  *    externally produced art; the same art applies whichever palette slot
  *    the game assigns;
- *  - else a pack file "<graphic>_<slot>.rgba" (one digit: the palette slot);
+ *  - else a pack file "<graphic>_<slot>.rgba" (one digit: the palette slot),
+ *    the slot aliases.txt names for the content key when it lists one
+ *    ("<graphic>_p<palette> -> <graphic>_<slot>" per line), else the
+ *    record's own slot;
  *  - the runtime filter applied to the ROM frame (no external data), or
  *    the learned filter when its table loads.
  *
@@ -250,6 +254,26 @@ unsigned Dkc2HdPackReaderProgress(const Dkc2HdPackReader *reader);
 void Dkc2HdAdoptPack(Dkc2Hd *hd, Dkc2HdPackReader *reader);
 void Dkc2HdPackReaderDestroy(Dkc2HdPackReader *reader);
 
+/* Sprite frames filtered on another thread. Once enabled, a sprite frame
+ * missing from the cache shows unfiltered and joins the open batch. The
+ * main thread takes the batch between frames, another thread runs it, and
+ * the main thread adopts it before building the next scene; one batch is
+ * out at a time, and it must be adopted before the compositor is
+ * destroyed or batches are disabled. */
+typedef struct Dkc2HdFilterBatch Dkc2HdFilterBatch;
+void Dkc2HdSetFilterBatches(Dkc2Hd *hd, bool enabled);
+/* NULL when no batch is open with frames or one is still out. */
+Dkc2HdFilterBatch *Dkc2HdTakeFilterBatch(Dkc2Hd *hd);
+void Dkc2HdRunFilterBatch(Dkc2HdFilterBatch *batch);
+void Dkc2HdAdoptFilterBatch(Dkc2Hd *hd, Dkc2HdFilterBatch *batch);
+
+/* Filtered sprite frames kept on storage between sessions: the batches'
+ * results are appended to the file at path (from the batch thread, after
+ * running a batch) and read back into the cache when a session starts. */
+FILE *Dkc2HdOpenSpriteCache(const Dkc2Hd *hd, const char *path);
+void Dkc2HdSaveFilterBatch(const Dkc2HdFilterBatch *batch, FILE *file);
+void Dkc2HdLoadSpriteCache(Dkc2Hd *hd, const char *path);
+
 /* CPU time spent building scenes since the last Dkc2HdTakeTimings, in ticks
  * of the clock given to Dkc2HdSetClock (without one nothing is measured). */
 typedef struct Dkc2HdTimings {
@@ -260,15 +284,23 @@ typedef struct Dkc2HdTimings {
   uint64_t sprites; /* sprite and loose-object quads */
   uint64_t load;    /* pack files read, part of the phases above */
   uint64_t reads;   /* pack files read from storage (a count, not time) */
+  /* Sprite frames filtered on a cache miss (counts): inside the scene, or
+   * by a filter batch and adopted. */
+  uint64_t filtered_inframe;
+  uint64_t filtered_async;
 } Dkc2HdTimings;
 void Dkc2HdSetClock(Dkc2Hd *hd, uint64_t (*now)(void));
 /* Copies the timings into *timings (zeros for a NULL hd) and clears them. */
 void Dkc2HdTakeTimings(Dkc2Hd *hd, Dkc2HdTimings *timings);
+/* Bytes the filtered sprite frame cache holds (0 for a NULL hd). */
+size_t Dkc2HdCacheBytes(const Dkc2Hd *hd);
 
 /* Call before Dkc2DrawPpuFrame with the width it renders (256 plus both
- * widescreen margins). Routes the frame through the HD path when the scene
- * is supported; otherwise leaves the PPU untouched. */
-void Dkc2HdBeginFrame(Dkc2Hd *hd, Ppu *ppu, int frame_width);
+ * widescreen margins) and the registers the previous frame's scanlines were
+ * drawn with (NULL: none yet). Routes the frame through the HD path when the
+ * scene is supported; otherwise leaves the PPU untouched. */
+void Dkc2HdBeginFrame(Dkc2Hd *hd, Ppu *ppu, int frame_width,
+                      const Dkc2HdmaLines *previous_lines);
 
 /* Call after Dkc2DrawPpuFrame with the BGRA frame it rendered (pitch in
  * bytes) and the registers its scanlines were drawn with (NULL: no tile

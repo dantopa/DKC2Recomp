@@ -837,11 +837,12 @@ static void SetPresenterDefaults(Dkc2SdlPresenter *presenter,
 }
 
 #ifdef __SWITCH__
-/* DKC2_RENDERER=deko3d (the bench's --renderer) draws with deko3d instead
- * of OpenGL. False without it, or when deko3d cannot start. */
+/* The console draws with deko3d unless DKC2_RENDERER=gl (--renderer gl)
+ * asks for OpenGL, which also has the in-game menu. False then, or when
+ * deko3d cannot start. */
 static bool InitDeko3d(Dkc2SdlPresenter *presenter, bool linear_filter) {
   const char *renderer = getenv("DKC2_RENDERER");
-  if (!renderer || strcmp(renderer, "deko3d") != 0) return false;
+  if (renderer && strcmp(renderer, "gl") == 0) return false;
   char error[160];
   Dkc2Deko3d *deko = Dkc2Deko3dCreate(&s_gl_stats, error, sizeof error);
   if (!deko) {

@@ -70,8 +70,9 @@ next, lighting and depth effects possible.
 | Terrain art | Pirate Panic |
 | Title screen art | Working |
 | Sky/water (BG2/BG3), loose objects (single bananas) | Filter only |
-| Mounts, most enemies | Not covered yet |
-| Nintendo Switch homebrew build | Runs on hardware: 60 fps without HD, HD 2x 37-60 fps ([docs](docs/CROSS_PLATFORM.md#nintendo-switch-homebrew-build-experimental)) |
+| Mounts | Rambi and Enguarde first pass |
+| Most enemies | Partly covered |
+| Nintendo Switch homebrew build (`.nro` and installable `.nsp`) | Runs on hardware: 60 fps without HD, HD 2x 60 fps at 1785 MHz ([build](docs/CROSS_PLATFORM.md#nintendo-switch-homebrew-build-experimental)) |
 
 ## Roadmap: a remaster without a pack
 
@@ -95,6 +96,11 @@ targets. Enable it in the in-game **Settings** tab. For headless and
 scripted runs use `DKC2_HD=<2-8>`, `DKC2_HD_FILTER=nearest|smooth|learned|learned-pixel`,
 `DKC2_HD_PACK=<dir>` and `DKC2_HD_DUMP=<dir>`. The pack format is documented
 in `runner/dkc2_hd.h`.
+
+The Nintendo Switch build (homebrew `.nro`, or an installable `.nsp`
+signed with your own console's keys) compiles in the official
+`devkitpro/devkita64` Docker image with no host install; see
+[docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md#nintendo-switch-homebrew-build-experimental).
 
 **No art ships with this repository.** Packs are derivative of Nintendo and
 Rare content: build yours from your own ROM and keep it in `private/` or the

@@ -2,6 +2,37 @@
 
 ## Unreleased (fork: HD presentation)
 
+- HD packs may carry `aliases.txt`: `<graphic>_p<palette content> ->
+  <graphic>_<slot>` lines draw art made for a palette slot whatever slot
+  the game puts that palette in, with no copy of the file. Art keyed by
+  slot alone showed only while the sprite kept its slot (Zingers and
+  balloons switched between HD and the original).
+- HD starts each frame in the mode of the previous frame's first line, so
+  "Nintendo Presents" (mode 1 above a mode 5 band set by HDMA) is drawn in
+  HD; snesrecomp now sends mode 0, 4, 5 and 6 lines to the scalar renderer,
+  which removes the sliver over the Rare logo.
+- Filtered sprite frames are decoded unlit and the scene applies the
+  screen brightness, so a frame first filtered during a fade is cached
+  right.
+- `hd_pack.py cut` cleans light halos the model leaves over transparent
+  parts of a frame, keeping eyes and teeth.
+- Switch: Minus with L saves the state (also written as a bug report with
+  `shot.ppm` and `state.sav`), Minus with R loads it, and Minus with Plus
+  quits back to the homebrew that launched the game. Save states, loads,
+  reports and quits are `event` lines in `perf.log`; frames over budget go
+  to `spikes.log`; log files are written by a thread of their own.
+- Switch: the cartridge save is written once a second when the game
+  changed it, through a temporary file, so a killed process keeps the last
+  complete save; snesrecomp's `RtlWriteSram` and `RtlSaveSnapshot` replace
+  files atomically on the SD card.
+- Switch: sprite frames missing from the HD cache are filtered by a worker
+  thread in batches and kept in `hdcache.bin` between sessions; deko3d is
+  the default renderer (`--renderer gl` for the menu); `SwitchCpuMhz` in
+  `launcher.cfg` sets the clock (1020-1785, default 1785); the left stick
+  steers.
+- Headless: `DKC2_BOT_SERVER` serves a search bot's trials over stdin from
+  one process.
+
 - The game is now titled "Donkey Kong Country 2 HD" (window, macOS menu
   and bundle, Switch HOME menu); data folders keep the DKC2Recomp name.
 - HD pack art is read into memory behind a loading screen with a progress

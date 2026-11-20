@@ -31,13 +31,25 @@ static uint16_t Read16(const uint8_t *data, size_t address) {
   return (uint16_t)(data[address] | (data[address + 1] << 8));
 }
 
-static uint32_t ColorWithRank(const Ppu *ppu, uint8_t index, uint8_t rank) {
+/* A CGRAM color through levels, 32 channel values (the screen brightness,
+ * or kFullBrightness). */
+static uint32_t ColorAtLevels(const Ppu *ppu, const uint8_t *levels,
+                              uint8_t index, uint8_t rank) {
   const uint16_t color = ppu->cgram[index];
-  return (uint32_t)rank << 24 |
-         (uint32_t)ppu->brightnessMult[color & 0x1f] << 16 |
-         (uint32_t)ppu->brightnessMult[(color >> 5) & 0x1f] << 8 |
-         ppu->brightnessMult[(color >> 10) & 0x1f];
+  return (uint32_t)rank << 24 | (uint32_t)levels[color & 0x1f] << 16 |
+         (uint32_t)levels[(color >> 5) & 0x1f] << 8 |
+         levels[(color >> 10) & 0x1f];
 }
+
+static uint32_t ColorWithRank(const Ppu *ppu, uint8_t index, uint8_t rank) {
+  return ColorAtLevels(ppu, ppu->brightnessMult, index, rank);
+}
+
+/* The channel values of the brightest screen, as the PPU expands them. */
+static const uint8_t kFullBrightness[32] = {
+    0,   8,   16,  24,  33,  41,  49,  57,  66,  74,  82,
+    90,  99,  107, 115, 123, 132, 140, 148, 156, 165, 173,
+    181, 189, 198, 206, 214, 222, 231, 239, 247, 255};
 
 /* One 4-bpp planar pixel: planes 0/1 in the row word, planes 2/3 eight words
  * later. */
@@ -305,9 +317,9 @@ unsigned Dkc2NativeCollectSprites(const uint8_t *ram, const uint8_t *rom,
 /* Decodes a compound graphic: large 16x16 pieces, then two groups of 8x8
  * pieces, followed by the 4-bpp payload uploaded in two DMA runs. Earlier
  * pieces take precedence where pieces overlap. */
-bool Dkc2NativeDecodeSpriteFrame(const Ppu *ppu,
-                                 const Dkc2NativeSprite *sprite,
-                                 Dkc2NativeSpriteFrame *frame) {
+static bool DecodeSpriteFrame(const Ppu *ppu, const uint8_t *levels,
+                              const Dkc2NativeSprite *sprite,
+                              Dkc2NativeSpriteFrame *frame) {
   const uint8_t *data = sprite->graphic;
   if (!ppu || !data || sprite->available < 8)
     return false;
@@ -367,11 +379,23 @@ bool Dkc2NativeDecodeSpriteFrame(const Ppu *ppu,
             (unsigned)y % 8u);
         if (color)
           frame->pixels[(offset_y + y) * frame->width + offset_x + x] =
-              ColorWithRank(ppu, (uint8_t)(palette | color), rank);
+              ColorAtLevels(ppu, levels, (uint8_t)(palette | color), rank);
       }
     }
   }
   return true;
+}
+
+bool Dkc2NativeDecodeSpriteFrame(const Ppu *ppu,
+                                 const Dkc2NativeSprite *sprite,
+                                 Dkc2NativeSpriteFrame *frame) {
+  return ppu && DecodeSpriteFrame(ppu, ppu->brightnessMult, sprite, frame);
+}
+
+bool Dkc2NativeDecodeSpriteFrameUnlit(const Ppu *ppu,
+                                      const Dkc2NativeSprite *sprite,
+                                      Dkc2NativeSpriteFrame *frame) {
+  return DecodeSpriteFrame(ppu, kFullBrightness, sprite, frame);
 }
 
 void Dkc2NativeSpritePixelScreen(const Dkc2NativeSprite *sprite,

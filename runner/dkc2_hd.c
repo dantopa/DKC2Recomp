@@ -23,8 +23,13 @@ enum {
   /* Graphic ids are 4-byte directory offsets below $35A0. */
   kGraphicSlots = 0x35a0 / 4,
   kPalettes = 8,
-  kCacheSlots = 1024,
+  /* Filtered sprite frames stay cached for the whole session: the cache is
+   * flushed only when it passes kCacheFlush entries or kCacheBudget bytes,
+   * which play does not reach. */
+  kCacheSlots = 16384,
   kCacheFlush = kCacheSlots * 3 / 4,
+  /* Sprite frames one filter batch carries. */
+  kFilterBatchMax = 64,
   /* Smooth upscale taps reach two source pixels past either edge. */
   kTapReach = 2,
   kPathMax = 1024,
@@ -50,6 +55,9 @@ enum {
   kLearnedWindows = 1 << 16,
   kLearnedOutputs = 5,
   kLearnedRow = kLearnedScale * kLearnedScale * kLearnedOutputs,
+  kLearnedSubpixels = kLearnedScale * kLearnedScale,
+  /* Softmax weights remembered by window, a power of two. */
+  kLearnedMemoSlots = 1024,
   kLearnedHeader = 8,
   /* Sprite quads: every sprite-table record and every OAM entry as its own
    * loose group. */
@@ -98,6 +106,9 @@ typedef enum PackState {
 typedef struct CacheEntry {
   uint64_t key;
   HdImage *image;
+  /* The image is the unfiltered frame standing in until a filter batch
+   * brings the filtered one; queued once its frame is in a batch. */
+  bool stand_in, queued;
 } CacheEntry;
 
 /* Pack art and dump state of one terrain block or sprite frame. */
@@ -106,7 +117,17 @@ typedef struct PackEntry {
   HdImage *image;
   uint8_t state;  /* PackState */
   bool dumped;
+  /* Sprite art without its own file: the palette slot whose slot-keyed
+   * art stands in (aliases.txt, else the record's own slot). */
+  uint8_t fallback;
 } PackEntry;
+
+/* An aliases.txt line: sprite art key (see SpriteArtKey) drawn with the
+ * slot-keyed art of palette slot "palette". */
+typedef struct SpriteAlias {
+  uint64_t key;
+  uint8_t palette;
+} SpriteAlias;
 
 typedef struct ScreenEntry {
   uint64_t key;
@@ -202,11 +223,44 @@ struct Dkc2HdPackReader {
   size_t budget; /* bytes of pixels left to read */
 };
 
+/* The softmax weights of every subpixel of a learned-filter cell, which
+ * depend only on its four pattern windows: sprites repeat windows across
+ * flat areas and between frames, and the exponentials dominate the
+ * filter's cost. */
+typedef struct LearnedWeights {
+  uint64_t windows; /* the four 16-bit window indices, when set */
+  bool set;
+  /* Each pixel's share, weight / total; the fifth output is transparent
+   * and only takes weight away. */
+  float share[kLearnedSubpixels][4];
+} LearnedWeights;
+
+/* The bytes of filtered sprite frames the cache may hold. */
+static const size_t kCacheBudget = (size_t)768 << 20;
+
+/* Sprite frames filtered on another thread (see Dkc2HdTakeFilterBatch). */
+typedef struct FilterJob {
+  uint64_t key;
+  Dkc2NativeSpriteFrame frame;
+  HdImage *image; /* the result, without an id */
+} FilterJob;
+
+struct Dkc2HdFilterBatch {
+  const int8_t *learned; /* the learned table, or NULL */
+  LearnedWeights *memo;  /* the learned memo, the batch thread's alone */
+  int filter, scale;
+  bool running; /* taken by the host and not adopted yet */
+  unsigned count;
+  FilterJob jobs[kFilterBatchMax];
+};
+
 struct Dkc2Hd {
   int scale;
   Dkc2HdFilter filter;
   Dkc2HdFilter background;
   int8_t *learned;  /* the learned filter's table, when that filter is on */
+  LearnedWeights *learned_memo; /* kLearnedMemoSlots, with learned */
+  Dkc2HdFilterBatch *batch; /* NULL: sprite frames are filtered in place */
   /* Smooth background: first source tap and four Catmull-Rom weights for
    * each output phase of a source pixel. */
   int tap_offset[kDkc2HdMaxScale];
@@ -216,6 +270,8 @@ struct Dkc2Hd {
    * only when listed, so keys without art never reach the file system. */
   PackFile *pack_files;
   size_t pack_file_count;
+  SpriteAlias *aliases; /* sorted by key */
+  size_t alias_count;
   char dump_dir[kPathMax];
   const uint8_t *rom;
   size_t rom_size;
@@ -241,6 +297,7 @@ struct Dkc2Hd {
   unsigned sprite_art_count;
   CacheEntry cache[kCacheSlots];
   unsigned cache_count;
+  size_t cache_bytes;
   uint32_t base[kMaxPixels];
   /* BG1 art: when the pack lists terrain blocks or screens, BG1 leaves the
    * rendered frame and is composed here, art where the pack has it and the
@@ -406,6 +463,51 @@ static bool CopyPath(char *destination, const char *source) {
 static HdImage *LoadImage(const char *path);
 static bool ListPack(Dkc2Hd *hd);
 
+static int CompareAlias(const void *a, const void *b) {
+  const uint64_t x = ((const SpriteAlias *)a)->key,
+                 y = ((const SpriteAlias *)b)->key;
+  return (x > y) - (x < y);
+}
+
+/* Reads aliases.txt: "<graphic>_p<palette content> -> <graphic>_<slot>"
+ * per line, so art made for a palette slot follows that palette into any
+ * slot without a copy of the file. */
+static void LoadAliases(Dkc2Hd *hd) {
+  char path[kPathMax + 32];
+  snprintf(path, sizeof path, "%s/aliases.txt", hd->pack_dir);
+  FILE *index = fopen(path, "r");
+  if (!index)
+    return;
+  size_t capacity = 0;
+  unsigned graphic, content, target, palette;
+  int fields;
+  while ((fields = fscanf(index, "%4x_p%8x -> %4x_%1u", &graphic, &content,
+                          &target, &palette)) == 4) {
+    if (graphic != target || palette >= kPalettes || graphic == 0) {
+      fprintf(stderr, "warning: DKC2_HD_PACK alias %04x_p%08x is invalid\n",
+              graphic, content);
+      continue;
+    }
+    if (hd->alias_count == capacity) {
+      const size_t grown = capacity ? capacity * 2 : 512;
+      SpriteAlias *aliases =
+          (SpriteAlias *)realloc(hd->aliases, grown * sizeof *aliases);
+      if (!aliases)
+        break;
+      hd->aliases = aliases;
+      capacity = grown;
+    }
+    hd->aliases[hd->alias_count++] =
+        (SpriteAlias){(uint64_t)content << 16 | graphic, (uint8_t)palette};
+  }
+  if (fields != EOF)
+    fprintf(stderr, "warning: DKC2_HD_PACK aliases.txt stops at line %zu\n",
+            hd->alias_count + 1);
+  fclose(index);
+  if (hd->alias_count)
+    qsort(hd->aliases, hd->alias_count, sizeof *hd->aliases, CompareAlias);
+}
+
 /* Reads screens.txt: one 16-digit hex key per line, each with a native BG1
  * reference "s_<key>.ref" (as the dump writes it) and art "s_<key>.rgba". */
 static void LoadScreens(Dkc2Hd *hd) {
@@ -501,7 +603,13 @@ Dkc2Hd *Dkc2HdCreate(const Dkc2HdConfig *config, const uint8_t *rom,
                             ? kDkc2HdPixelFilterTable
                             : kDkc2HdDefaultFilterTable;
     hd->learned = LoadLearnedTable(table);
-    if (!hd->learned) {
+    hd->learned_memo =
+        hd->learned ? (LearnedWeights *)calloc(kLearnedMemoSlots,
+                                               sizeof *hd->learned_memo)
+                    : NULL;
+    if (!hd->learned_memo) {
+      free(hd->learned);
+      hd->learned = NULL;
       fprintf(stderr,
               "warning: HD sprite filter table %s is missing or invalid; "
               "using the smooth filter\n",
@@ -537,6 +645,7 @@ Dkc2Hd *Dkc2HdCreate(const Dkc2HdConfig *config, const uint8_t *rom,
     hd->layer_pack = index != NULL;
     if (index)
       fclose(index);
+    LoadAliases(hd);
     LoadScreens(hd);
     hd->layer_pack |= hd->screen_count > 0;
     snprintf(path, sizeof path, "%s/backgrounds.txt", hd->pack_dir);
@@ -565,10 +674,10 @@ Dkc2Hd *Dkc2HdCreate(const Dkc2HdConfig *config, const uint8_t *rom,
 static void FlushCache(Dkc2Hd *hd) {
   for (unsigned i = 0; i < kCacheSlots; i++) {
     free(hd->cache[i].image);
-    hd->cache[i].image = NULL;
-    hd->cache[i].key = 0;
+    hd->cache[i] = (CacheEntry){0};
   }
   hd->cache_count = 0;
+  hd->cache_bytes = 0;
 }
 
 void Dkc2HdDestroy(Dkc2Hd *hd) {
@@ -595,13 +704,20 @@ void Dkc2HdDestroy(Dkc2Hd *hd) {
   for (size_t i = 0; i < hd->pack_file_count; i++)
     free(hd->pack_files[i].image);
   free(hd->pack_files);
+  free(hd->aliases);
   free(hd->learned);
+  free(hd->learned_memo);
+  free(hd->batch);
   free(hd->output);
   free(hd);
 }
 
 void Dkc2HdSetClock(Dkc2Hd *hd, uint64_t (*now)(void)) {
   if (hd) hd->clock = now;
+}
+
+size_t Dkc2HdCacheBytes(const Dkc2Hd *hd) {
+  return hd ? hd->cache_bytes : 0;
 }
 
 void Dkc2HdTakeTimings(Dkc2Hd *hd, Dkc2HdTimings *timings) {
@@ -613,12 +729,19 @@ void Dkc2HdTakeTimings(Dkc2Hd *hd, Dkc2HdTimings *timings) {
   memset(&hd->timings, 0, sizeof hd->timings);
 }
 
-void Dkc2HdBeginFrame(Dkc2Hd *hd, Ppu *ppu, int frame_width) {
+void Dkc2HdBeginFrame(Dkc2Hd *hd, Ppu *ppu, int frame_width,
+                      const Dkc2HdmaLines *previous_lines) {
   if (!hd || !ppu)
     return;
+  /* The mode the picture starts in. HDMA can change it before the first
+   * line: "Nintendo Presents" ends every frame in mode 5 yet shows mode 1
+   * above its last band, so the previous frame's first line decides. */
+  const unsigned top_mode = previous_lines
+                                ? previous_lines->line[1].bgmode & 7u
+                                : ppu->bgmode & 7u;
   static const PpuOverlaySource kBgSources[kBgLayers] = {
       kPpuOverlaySource_Bg1, kPpuOverlaySource_Bg2, kPpuOverlaySource_Bg3};
-  hd->active = (ppu->bgmode & 7) == 1 && frame_width >= kNativeWidth &&
+  hd->active = top_mode == 1 && frame_width >= kNativeWidth &&
                frame_width <= kMaxWidth &&
                (frame_width - kNativeWidth) % 2 == 0;
   hd->width = frame_width;
@@ -1000,12 +1123,14 @@ static uint64_t SpriteArtKey(const Ppu *ppu, const SpriteState *state) {
 }
 
 /* Pack art for a sprite record: "<graphic>_p<palette content>.rgba", else
- * "<graphic>_<palette slot>.rgba". */
+ * "<graphic>_<palette slot>.rgba" of the slot aliases.txt names for that
+ * content, else of the record's own slot. */
 static const HdImage *PackImage(Dkc2Hd *hd, const Ppu *ppu,
                                 const SpriteState *state) {
   if (!hd->pack_dir[0])
     return NULL;
   const uint64_t key = SpriteArtKey(ppu, state);
+  unsigned palette = (state->sprite.properties >> 9) & 7u;
   PackEntry *entry =
       PackFind(hd->sprite_art, kSpriteArtSlots, &hd->sprite_art_count, key);
   if (entry && entry->state == kPackUnknown) {
@@ -1014,11 +1139,20 @@ static const HdImage *PackImage(Dkc2Hd *hd, const Ppu *ppu,
              (unsigned)(key >> 16));
     entry->image = LoadPackImage(hd, name);
     entry->state = entry->image ? kPackLoaded : kPackMissing;
+    const SpriteAlias wanted = {key, 0};
+    const SpriteAlias *alias =
+        hd->alias_count
+            ? (const SpriteAlias *)bsearch(&wanted, hd->aliases,
+                                           hd->alias_count, sizeof *hd->aliases,
+                                           CompareAlias)
+            : NULL;
+    entry->fallback = alias ? alias->palette : (uint8_t)palette;
   }
   if (entry && entry->image)
     return entry->image;
+  if (entry)
+    palette = entry->fallback;
   const unsigned slot = state->sprite.graphic_id / 4u;
-  const unsigned palette = (state->sprite.properties >> 9) & 7u;
   if (hd->pack_state[slot][palette] == kPackUnknown) {
     char name[32];
     snprintf(name, sizeof name, "%04x_%x.rgba", slot * 4u, palette);
@@ -1080,7 +1214,7 @@ static HdImage *SmoothImage(const Dkc2NativeSpriteFrame *frame, int scale) {
 
 /* The decoded frame itself, opaque where it has color. */
 static HdImage *FrameImage(const Dkc2NativeSpriteFrame *frame) {
-  HdImage *image = NewImage(frame->width, frame->height);
+  HdImage *image = AllocImage(frame->width, frame->height);
   if (!image)
     return NULL;
   for (int i = 0; i < frame->width * frame->height; i++)
@@ -1089,10 +1223,46 @@ static HdImage *FrameImage(const Dkc2NativeSpriteFrame *frame) {
   return image;
 }
 
+/* The weights of the cell with these window indices, from memo or
+ * computed into it. */
+static const LearnedWeights *LearnedCellWeights(const int8_t *table,
+                                                LearnedWeights *memo,
+                                                const unsigned index[]) {
+  uint64_t windows = 0;
+  for (int t = 0; t < kLearnedPatterns; t++)
+    windows = windows << 16 | index[t];
+  LearnedWeights *entry =
+      &memo[(windows * 0x9e3779b97f4a7c15ull) >> 54 & (kLearnedMemoSlots - 1)];
+  if (entry->set && entry->windows == windows)
+    return entry;
+  const int8_t *rows[kLearnedPatterns];
+  for (int t = 0; t < kLearnedPatterns; t++)
+    rows[t] = table + ((size_t)t * kLearnedWindows + index[t]) * kLearnedRow;
+  for (int sub = 0; sub < kLearnedSubpixels; sub++) {
+    float logit[kLearnedOutputs], top = -1e30f;
+    for (int k = 0; k < kLearnedOutputs; k++) {
+      int sum = 0;
+      for (int t = 0; t < kLearnedPatterns; t++)
+        sum += rows[t][sub * kLearnedOutputs + k];
+      logit[k] = (float)sum / kLearnedLogitScale;
+      top = logit[k] > top ? logit[k] : top;
+    }
+    float weight[kLearnedOutputs], total = 0;
+    for (int k = 0; k < kLearnedOutputs; k++)
+      total += weight[k] = expf(logit[k] - top);
+    for (int n = 0; n < 4; n++)
+      entry->share[sub][n] = weight[n] / total;
+  }
+  entry->windows = windows;
+  entry->set = true;
+  return entry;
+}
+
 /* The learned filter (see dkc2_hd.h) at its table's scale, premultiplied
  * inside, straight alpha out. NULL when the frame has more than 15 colors
- * (it then takes the smooth filter). */
-static HdImage *LearnedImage(const int8_t *table,
+ * (it then takes the smooth filter). memo holds kLearnedMemoSlots entries
+ * kept between calls with the same table. */
+static HdImage *LearnedImage(const int8_t *table, LearnedWeights *memo,
                              const Dkc2NativeSpriteFrame *frame) {
   const int width = frame->width, height = frame->height;
   const int pixel_count = width * height;
@@ -1144,19 +1314,24 @@ static HdImage *LearnedImage(const int8_t *table,
    * subpixels sit half a pixel down and right of its top-left pixel. */
   for (int cell_y = -1; cell_y < height; cell_y++) {
     for (int cell_x = -1; cell_x < width; cell_x++) {
-      const int8_t *rows[kLearnedPatterns];
+      unsigned index[kLearnedPatterns];
+      unsigned any = 0;
       for (int t = 0; t < kLearnedPatterns; t++) {
-        unsigned index = 0;
+        index[t] = 0;
         for (int n = 0; n < 4; n++) {
           const int y = cell_y + kLearnedPattern[t][n][0];
           const int x = cell_x + kLearnedPattern[t][n][1];
           const unsigned rank = y >= 0 && y < height && x >= 0 && x < width
                                     ? ranks[y * width + x]
                                     : 0u;
-          index = index << 4 | rank;
+          index[t] = index[t] << 4 | rank;
         }
-        rows[t] = table + ((size_t)t * kLearnedWindows + index) * kLearnedRow;
+        any |= index[t];
       }
+      /* With every pixel around it transparent the cell's subpixels are
+       * transparent too. */
+      const LearnedWeights *weights =
+          any ? LearnedCellWeights(table, memo, index) : NULL;
       float cell[4][4];  /* premultiplied RGBA of the cell's pixels */
       for (int n = 0; n < 4; n++) {
         const int y = cell_y + kLearnedPattern[0][n][0];
@@ -1175,29 +1350,20 @@ static HdImage *LearnedImage(const int8_t *table,
         if (out_y < 0 || out_y >= height * scale || out_x < 0 ||
             out_x >= width * scale)
           continue;
-        float logit[kLearnedOutputs], top = -1e30f;
-        for (int k = 0; k < kLearnedOutputs; k++) {
-          int sum = 0;
-          for (int t = 0; t < kLearnedPatterns; t++)
-            sum += rows[t][sub * kLearnedOutputs + k];
-          logit[k] = (float)sum / kLearnedLogitScale;
-          top = logit[k] > top ? logit[k] : top;
-        }
-        float weight[kLearnedOutputs], total = 0;
-        for (int k = 0; k < kLearnedOutputs; k++)
-          total += weight[k] = expf(logit[k] - top);
-        /* The fifth output is transparent: it only takes weight away. */
-        float rgba[4] = {0, 0, 0, 0};
-        for (int n = 0; n < 4; n++)
-          for (int c = 0; c < 4; c++)
-            rgba[c] += weight[n] / total * cell[n][c];
         uint32_t result = 0;
-        if (rgba[3] * 255.0f >= 0.5f) {
-          result = (uint32_t)(rgba[3] * 255.0f + 0.5f) << 24;
-          for (int c = 0; c < 3; c++) {
-            float value = rgba[c] / rgba[3] * 255.0f;
-            value = value < 0 ? 0 : value > 255 ? 255 : value;
-            result |= (uint32_t)(value + 0.5f) << (16 - 8 * c);
+        if (weights) {
+          const float *share = weights->share[sub];
+          float rgba[4] = {0, 0, 0, 0};
+          for (int n = 0; n < 4; n++)
+            for (int c = 0; c < 4; c++)
+              rgba[c] += share[n] * cell[n][c];
+          if (rgba[3] * 255.0f >= 0.5f) {
+            result = (uint32_t)(rgba[3] * 255.0f + 0.5f) << 24;
+            for (int c = 0; c < 3; c++) {
+              float value = rgba[c] / rgba[3] * 255.0f;
+              value = value < 0 ? 0 : value > 255 ? 255 : value;
+              result |= (uint32_t)(value + 0.5f) << (16 - 8 * c);
+            }
           }
         }
         image->pixels[out_y * width * scale + out_x] = result;
@@ -1209,7 +1375,7 @@ static HdImage *LearnedImage(const int8_t *table,
 
 static uint64_t PaletteKey(const Ppu *ppu, const SpriteState *state) {
   const unsigned palette = (state->sprite.properties >> 9) & 7u;
-  uint32_t hash = 2166136261u ^ ppu->brightnessMult[31];
+  uint32_t hash = 2166136261u;
   for (unsigned i = 0; i < 16; i++) {
     hash ^= ppu->cgram[0x80u + palette * 16u + i];
     hash *= 16777619u;
@@ -1218,30 +1384,244 @@ static uint64_t PaletteKey(const Ppu *ppu, const SpriteState *state) {
          state->sprite.graphic_id;
 }
 
-/* The filtered image of the frame in hd->frame. A full cache is flushed at
- * the start of a frame (the last scene may still use its images), so a
- * probe here always meets a free slot. */
-static const HdImage *FilteredCached(Dkc2Hd *hd, uint64_t key) {
-  unsigned slot = (unsigned)((key ^ key >> 29) * 0x9e3779b97f4a7c15ull >> 54);
-  for (;; slot = (slot + 1) % kCacheSlots) {
-    if (!hd->cache[slot].image)
-      break;
-    if (hd->cache[slot].key == key)
-      return hd->cache[slot].image;
-  }
-  HdImage *image = NULL;
-  if (hd->learned)
-    image = LearnedImage(hd->learned, &hd->frame);
+/* The frame filtered as the configuration asks, without an id. Any thread
+ * may run it with its own memo. */
+static HdImage *FilterFrame(const int8_t *learned, LearnedWeights *memo,
+                            int filter, int scale,
+                            const Dkc2NativeSpriteFrame *frame) {
+  HdImage *image = learned ? LearnedImage(learned, memo, frame) : NULL;
   if (!image)
-    image = hd->filter == kDkc2HdFilterNearest
-                ? FrameImage(&hd->frame)
-                : SmoothImage(&hd->frame, hd->scale);
-  if (image) {
-    hd->cache[slot].key = key;
-    hd->cache[slot].image = image;
-    hd->cache_count++;
-  }
+    image = filter == kDkc2HdFilterNearest ? FrameImage(frame)
+                                           : SmoothImage(frame, scale);
   return image;
+}
+
+static size_t ImageBytes(const HdImage *image) {
+  return sizeof *image + sizeof(uint32_t) * (size_t)image->width *
+                             (size_t)image->height;
+}
+
+/* Adds the frame in hd->frame to the open filter batch, if it has room. */
+static bool QueueFilter(Dkc2Hd *hd, uint64_t key) {
+  Dkc2HdFilterBatch *batch = hd->batch;
+  if (batch->running || batch->count == kFilterBatchMax)
+    return false;
+  FilterJob *job = &batch->jobs[batch->count++];
+  job->key = key;
+  job->frame = hd->frame;
+  job->image = NULL;
+  return true;
+}
+
+/* The cache entry holding key, or the free slot where it would go. A full
+ * cache is flushed at the start of a frame (the last scene may still use
+ * its images), so a probe always meets one or the other. */
+static CacheEntry *CacheSlot(Dkc2Hd *hd, uint64_t key) {
+  unsigned slot = (unsigned)((key ^ key >> 29) * 0x9e3779b97f4a7c15ull >> 32) %
+                  kCacheSlots;
+  while (hd->cache[slot].image && hd->cache[slot].key != key)
+    slot = (slot + 1) % kCacheSlots;
+  return &hd->cache[slot];
+}
+
+/* Fills the free entry with the frame in hd->frame filtered, or with the
+ * frame itself standing in while a filter batch takes it. */
+static const HdImage *CacheFrame(Dkc2Hd *hd, CacheEntry *entry,
+                                 uint64_t key) {
+  const bool stand_in = hd->batch != NULL;
+  HdImage *image = stand_in ? FrameImage(&hd->frame)
+                            : FilterFrame(hd->learned, hd->learned_memo,
+                                          hd->filter, hd->scale, &hd->frame);
+  if (!image)
+    return NULL;
+  image->id = NextImageId();
+  *entry = (CacheEntry){key, image, stand_in,
+                        stand_in && QueueFilter(hd, key)};
+  hd->cache_count++;
+  hd->cache_bytes += ImageBytes(image);
+  if (!stand_in)
+    hd->timings.filtered_inframe++;
+  return image;
+}
+
+/* The filtered image of the frame in hd->frame, by key. */
+static const HdImage *FilteredCached(Dkc2Hd *hd, uint64_t key) {
+  CacheEntry *entry = CacheSlot(hd, key);
+  if (!entry->image)
+    return CacheFrame(hd, entry, key);
+  if (entry->stand_in && !entry->queued)
+    entry->queued = QueueFilter(hd, key);
+  return entry->image;
+}
+
+/* The filtered image of a sprite-table record's frame. The frame is decoded
+ * (unlit: the scene applies the brightness) only when the cache needs it. */
+static const HdImage *SpriteCached(Dkc2Hd *hd, const Ppu *ppu,
+                                   const SpriteState *state) {
+  const uint64_t key = PaletteKey(ppu, state);
+  CacheEntry *entry = CacheSlot(hd, key);
+  if (entry->image && !(entry->stand_in && !entry->queued))
+    return entry->image;
+  if (!Dkc2NativeDecodeSpriteFrameUnlit(ppu, &state->sprite, &hd->frame))
+    return entry->image;
+  if (!entry->image)
+    return CacheFrame(hd, entry, key);
+  entry->queued = QueueFilter(hd, key);
+  return entry->image;
+}
+
+void Dkc2HdSetFilterBatches(Dkc2Hd *hd, bool enabled) {
+  if (!hd || enabled == (hd->batch != NULL))
+    return;
+  if (!enabled) {
+    free(hd->batch);
+    hd->batch = NULL;
+    return;
+  }
+  hd->batch = (Dkc2HdFilterBatch *)calloc(1, sizeof *hd->batch);
+  if (!hd->batch)
+    return;
+  hd->batch->learned = hd->learned;
+  hd->batch->memo = hd->learned_memo;
+  hd->batch->filter = hd->filter;
+  hd->batch->scale = hd->scale;
+}
+
+Dkc2HdFilterBatch *Dkc2HdTakeFilterBatch(Dkc2Hd *hd) {
+  if (!hd || !hd->batch || hd->batch->running || !hd->batch->count)
+    return NULL;
+  hd->batch->running = true;
+  return hd->batch;
+}
+
+void Dkc2HdRunFilterBatch(Dkc2HdFilterBatch *batch) {
+  for (unsigned i = 0; i < batch->count; i++) {
+    FilterJob *job = &batch->jobs[i];
+    job->image = FilterFrame(batch->learned, batch->memo, batch->filter,
+                             batch->scale, &job->frame);
+  }
+}
+
+/* The sprite cache file: a header naming the filter, then records of a key,
+ * a 16-bit width and height and the filtered pixels, appended as batches
+ * run. A file written for another filter or scale is started over. */
+enum { kSpriteCacheHeader = 8 };
+
+static void SpriteCacheHeader(const Dkc2Hd *hd,
+                              uint8_t header[kSpriteCacheHeader]) {
+  memcpy(header, "DKSC", 4);
+  header[4] = 1;
+  header[5] = (uint8_t)hd->filter;
+  header[6] = (uint8_t)hd->scale;
+  header[7] = 0;
+}
+
+FILE *Dkc2HdOpenSpriteCache(const Dkc2Hd *hd, const char *path) {
+  if (!hd || !path)
+    return NULL;
+  uint8_t header[kSpriteCacheHeader], found[kSpriteCacheHeader];
+  SpriteCacheHeader(hd, header);
+  FILE *file = fopen(path, "rb");
+  const bool same = file && fread(found, 1, sizeof found, file) ==
+                                sizeof found &&
+                    memcmp(found, header, sizeof header) == 0;
+  if (file)
+    fclose(file);
+  if (same)
+    return fopen(path, "ab");
+  file = fopen(path, "wb");
+  if (file && fwrite(header, 1, sizeof header, file) != sizeof header) {
+    fclose(file);
+    return NULL;
+  }
+  return file;
+}
+
+void Dkc2HdSaveFilterBatch(const Dkc2HdFilterBatch *batch, FILE *file) {
+  /* Past what a session loads back the file only grows. */
+  const long size = ftell(file);
+  if (size < 0 || (size_t)size >= kCacheBudget / 2)
+    return;
+  for (unsigned i = 0; i < batch->count; i++) {
+    const HdImage *image = batch->jobs[i].image;
+    if (!image)
+      continue;
+    const uint64_t key = batch->jobs[i].key;
+    uint8_t record[12];
+    for (int b = 0; b < 8; b++)
+      record[b] = (uint8_t)(key >> (8 * b));
+    record[8] = (uint8_t)image->width;
+    record[9] = (uint8_t)(image->width >> 8);
+    record[10] = (uint8_t)image->height;
+    record[11] = (uint8_t)(image->height >> 8);
+    const size_t count = (size_t)image->width * (size_t)image->height;
+    if (fwrite(record, 1, sizeof record, file) != sizeof record ||
+        fwrite(image->pixels, sizeof *image->pixels, count, file) != count)
+      return;
+  }
+  (void)fflush(file);
+}
+
+void Dkc2HdLoadSpriteCache(Dkc2Hd *hd, const char *path) {
+  if (!hd || !path)
+    return;
+  FILE *file = fopen(path, "rb");
+  if (!file)
+    return;
+  uint8_t header[kSpriteCacheHeader], found[kSpriteCacheHeader];
+  SpriteCacheHeader(hd, header);
+  bool ok = fread(found, 1, sizeof found, file) == sizeof found &&
+            memcmp(found, header, sizeof header) == 0;
+  uint8_t record[12];
+  /* Half the budget, so play still has room to add frames. */
+  while (ok && hd->cache_bytes < kCacheBudget / 2 &&
+         hd->cache_count < kCacheFlush &&
+         fread(record, 1, sizeof record, file) == sizeof record) {
+    uint64_t key = 0;
+    for (int b = 8; b-- > 0;)
+      key = key << 8 | record[b];
+    const int width = record[8] | record[9] << 8;
+    const int height = record[10] | record[11] << 8;
+    ok = width > 0 && height > 0 &&
+         width <= kDkc2NativeFrameMax * kLearnedScale &&
+         height <= kDkc2NativeFrameMax * kLearnedScale;
+    HdImage *image = ok ? AllocImage(width, height) : NULL;
+    const size_t count = (size_t)width * (size_t)height;
+    ok = image &&
+         fread(image->pixels, sizeof *image->pixels, count, file) == count;
+    CacheEntry *entry = ok ? CacheSlot(hd, key) : NULL;
+    /* A frame saved twice keeps its first copy. */
+    if (!entry || entry->image) {
+      free(image);
+      continue;
+    }
+    image->id = NextImageId();
+    *entry = (CacheEntry){key, image, false, false};
+    hd->cache_count++;
+    hd->cache_bytes += ImageBytes(image);
+  }
+  fclose(file);
+}
+
+void Dkc2HdAdoptFilterBatch(Dkc2Hd *hd, Dkc2HdFilterBatch *batch) {
+  for (unsigned i = 0; i < batch->count; i++) {
+    FilterJob *job = &batch->jobs[i];
+    if (!job->image)
+      continue;
+    CacheEntry *entry = CacheSlot(hd, job->key);
+    /* A flush since the batch was taken dropped the stand-in. */
+    if (!entry->image || !entry->stand_in) {
+      free(job->image);
+      continue;
+    }
+    hd->cache_bytes += ImageBytes(job->image) - ImageBytes(entry->image);
+    free(entry->image);
+    job->image->id = NextImageId();
+    *entry = (CacheEntry){job->key, job->image, false, false};
+    hd->timings.filtered_async++;
+  }
+  batch->count = 0;
+  batch->running = false;
 }
 
 /* The OBJ palette of OAM attributes or record properties. */
@@ -1393,14 +1773,12 @@ static void AddSprite(Dkc2Hd *hd, const Ppu *ppu, unsigned k,
   const SpriteState *state = &hd->sprites[k];
   const HdImage *image = PackImage(hd, ppu, state);
   const bool art = image != NULL;
-  const unsigned brightness = art ? ppu->brightnessMult[31] : 255u;
-  if (!image) {
-    if (!Dkc2NativeDecodeSpriteFrame(ppu, &state->sprite, &hd->frame))
-      return;
-    image = FilteredCached(hd, PaletteKey(ppu, state));
-    if (!image)
-      return;
-  }
+  /* Art and filtered frames are both unlit. */
+  const unsigned brightness = ppu->brightnessMult[31];
+  if (!image)
+    image = SpriteCached(hd, ppu, state);
+  if (!image)
+    return;
   const int scale = hd->scale;
   snprintf(hd->quad_name[hd->quad_count], sizeof hd->quad_name[0],
            "%04x_p%08x", state->sprite.graphic_id,
@@ -1419,6 +1797,19 @@ static void AddSprite(Dkc2Hd *hd, const Ppu *ppu, unsigned k,
   quad->brightness = (uint8_t)brightness;
   quad->rank = state->rank;
   quad->index = (uint8_t)position;
+}
+
+/* Object color at full brightness of palette pixel in an OAM palette. */
+static uint32_t ObjColorUnlit(const Ppu *ppu, const LooseEntry *entry,
+                              uint8_t pixel) {
+  const uint16_t color =
+      ppu->cgram[0x80u + ((entry->oam.attributes >> 9) & 7u) * 16u + pixel];
+  uint32_t result = 0xff000000u;
+  for (int c = 0; c < 3; c++) {
+    const unsigned level = (color >> (5 * c)) & 0x1fu;
+    result |= (uint32_t)(level << 3 | level >> 2) << (16 - 8 * c);
+  }
+  return result;
 }
 
 /* Object color (brightness applied) of palette pixel in an OAM palette. */
@@ -1569,7 +1960,7 @@ static void PrepareLoose(Dkc2Hd *hd, const Ppu *ppu) {
   }
 }
 
-/* Decodes loose group g into hd->frame (brightness applied) and returns its
+/* Decodes loose group g into hd->frame (unlit) and returns its
  * key: its size and raw palette colors, so the same art follows the object
  * through fades and wherever OAM, VRAM or the palette slot put it. */
 static uint64_t DecodeLoose(Dkc2Hd *hd, const Ppu *ppu, unsigned g) {
@@ -1594,7 +1985,7 @@ static uint64_t DecodeLoose(Dkc2Hd *hd, const Ppu *ppu, unsigned g) {
         const size_t i =
             (size_t)(entry->oam.y + y - group->top) * (size_t)frame->width +
             (size_t)(entry->oam.x + x - group->left);
-        frame->pixels[i] = ObjColor(ppu, entry, pixel);
+        frame->pixels[i] = ObjColorUnlit(ppu, entry, pixel);
         hd->loose_raw[i] =
             ppu->cgram[0x80u + palette * 16u + pixel] & 0x7fffu;
       }
@@ -1647,9 +2038,10 @@ static void AddLoose(Dkc2Hd *hd, const Ppu *ppu, unsigned g,
   }
   const HdImage *image = entry ? entry->image : NULL;
   const bool art = image != NULL;
-  const unsigned brightness = art ? ppu->brightnessMult[31] : 255u;
+  /* Art and filtered frames are both unlit. */
+  const unsigned brightness = ppu->brightnessMult[31];
   if (!image)
-    image = FilteredCached(hd, key ^ (uint64_t)ppu->brightnessMult[31] << 48);
+    image = FilteredCached(hd, key);
   if (!image)
     return;
   const int scale = hd->scale;
@@ -2591,7 +2983,7 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
   hd->resolve = resolve || frame_pitch != (size_t)hd->width * 4u;
   hd->origin = (hd->width - kNativeWidth) / 2 - ppu->wsPresentationXBias;
   uint64_t lap = Now(hd);
-  if (hd->cache_count >= kCacheFlush)
+  if (hd->cache_count >= kCacheFlush || hd->cache_bytes >= kCacheBudget)
     FlushCache(hd);
   /* The displayed OAM was built from the previous game update. */
   PrepareOam(hd, ppu);
