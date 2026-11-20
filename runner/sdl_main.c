@@ -33,6 +33,7 @@
 #include "common_rtl.h"
 #include "host_report.h"
 #include "launcher.h"
+#include "snes/apu.h"
 #include "snes/snes.h"
 
 #include <errno.h>
@@ -43,6 +44,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -52,6 +54,539 @@
 #define DKC2_MKDIR(path) _mkdir(path)
 #else
 #define DKC2_MKDIR(path) mkdir(path, 0755)
+#endif
+
+#ifdef __SWITCH__
+#include <SDL_opengl.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <switch.h>
+#include "snes/interp_bridge.h"
+#include "snes/tier2_capture.h"
+#include <unistd.h>
+static const char kSwitchDataDirectory[] = "sdmc:/switch/DKC2Recomp";
+
+/* perf.log in the data folder: every kSwitchPerfFrames presented frames, the
+ * rate and the mean cost of each stage, draw split into the PPU frame and
+ * the HD scene. The console has no environment to opt in through, so it is
+ * always written; test runs echo it to stdout. spikes.log lists each frame
+ * slower than kSwitchSpikeMs with its stages. Both are appended, each
+ * session headed by its start time. */
+enum { kSwitchPerfFrames = 300, kSwitchSpikeMs = 20 };
+
+/* A log file whose lines a thread of its own writes: a write to the SD card
+ * can block for over 100 ms, which the game loop must not wait for. The
+ * thread runs on a core of its own at low priority, so the write does not
+ * preempt the game either. Lines that find the buffer full are dropped and
+ * counted. */
+enum {
+  kSwitchLogBytes = 64 * 1024,
+  kSwitchLogStack = 64 * 1024,
+  kSwitchLogPriority = 0x3b,
+  kSwitchLogCore = 2,
+};
+
+typedef struct SwitchLog {
+  FILE *file;
+  Thread thread;
+  Mutex lock;
+  CondVar wake;
+  char pending[kSwitchLogBytes]; /* filled by the game loop */
+  char writing[kSwitchLogBytes]; /* owned by the thread while it writes */
+  size_t used;
+  unsigned dropped;
+  bool stop;
+  int core; /* kSwitchLogCore, or -2 when it runs wherever it was placed */
+} SwitchLog;
+
+static void SwitchLogThread(void *argument) {
+  SwitchLog *log = argument;
+  mutexLock(&log->lock);
+  for (;;) {
+    while (!log->stop && !log->used) condvarWait(&log->wake, &log->lock);
+    if (!log->used) break;
+    const size_t size = log->used;
+    memcpy(log->writing, log->pending, size);
+    log->used = 0;
+    mutexUnlock(&log->lock);
+    (void)fwrite(log->writing, 1, size, log->file);
+    (void)fflush(log->file);
+    mutexLock(&log->lock);
+  }
+  mutexUnlock(&log->lock);
+}
+
+/* Appends to the file at path, or returns NULL. */
+static SwitchLog *SwitchLogOpen(const char *path) {
+  SwitchLog *log = calloc(1, sizeof *log);
+  if (!log) return NULL;
+  log->file = fopen(path, "a");
+  if (!log->file) {
+    free(log);
+    return NULL;
+  }
+  mutexInit(&log->lock);
+  condvarInit(&log->wake);
+  /* Applet mode may not grant the spare core; then any core will do. */
+  log->core = kSwitchLogCore;
+  Result result = threadCreate(&log->thread, SwitchLogThread, log, NULL,
+                               kSwitchLogStack, kSwitchLogPriority, log->core);
+  if (R_FAILED(result)) {
+    log->core = -2;
+    result = threadCreate(&log->thread, SwitchLogThread, log, NULL,
+                          kSwitchLogStack, kSwitchLogPriority, log->core);
+  }
+  bool started = R_SUCCEEDED(result);
+  if (started && R_FAILED(threadStart(&log->thread))) {
+    (void)threadClose(&log->thread);
+    started = false;
+  }
+  if (!started) {
+    fclose(log->file);
+    free(log);
+    return NULL;
+  }
+  return log;
+}
+
+static void SwitchLogPrintf(SwitchLog *log, const char *format, ...)
+    __attribute__((format(printf, 2, 3)));
+
+static void SwitchLogPrintf(SwitchLog *log, const char *format, ...) {
+  char line[512];
+  va_list arguments;
+  va_start(arguments, format);
+  const int length = vsnprintf(line, sizeof line, format, arguments);
+  va_end(arguments);
+  if (length < 0) return;
+  const size_t size =
+      (size_t)length < sizeof line ? (size_t)length : sizeof line - 1;
+  mutexLock(&log->lock);
+  if (log->used + size <= sizeof log->pending) {
+    memcpy(log->pending + log->used, line, size);
+    log->used += size;
+    condvarWakeOne(&log->wake);
+  } else {
+    log->dropped++;
+  }
+  mutexUnlock(&log->lock);
+}
+
+/* Writes what is left, notes any dropped lines and closes the file. */
+static void SwitchLogClose(SwitchLog *log) {
+  if (!log) return;
+  mutexLock(&log->lock);
+  log->stop = true;
+  condvarWakeOne(&log->wake);
+  mutexUnlock(&log->lock);
+  (void)threadWaitForExit(&log->thread);
+  (void)threadClose(&log->thread);
+  if (log->dropped)
+    fprintf(log->file, "dropped lines: %u\n", log->dropped);
+  fclose(log->file);
+  free(log);
+}
+
+/* Running totals a spike is measured against: the stage costs as of the
+ * previous presented frame. */
+typedef struct SwitchPerfMark {
+  uint64_t run, draw, ppu, present, audio, events, rewind, pace, art, tiles,
+      sprites, uploads, upload_bytes, interp_steps, tier_hits,
+      filtered_inframe, filtered_async;
+} SwitchPerfMark;
+
+typedef struct SwitchPerf {
+  SwitchLog *file;
+  bool echo;
+  uint64_t frequency;
+  uint64_t window_start;
+  uint64_t run, draw, ppu, audio, present;
+  /* Host work around the stages: input and HD reloads at the top of the
+   * loop, rewind snapshots, and waiting for the next frame's deadline. */
+  uint64_t events, rewind, pace;
+  uint64_t run_max; /* the slowest single frame of the recompiled CPU */
+  Dkc2HdTimings hd; /* scene building, within draw */
+  unsigned emulated, presented;
+  uint64_t draws, uploads, upload_bytes;
+  /* Audio queue, sampled as each emulated frame arrives: frames that found
+   * it empty after priming, its lowest and highest fill, and the mixed
+   * samples at full scale. */
+  unsigned audio_underruns;
+  double audio_fill_min_ms, audio_fill_max_ms;
+  bool audio_fill_seen;
+  uint64_t audio_clipped;
+  /* Controllers attached when the window closed, and every SNES button
+   * they pressed in it (before a bench replay takes over). */
+  unsigned pads;
+  uint32_t pad_buttons;
+  size_t cache_bytes; /* the HD sprite cache as of the last scene */
+  SwitchLog *spikes;
+  SwitchLog *journal; /* the interpreter's tier2 discoveries */
+  /* Save states, loads and bug reports go to perf.log as "event" lines,
+   * kept across sessions (stdout.log starts over at each boot). A log of
+   * their own would need another thread, which the console refuses. */
+  SwitchLog *events_log;
+  uint64_t frame;        /* presented frames this session */
+  uint64_t last_present; /* when the previous frame was presented */
+  SwitchPerfMark mark;   /* the totals as of the last presented frame */
+} SwitchPerf;
+
+static double SwitchPerfMs(const SwitchPerf *perf, uint64_t ticks,
+                           unsigned count) {
+  return count ? 1000.0 * (double)ticks / (double)perf->frequency / count : 0.0;
+}
+
+static SwitchPerfMark SwitchPerfTotals(const SwitchPerf *perf) {
+  return (SwitchPerfMark){perf->run, perf->draw, perf->ppu, perf->present,
+                          perf->audio, perf->events, perf->rewind,
+                          perf->pace, perf->hd.art, perf->hd.tiles, perf->hd.sprites,
+                          perf->uploads, perf->upload_bytes,
+                          interp_step_count(),
+                          (uint64_t)interp_tier_hit_count(),
+                          perf->hd.filtered_inframe,
+                          perf->hd.filtered_async};
+}
+
+/* Writes the frame just presented to spikes.log when it took too long. */
+static void SwitchPerfSpike(SwitchPerf *perf, uint64_t now) {
+  const SwitchPerfMark totals = SwitchPerfTotals(perf);
+  const SwitchPerfMark *mark = &perf->mark;
+  const double total = SwitchPerfMs(perf, now - perf->last_present, 1);
+  if (perf->spikes && perf->last_present && total > kSwitchSpikeMs) {
+    const uint64_t staged =
+        (totals.run - mark->run) + (totals.draw - mark->draw) +
+        (totals.present - mark->present) + (totals.audio - mark->audio) +
+        (totals.events - mark->events) + (totals.rewind - mark->rewind) +
+        (totals.pace - mark->pace);
+    const double unaccounted = total - SwitchPerfMs(perf, staged, 1);
+    SwitchLogPrintf(
+        perf->spikes,
+        "%llu %.1f %.1f %.1f %.1f %.1f %.1f %.1f %llu %.1f %.1f %llu %llu "
+        "%llu %llu %.1f %.1f %.1f %.1f %.1f %.1f\n",
+            (unsigned long long)perf->frame, total,
+            SwitchPerfMs(perf, totals.run - mark->run, 1),
+            SwitchPerfMs(perf, totals.ppu - mark->ppu, 1),
+            SwitchPerfMs(perf, (totals.draw - mark->draw) -
+                                   (totals.ppu - mark->ppu), 1),
+            SwitchPerfMs(perf, totals.art - mark->art, 1),
+            SwitchPerfMs(perf, totals.tiles - mark->tiles, 1),
+            SwitchPerfMs(perf, totals.sprites - mark->sprites, 1),
+            (unsigned long long)(totals.uploads - mark->uploads),
+            (double)(totals.upload_bytes - mark->upload_bytes) / 1024.0,
+            SwitchPerfMs(perf, totals.present - mark->present, 1),
+            (unsigned long long)(totals.interp_steps - mark->interp_steps),
+            (unsigned long long)(totals.tier_hits - mark->tier_hits),
+            (unsigned long long)(totals.filtered_inframe -
+                                 mark->filtered_inframe),
+            (unsigned long long)(totals.filtered_async - mark->filtered_async),
+            (double)perf->cache_bytes / (1024.0 * 1024.0),
+            SwitchPerfMs(perf, totals.audio - mark->audio, 1),
+            SwitchPerfMs(perf, totals.events - mark->events, 1),
+            SwitchPerfMs(perf, totals.rewind - mark->rewind, 1),
+            SwitchPerfMs(perf, totals.pace - mark->pace, 1), unaccounted);
+  }
+  perf->mark = totals;
+  perf->last_present = now;
+  perf->frame++;
+}
+
+extern const char *rtl_game_title(void);
+
+/* Interpreter discoveries go to the journal through the log thread: the
+ * game thread must not wait on the SD card. */
+static void SwitchJournalLine(const char *path, const char *line,
+                              void *context) {
+  (void)path;
+  SwitchLogPrintf((SwitchLog *)context, "%s", line);
+}
+
+/* The CPU clock while the game has focus: raised to the launcher's
+ * SwitchCpuMhz and given back to the system's rate whenever the game loses
+ * focus or exits. A closed game leaves the clock to the system, which sets
+ * its own for the next application. */
+typedef struct SwitchClock {
+  bool open, clkrst;
+  ClkrstSession session;
+  u32 stock_hz, game_hz;
+  AppletHookCookie hook;
+} SwitchClock;
+
+static SwitchClock g_switch_clock;
+
+static void SwitchClockSet(u32 hz) {
+  SwitchClock *clock = &g_switch_clock;
+  const Result result = clock->clkrst
+      ? clkrstSetClockRate(&clock->session, hz)
+      : pcvSetClockRate(PcvModule_CpuBus, hz);
+  if (R_FAILED(result))
+    fprintf(stderr, "warning: cannot set the CPU clock to %u Hz\n", hz);
+}
+
+static void SwitchClockHook(AppletHookType hook, void *param) {
+  (void)param;
+  if (hook == AppletHookType_OnFocusState)
+    SwitchClockSet(appletGetFocusState() == AppletFocusState_InFocus
+                       ? g_switch_clock.game_hz
+                       : g_switch_clock.stock_hz);
+  else if (hook == AppletHookType_OnExitRequest)
+    SwitchClockSet(g_switch_clock.stock_hz);
+}
+
+static void SwitchClockStart(int mhz) {
+  SwitchClock *clock = &g_switch_clock;
+  if (mhz <= 0 || clock->open) return;
+  clock->clkrst = hosversionAtLeast(8, 0, 0);
+  Result result = clock->clkrst ? clkrstInitialize() : pcvInitialize();
+  if (R_SUCCEEDED(result) && clock->clkrst) {
+    result = clkrstOpenSession(&clock->session, PcvModuleId_CpuBus, 3);
+    if (R_SUCCEEDED(result))
+      result = clkrstGetClockRate(&clock->session, &clock->stock_hz);
+    if (R_FAILED(result)) clkrstExit();
+  } else if (R_SUCCEEDED(result)) {
+    result = pcvGetClockRate(PcvModule_CpuBus, &clock->stock_hz);
+    if (R_FAILED(result)) pcvExit();
+  }
+  if (R_FAILED(result)) {
+    fprintf(stderr, "warning: CPU clock control unavailable (0x%x)\n",
+            (unsigned)result);
+    return;
+  }
+  clock->open = true;
+  clock->game_hz = (u32)mhz * 1000000u;
+  SwitchClockSet(clock->game_hz);
+  appletHook(&clock->hook, SwitchClockHook, NULL);
+  fprintf(stdout, "CPU clock: %u MHz (system %u MHz)\n",
+          clock->game_hz / 1000000u, clock->stock_hz / 1000000u);
+}
+
+static void SwitchClockStop(void) {
+  SwitchClock *clock = &g_switch_clock;
+  if (!clock->open) return;
+  appletUnhook(&clock->hook);
+  SwitchClockSet(clock->stock_hz);
+  if (clock->clkrst) {
+    clkrstCloseSession(&clock->session);
+    clkrstExit();
+  } else {
+    pcvExit();
+  }
+  clock->open = false;
+}
+
+static void SwitchPerfOpen(SwitchPerf *perf, const char *backend,
+                           bool gl, bool hd_gpu, bool echo) {
+  memset(perf, 0, sizeof *perf);
+  perf->file = SwitchLogOpen("perf.log");
+  if (!perf->file) return;
+  perf->spikes = SwitchLogOpen("spikes.log");
+  perf->events_log = perf->file;
+  perf->journal = SwitchLogOpen(tier2_capture_journal_path(rtl_game_title()));
+  if (perf->journal)
+    tier2_capture_set_journal_writer(SwitchJournalLine, perf->journal);
+  /* Which cores the game and the log writers run on. */
+  fprintf(stdout, "game thread on core %u, log thread on core %d\n",
+          svcGetCurrentProcessorNumber(), perf->file->core);
+  perf->echo = echo;
+  char started[32] = "unknown";
+  const time_t clock = time(NULL);
+  const struct tm *local = localtime(&clock);
+  if (local) (void)strftime(started, sizeof started, "%Y-%m-%d %H:%M:%S", local);
+  SwitchLogPrintf(perf->file, "session: %s\n", started);
+  if (perf->spikes)
+    SwitchLogPrintf(perf->spikes,
+                    "session: %s, %s\nframe total_ms run_ms ppu_ms scene_ms "
+                    "hd_art_ms hd_tiles_ms hd_sprites_ms uploads upload_kb "
+                    "present_ms interp_ops tier_downs hd_filtered_inframe "
+                    "hd_filtered_async cache_mb audio_ms events_ms "
+                    "rewind_ms pace_ms unaccounted_ms\n",
+                    started, backend);
+  /* deko3d leaves no OpenGL context to ask. */
+  const GLubyte *renderer = gl ? glGetString(GL_RENDERER) : NULL;
+  SwitchLogPrintf(perf->file,
+                  "backend: %s\nrenderer: %s\nhd composition: %s\n", backend,
+          renderer ? (const char *)renderer
+                   : gl ? "unknown" : "deko3d, Tegra X1",
+          hd_gpu ? "gpu" : "cpu");
+  SwitchLogPrintf(perf->file,
+          "fps run_ms run_max_ms draw_ms ppu_ms scene_ms audio_ms present_ms hd "
+          "draws uploads upload_kb hd_prepare_ms hd_pixels_ms hd_art_ms "
+          "hd_tiles_ms hd_sprites_ms hd_load_ms audio_underruns "
+          "audio_fill_min_ms audio_fill_max_ms audio_clipped emulated_fps "
+          "hd_pack_reads pads pad_buttons hd_filtered_inframe "
+          "hd_filtered_async cache_mb\n");
+  perf->frequency = SDL_GetPerformanceFrequency();
+  perf->window_start = SDL_GetPerformanceCounter();
+}
+
+static void SwitchPerfAudio(SwitchPerf *perf, const int16_t *samples,
+                            size_t sample_count, double queued_ms,
+                            bool primed) {
+  if (primed && queued_ms <= 0.0) perf->audio_underruns++;
+  if (!perf->audio_fill_seen || queued_ms < perf->audio_fill_min_ms)
+    perf->audio_fill_min_ms = queued_ms;
+  if (!perf->audio_fill_seen || queued_ms > perf->audio_fill_max_ms)
+    perf->audio_fill_max_ms = queued_ms;
+  perf->audio_fill_seen = true;
+  for (size_t i = 0; i < sample_count; i++)
+    if (samples[i] == INT16_MAX || samples[i] == INT16_MIN)
+      perf->audio_clipped++;
+}
+
+static void SwitchPerfPresented(SwitchPerf *perf, int hd_scale) {
+  if (!perf->file) return;
+  Dkc2SdlPresenterGlStats gl;
+  Dkc2SdlPresenterTakeGlStats(&gl);
+  perf->draws += gl.draws;
+  perf->uploads += gl.uploads;
+  perf->upload_bytes += gl.upload_bytes;
+  const uint64_t now = SDL_GetPerformanceCounter();
+  SwitchPerfSpike(perf, now);
+  if (++perf->presented < kSwitchPerfFrames) return;
+  const double seconds =
+      (double)(now - perf->window_start) / (double)perf->frequency;
+  /* GL work per presented frame. */
+  const double frames = (double)perf->presented;
+  char line[320];
+  (void)snprintf(line, sizeof line,
+                 "%.1f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %d %.1f %.1f %.1f "
+                 "%.2f %.2f %.2f %.2f %.2f %.2f %u %.1f %.1f %llu %.1f %llu "
+                 "%u %08x %llu %llu %.1f\n",
+                 seconds > 0.0 ? perf->presented / seconds : 0.0,
+                 SwitchPerfMs(perf, perf->run, perf->emulated),
+                 SwitchPerfMs(perf, perf->run_max, 1),
+                 SwitchPerfMs(perf, perf->draw, perf->emulated),
+                 SwitchPerfMs(perf, perf->ppu, perf->emulated),
+                 SwitchPerfMs(perf, perf->draw - perf->ppu, perf->emulated),
+                 SwitchPerfMs(perf, perf->audio, perf->emulated),
+                 SwitchPerfMs(perf, perf->present, perf->presented), hd_scale,
+                 (double)perf->draws / frames, (double)perf->uploads / frames,
+                 (double)perf->upload_bytes / 1024.0 / frames,
+                 SwitchPerfMs(perf, perf->hd.prepare, perf->emulated),
+                 SwitchPerfMs(perf, perf->hd.pixels, perf->emulated),
+                 SwitchPerfMs(perf, perf->hd.art, perf->emulated),
+                 SwitchPerfMs(perf, perf->hd.tiles, perf->emulated),
+                 SwitchPerfMs(perf, perf->hd.sprites, perf->emulated),
+                 SwitchPerfMs(perf, perf->hd.load, perf->emulated),
+                 perf->audio_underruns, perf->audio_fill_min_ms,
+                 perf->audio_fill_max_ms,
+                 (unsigned long long)perf->audio_clipped,
+                 seconds > 0.0 ? perf->emulated / seconds : 0.0,
+                 (unsigned long long)perf->hd.reads, perf->pads,
+                 (unsigned)perf->pad_buttons,
+                 (unsigned long long)perf->hd.filtered_inframe,
+                 (unsigned long long)perf->hd.filtered_async,
+                 (double)perf->cache_bytes / (1024.0 * 1024.0));
+  SwitchLogPrintf(perf->file, "%s", line);
+  if (perf->echo) fputs(line, stdout);
+  const SwitchPerf kept = *perf;
+  memset(perf, 0, sizeof *perf);
+  perf->file = kept.file;
+  perf->echo = kept.echo;
+  perf->frequency = kept.frequency;
+  perf->spikes = kept.spikes;
+  perf->journal = kept.journal;
+  perf->frame = kept.frame;
+  perf->last_present = kept.last_present;
+  perf->window_start = now;
+  perf->cache_bytes = kept.cache_bytes;
+  /* The window's counters start again from zero; the interpreter's run on. */
+  perf->mark = SwitchPerfTotals(perf);
+}
+
+/* Launchers pass arguments, but the console has no environment to set.
+ * --renderer R draws with R: deko3d by default, gl for OpenGL with the
+ * in-game menu (also without --bench). --bench N replays the route in
+ * bench.input for N seconds without the launcher or saves, then quits;
+ * --hd S runs it at HD scale S (0: HD off), --aspect A at aspect A (as
+ * DKC2_ASPECT), --shot F1,F2,... writes the presented frames F1, F2, ... to
+ * shot-R-F.ppm, and --return P loads the homebrew P instead of the menu
+ * afterwards. */
+enum { kSwitchBenchMaxSeconds = 10000 };
+
+typedef struct SwitchBench {
+  unsigned seconds;        /* 0 without --bench */
+  int hd_scale;            /* -1 to keep the saved HD options */
+  const char *aspect;      /* NULL to keep the saved aspect */
+  const char *renderer;    /* "gl" or "deko3d" */
+  const char *shots;       /* frame numbers separated by commas, or NULL */
+  const char *return_path; /* NULL to return to the menu */
+} SwitchBench;
+
+static bool SwitchParseNumber(const char *text, long min, long max,
+                              long *value) {
+  char *end = NULL;
+  *value = strtol(text, &end, 10);
+  return end && !*end && *value >= min && *value <= max;
+}
+
+static bool SwitchParseBench(int *argc, char **argv, SwitchBench *bench) {
+  *bench = (SwitchBench){0, -1, NULL, "deko3d", NULL, NULL};
+  int kept = 1;
+  for (int i = 1; i < *argc; i++) {
+    const char *option = argv[i];
+    if (strcmp(option, "--bench") != 0 && strcmp(option, "--hd") != 0 &&
+        strcmp(option, "--aspect") != 0 && strcmp(option, "--renderer") != 0 &&
+        strcmp(option, "--shot") != 0 && strcmp(option, "--return") != 0) {
+      argv[kept++] = argv[i];
+      continue;
+    }
+    if (++i == *argc) return false;
+    const char *text = argv[i];
+    long value = 0;
+    if (strcmp(option, "--bench") == 0) {
+      if (!SwitchParseNumber(text, 1, kSwitchBenchMaxSeconds, &value))
+        return false;
+      bench->seconds = (unsigned)value;
+    } else if (strcmp(option, "--hd") == 0) {
+      if (!SwitchParseNumber(text, 0, kDkc2HdMaxScale, &value) ||
+          (value != 0 && value < kDkc2HdMinScale))
+        return false;
+      bench->hd_scale = (int)value;
+    } else if (strcmp(option, "--aspect") == 0) {
+      bench->aspect = text;
+    } else if (strcmp(option, "--renderer") == 0) {
+      if (strcmp(text, "gl") != 0 && strcmp(text, "deko3d") != 0)
+        return false;
+      bench->renderer = text;
+    } else if (strcmp(option, "--shot") == 0) {
+      if (!*text || strspn(text, "0123456789,") != strlen(text)) return false;
+      bench->shots = text;
+    } else {
+      bench->return_path = text;
+    }
+  }
+  *argc = kept;
+  /* Without --bench the overrides would be saved into the options. */
+  return bench->seconds ||
+         (bench->hd_scale < 0 && !bench->aspect && !bench->shots &&
+          !bench->return_path);
+}
+
+/* Maps the bench onto the desktop test controls and the in-memory HD
+ * options; the caller skips saving the options afterwards. */
+static void SwitchApplyBench(const SwitchBench *bench) {
+  char frames[16];
+  (void)snprintf(frames, sizeof frames, "%u", bench->seconds * 60u);
+  (void)setenv("DKC2_DESKTOP_TEST_FRAMES", frames, 1);
+  (void)setenv("SNESRECOMP_NO_LAUNCHER", "1", 1);
+  (void)setenv("DKC2_DESKTOP_DISABLE_SRAM", "1", 1);
+  (void)setenv("SNESRECOMP_INPUT_PLAY", "bench.input", 1);
+  if (bench->aspect) (void)setenv("DKC2_ASPECT", bench->aspect, 1);
+  if (bench->shots) {
+    /* One frame names its file itself; several get "-<frame>" added. */
+    char path[64];
+    if (strchr(bench->shots, ','))
+      (void)snprintf(path, sizeof path, "shot-%s.ppm", bench->renderer);
+    else
+      (void)snprintf(path, sizeof path, "shot-%s-%s.ppm", bench->renderer,
+                     bench->shots);
+    (void)setenv("DKC2_DESKTOP_SCREENSHOT", path, 1);
+    (void)setenv("DKC2_DESKTOP_SCREENSHOT_FRAME", bench->shots, 1);
+  }
+  if (bench->hd_scale < 0) return;
+  Dkc2LauncherSetHdEnabled(bench->hd_scale != 0);
+  if (bench->hd_scale) Dkc2LauncherSetHdScale(bench->hd_scale);
+}
 #endif
 
 #ifndef DKC2_RELEASE_VERSION
@@ -87,6 +622,17 @@ static const double kAudioFillWeight = 0.02;
  * the lock to the host clock. */
 static const double kDisplayLockTolerance = 0.02;
 static const double kDisplayTickTimeoutSeconds = 0.05;
+
+/* Flags shared with the HD pack worker thread. */
+#if SNESRECOMP_SDL3
+typedef SDL_AtomicInt HostAtomicInt;
+#define HostAtomicGet SDL_GetAtomicInt
+#define HostAtomicSet SDL_SetAtomicInt
+#else
+typedef SDL_atomic_t HostAtomicInt;
+#define HostAtomicGet SDL_AtomicGet
+#define HostAtomicSet SDL_AtomicSet
+#endif
 
 typedef struct SdlHost {
   Dkc2SdlPresenter presenter;
@@ -129,11 +675,29 @@ typedef struct SdlHost {
    * of the last draw, or NULL to present the authentic frame in pixels. */
   Dkc2Hd *hd;
   Dkc2HdConfig hd_config;
+  /* The pack art a worker thread reads for hd behind the loading screen. */
+  Dkc2HdPackReader *hd_reader;
+  SDL_Thread *hd_reader_thread;
+  HostAtomicInt hd_reader_cancel, hd_reader_done;
+  HostAtomicInt hd_reader_progress; /* thousandths, for the loading bar */
+#ifdef __SWITCH__
+  /* Sprite frames missing from the HD cache are filtered by a thread on a
+   * core of its own, one batch at a time (see ExchangeHdFilterBatch). */
+  Thread hd_filter_thread;
+  bool hd_filter_started;
+  Dkc2HdFilterBatch *hd_filter_batch; /* out with the thread, or NULL */
+  HostAtomicInt hd_filter_state;      /* a SwitchFilterState */
+  HostAtomicInt hd_filter_quit;
+  FILE *hd_cache_file; /* the batches' results, saved for later sessions */
+#endif
   const char *hd_pack_dir; /* used while the HD art pack option is on */
   bool hd_environment;
   const uint8_t *rom;
   size_t rom_size;
   const uint32_t *hd_pixels;
+#ifdef __SWITCH__
+  uint64_t perf_ppu_end; /* when the last DrawFrame finished the PPU frame */
+#endif
   int hd_width;
   int hd_height;
   /* With the GPU path the last frame is a scene the presenter draws, and
@@ -154,15 +718,107 @@ typedef struct SdlHost {
 #endif
 } SdlHost;
 
+#ifdef __SWITCH__
+enum {
+  kSwitchFilterStack = 128 * 1024,
+  kSwitchFilterPriority = 0x2c,
+  kSwitchFilterCore = 2,
+};
+
+/* Filtered sprite frames from earlier sessions, in the data folder. */
+static const char kSwitchSpriteCache[] = "hdcache.bin";
+
+typedef enum SwitchFilterState {
+  kSwitchFilterIdle,   /* the main thread holds the batch */
+  kSwitchFilterPosted, /* the filter thread may run it */
+  kSwitchFilterDone,   /* run, waiting to be adopted */
+} SwitchFilterState;
+
+static void RunHdFilterBatches(void *context) {
+  SdlHost *host = context;
+  while (!HostAtomicGet(&host->hd_filter_quit)) {
+    if (HostAtomicGet(&host->hd_filter_state) != kSwitchFilterPosted) {
+      svcSleepThread(1000000);
+      continue;
+    }
+    Dkc2HdRunFilterBatch(host->hd_filter_batch);
+    if (host->hd_cache_file)
+      Dkc2HdSaveFilterBatch(host->hd_filter_batch, host->hd_cache_file);
+    HostAtomicSet(&host->hd_filter_state, kSwitchFilterDone);
+  }
+}
+
+/* Between frames: adopts the batch the thread has run and hands it the
+ * frames queued since. */
+static void ExchangeHdFilterBatch(SdlHost *host) {
+  if (!host->hd_filter_started) return;
+  if (HostAtomicGet(&host->hd_filter_state) == kSwitchFilterDone) {
+    Dkc2HdAdoptFilterBatch(host->hd, host->hd_filter_batch);
+    host->hd_filter_batch = NULL;
+    HostAtomicSet(&host->hd_filter_state, kSwitchFilterIdle);
+  }
+  if (HostAtomicGet(&host->hd_filter_state) != kSwitchFilterIdle) return;
+  host->hd_filter_batch = Dkc2HdTakeFilterBatch(host->hd);
+  if (host->hd_filter_batch)
+    HostAtomicSet(&host->hd_filter_state, kSwitchFilterPosted);
+}
+
+static void StartHdFilterThread(SdlHost *host) {
+  Dkc2HdLoadSpriteCache(host->hd, kSwitchSpriteCache);
+  Dkc2HdSetFilterBatches(host->hd, true);
+  host->hd_cache_file = Dkc2HdOpenSpriteCache(host->hd, kSwitchSpriteCache);
+  HostAtomicSet(&host->hd_filter_state, kSwitchFilterIdle);
+  HostAtomicSet(&host->hd_filter_quit, 0);
+  host->hd_filter_started =
+      R_SUCCEEDED(threadCreate(&host->hd_filter_thread, RunHdFilterBatches,
+                               host, NULL, kSwitchFilterStack,
+                               kSwitchFilterPriority, kSwitchFilterCore));
+  if (host->hd_filter_started &&
+      R_FAILED(threadStart(&host->hd_filter_thread))) {
+    (void)threadClose(&host->hd_filter_thread);
+    host->hd_filter_started = false;
+  }
+  /* Without the thread every frame is filtered in place again. */
+  if (!host->hd_filter_started) {
+    Dkc2HdSetFilterBatches(host->hd, false);
+    if (host->hd_cache_file) fclose(host->hd_cache_file);
+    host->hd_cache_file = NULL;
+  }
+}
+
+/* Waits for the batch that is out, adopts it and filters in place again. */
+static void StopHdFilterThread(SdlHost *host) {
+  if (!host->hd_filter_started) return;
+  HostAtomicSet(&host->hd_filter_quit, 1);
+  (void)threadWaitForExit(&host->hd_filter_thread);
+  (void)threadClose(&host->hd_filter_thread);
+  host->hd_filter_started = false;
+  if (host->hd_filter_batch)
+    Dkc2HdAdoptFilterBatch(host->hd, host->hd_filter_batch);
+  host->hd_filter_batch = NULL;
+  Dkc2HdSetFilterBatches(host->hd, false);
+  if (host->hd_cache_file) fclose(host->hd_cache_file);
+  host->hd_cache_file = NULL;
+}
+#endif
+
 /* Renders the PPU frame, through the HD compositor when it is enabled. */
 static void DrawFrame(SdlHost *host) {
-  Dkc2HdBeginFrame(host->hd, g_ppu, Dkc2VideoWidth());
+#ifdef __SWITCH__
+  ExchangeHdFilterBatch(host);
+#endif
+  Dkc2HdBeginFrame(host->hd, g_ppu, Dkc2VideoWidth(), Dkc2GetFrameLines());
   Dkc2DrawPpuFrame();
+#ifdef __SWITCH__
+  host->perf_ppu_end = SDL_GetPerformanceCounter();
+  /* perf.log splits the scene building; set here so reloads keep it. */
+  Dkc2HdSetClock(host->hd, SDL_GetPerformanceCounter);
+#endif
   const size_t pitch = (size_t)Dkc2VideoWidth() * kBytesPerPixel;
   if (host->hd_gpu) {
     host->hd_scene =
         Dkc2HdEndFrameScene(host->hd, g_ppu, g_ram, Dkc2GetFrameLines(),
-                            host->pixels, pitch);
+                            host->pixels, pitch, false);
     return;
   }
   host->hd_pixels = Dkc2HdEndFrame(host->hd, g_ppu, g_ram, Dkc2GetFrameLines(),
@@ -173,6 +829,11 @@ static void DrawFrame(SdlHost *host) {
 typedef struct SdlControls {
   uint32_t controller;
   uint32_t host_actions;
+  /* Save and load state asked by the console's chords (not assist tools). */
+  uint32_t state_actions;
+  /* A pad's buttons while it holds Minus, for the console's event log. */
+  uint32_t back_buttons;
+  bool quit; /* Minus with Plus: leave the game */
 } SdlControls;
 
 typedef enum SdlSpeedMode {
@@ -267,20 +928,30 @@ static SDL_GameController *HapticController(SdlHost *host, int player) {
   return NULL;
 }
 
-static void PulseHaptics(SdlHost *host, unsigned players, bool test) {
-  if (!Dkc2LauncherHaptics() || !(SDL_GetWindowFlags((SDL_Window *)host->presenter.window) & SDL_WINDOW_INPUT_FOCUS)) return;
+/* Whether input reaches the game. The console's deko3d renderer presents
+ * without an SDL window: the console gives the app its focus. */
+static bool HasInputFocus(const SdlHost *host) {
+  SDL_Window *window = (SDL_Window *)host->presenter.window;
+  return !window || (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS);
+}
+
+/* Returns whether any controller started rumbling. */
+static bool PulseHaptics(SdlHost *host, unsigned players, bool test) {
+  if (!Dkc2LauncherHaptics() || !HasInputFocus(host)) return false;
+  bool pulsed = false;
   for (int player = 0; player < 2; ++player) {
     SDL_GameController *controller = HapticController(host, player);
     if ((players & (1u << player)) && controller && ControllerHasRumble(controller)) {
       if (RumbleController(controller, test ? 0x5000 : 0x2800,
                            test ? 0x7000 : 0x5000, test ? 500 : 55))
-        host->haptic_pulse_active = true;
+        host->haptic_pulse_active = pulsed = true;
     }
   }
+  return pulsed;
 }
 
 static void UpdateHaptics(SdlHost *host) {
-  bool stop = !Dkc2LauncherHaptics() || !(SDL_GetWindowFlags((SDL_Window *)host->presenter.window) & SDL_WINDOW_INPUT_FOCUS);
+  bool stop = !Dkc2LauncherHaptics() || !HasInputFocus(host);
   for (int i = 0; stop && host->haptic_pulse_active && i < kMaximumControllers; ++i)
     if (host->controllers[i]) (void)RumbleController(host->controllers[i], 0, 0, 0);
   if (stop) host->haptic_pulse_active = false;
@@ -420,10 +1091,8 @@ static bool IsSdlScancodePressed(int scancode, void *context) {
 }
 
 static SdlControls ReadControlsImpl(SdlHost *host) {
-  SdlControls controls = {0, 0};
-  SDL_Window *window = (SDL_Window *)host->presenter.window;
-  bool blocked = !host->hidden &&
-      !(SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS);
+  SdlControls controls = {0};
+  bool blocked = !host->hidden && !HasInputFocus(host);
 #ifdef _WIN32
   blocked = blocked || (!host->hidden && Dkc2WindowsMenuBlocksInput(host->menu));
 #endif
@@ -461,6 +1130,23 @@ static SdlControls ReadControlsImpl(SdlHost *host) {
         controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
     gamepad->right_trigger = ReadTrigger(
         controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+#ifdef __SWITCH__
+    /* Minus with L saves the state, Minus with R loads it and Minus with
+     * Plus quits. The chord's buttons never reach the game. */
+    const uint32_t chord = kDkc2GamepadBack | kDkc2GamepadLeftShoulder |
+                           kDkc2GamepadRightShoulder | kDkc2GamepadStart;
+    if (gamepad->buttons & kDkc2GamepadBack)
+      controls.back_buttons |= gamepad->buttons;
+    if ((gamepad->buttons & kDkc2GamepadBack) &&
+        (gamepad->buttons & chord & ~kDkc2GamepadBack)) {
+      if (gamepad->buttons & kDkc2GamepadLeftShoulder)
+        controls.state_actions |= kDkc2HostSaveState;
+      if (gamepad->buttons & kDkc2GamepadRightShoulder)
+        controls.state_actions |= kDkc2HostLoadState;
+      if (gamepad->buttons & kDkc2GamepadStart) controls.quit = true;
+      gamepad->buttons &= ~chord;
+    }
+#endif
   }
   controls.controller = Dkc2RoutePlayerInputsWithBindings(
       keyboard, gamepads, gamepad_count, host->player_source,
@@ -472,7 +1158,9 @@ static SdlControls ReadControlsImpl(SdlHost *host) {
   Dkc2DesktopOverlaySetGamepad(
       host->overlay, gamepad_count ? &gamepads[0] : NULL);
   uint32_t menu_input = Dkc2UpdateMenuChord(menu_buttons, &host->menu_chord_previous);
-  if (menu_input & kDkc2MenuInputToggle)
+  /* Without an OpenGL context (deko3d) the menu cannot be drawn, so it
+   * stays closed rather than swallow input unseen. */
+  if ((menu_input & kDkc2MenuInputToggle) && host->presenter.gl_context)
     Dkc2DesktopOverlayToggle(host->overlay);
   if ((menu_input & kDkc2MenuInputBlock) || Dkc2DesktopOverlayIsOpen(host->overlay)) {
     controls.controller = 0;
@@ -778,8 +1466,101 @@ static uint32_t ApplyWindowsCommands(SdlHost *host,
 }
 #endif
 
+/* Pack art read while HD starts, so play never waits on storage. Applet
+ * mode on the console leaves too little memory for it. */
+static size_t HdPreloadBytes(void) {
+#ifdef __SWITCH__
+  if (appletGetAppletType() != AppletType_Application) return 0;
+#endif
+  return (size_t)1 << 30;
+}
+
+static int ReadHdPack(void *data) {
+  SdlHost *host = (SdlHost *)data;
+  while (!HostAtomicGet(&host->hd_reader_cancel) &&
+         Dkc2HdPackReaderStep(host->hd_reader))
+    HostAtomicSet(&host->hd_reader_progress,
+                  (int)Dkc2HdPackReaderProgress(host->hd_reader));
+  HostAtomicSet(&host->hd_reader_done, 1);
+  return 0;
+}
+
+/* Starts reading the new compositor's pack art on a worker thread. */
+static void StartHdPackRead(SdlHost *host) {
+  host->hd_reader =
+      Dkc2HdPackReaderCreate(host->hd_config.pack_dir, HdPreloadBytes());
+  if (!host->hd_reader) return;
+  HostAtomicSet(&host->hd_reader_cancel, 0);
+  HostAtomicSet(&host->hd_reader_done, 0);
+  HostAtomicSet(&host->hd_reader_progress, 0);
+  host->hd_reader_thread = SDL_CreateThread(ReadHdPack, "hd pack", host);
+  if (!host->hd_reader_thread) {
+    Dkc2HdPackReaderDestroy(host->hd_reader);
+    host->hd_reader = NULL;
+  }
+}
+
+/* Hands the art over once the worker is done, or drops it when cancel is
+ * set. */
+static void FinishHdPackRead(SdlHost *host, bool cancel) {
+  if (!host->hd_reader_thread) return;
+  if (cancel)
+    HostAtomicSet(&host->hd_reader_cancel, 1);
+  else if (!HostAtomicGet(&host->hd_reader_done))
+    return;
+  SDL_WaitThread(host->hd_reader_thread, NULL);
+  if (!cancel) Dkc2HdAdoptPack(host->hd, host->hd_reader);
+  Dkc2HdPackReaderDestroy(host->hd_reader);
+  host->hd_reader = NULL;
+  host->hd_reader_thread = NULL;
+}
+
+/* A progress bar across the middle of an otherwise black frame. */
+static void DrawLoadingBar(uint8_t *pixels, int width, int height,
+                           unsigned thousandths) {
+  const int left = width / 8, right = width - width / 8;
+  const int top = height / 2 - 4, bottom = height / 2 + 4;
+  const int filled = left + (int)((right - left) * (long)thousandths / 1000);
+  for (int y = 0; y < height; y++)
+    for (int x = 0; x < width; x++) {
+      const bool bar = y >= top && y < bottom && x >= left && x < right;
+      const uint32_t color = !bar ? 0xff000000u
+                             : x < filled ? 0xffffffffu
+                                          : 0xff404040u;
+      memcpy(&pixels[((size_t)y * (size_t)width + (size_t)x) * kBytesPerPixel],
+             &color, sizeof color);
+    }
+}
+
+/* Reads the compositor's whole pack behind a loading screen before the game
+ * goes on, so play never waits on storage. */
+static void LoadHdPack(SdlHost *host) {
+  StartHdPackRead(host);
+  const int width = Dkc2VideoWidth();
+  while (host->hd_reader_thread && !HostAtomicGet(&host->hd_reader_done)) {
+    PumpEvents(host);
+    if (!host->running) {
+      FinishHdPackRead(host, true);
+      return;
+    }
+    DrawLoadingBar(host->filtered_pixels, width, kFrameHeight,
+                   (unsigned)HostAtomicGet(&host->hd_reader_progress));
+    if (!Dkc2SdlPresenterPresent(&host->presenter, host->filtered_pixels,
+                                 width, kFrameHeight, NULL, NULL))
+      SDL_Delay(16);
+  }
+  FinishHdPackRead(host, false);
+#ifdef __SWITCH__
+  if (host->hd) StartHdFilterThread(host);
+#endif
+}
+
 static void DestroyHd(SdlHost *host) {
+  FinishHdPackRead(host, true);
   if (!host->hd) return;
+#ifdef __SWITCH__
+  StopHdFilterThread(host);
+#endif
   PpuClearOverlayBindings(g_ppu);
   Dkc2HdDestroy(host->hd);
   host->hd = NULL;
@@ -787,10 +1568,140 @@ static void DestroyHd(SdlHost *host) {
   host->hd_scene = NULL;
 }
 
+#ifndef __SWITCH__
 static time_t PackFolderTime(const char *dir) {
   struct stat info;
   return dir && stat(dir, &info) == 0 ? info.st_mtime : 0;
 }
+#endif
+
+/* The cartridge save as last written to disk. */
+typedef struct SramSaved {
+  uint8_t *copy;
+  unsigned writes;
+} SramSaved;
+
+/* Writes the cartridge save once a second when the game changed it: the
+ * console closes the game from HOME without letting it exit. */
+static void SaveSramWhenChanged(SramSaved *saved, unsigned long long frame) {
+  if (frame % 60u || !g_sram || g_sram_size <= 0) return;
+  if (!saved->copy) {
+    /* The save as read from disk at boot. */
+    saved->copy = malloc((size_t)g_sram_size);
+    if (saved->copy) memcpy(saved->copy, g_sram, (size_t)g_sram_size);
+    return;
+  }
+  if (memcmp(saved->copy, g_sram, (size_t)g_sram_size) == 0) return;
+  memcpy(saved->copy, g_sram, (size_t)g_sram_size);
+  const bool written = RtlWriteSram();
+  fprintf(stdout, "sram_writes %u at frame %llu: %s\n", ++saved->writes,
+          frame, written ? "ok" : "failed");
+}
+
+
+#ifdef __SWITCH__
+/* A save state from the controller is also a bug report that is never
+ * overwritten: saves/bugs/<date-time>-f<frame>/ gets the state and the
+ * next presented frame. Written on its own thread so the game never waits
+ * for the SD. */
+typedef struct SwitchReport {
+  char dir[96];
+  char state[128];
+  uint8_t *rgb;
+  int width, height;
+  SDL_Thread *thread;
+  HostAtomicInt written;
+  SwitchLog *log; /* events.log, or NULL */
+} SwitchReport;
+
+static void CopyReportFile(const char *from, const char *dir,
+                           const char *name) {
+  char to[160];
+  (void)snprintf(to, sizeof to, "%s/%s", dir, name);
+  FILE *in = fopen(from, "rb");
+  if (!in) return;
+  FILE *out = fopen(to, "wb");
+  if (out) {
+    char buffer[16384];
+    size_t count;
+    while ((count = fread(buffer, 1, sizeof buffer, in)) > 0)
+      if (fwrite(buffer, 1, count, out) != count) break;
+    fclose(out);
+  }
+  fclose(in);
+}
+
+static int WriteSwitchReport(void *argument) {
+  SwitchReport *report = argument;
+  if ((DKC2_MKDIR("saves/bugs") != 0 && errno != EEXIST) ||
+      DKC2_MKDIR(report->dir) != 0) {
+    fprintf(stdout, "report failed: %s\n", report->dir);
+    if (report->log) SwitchLogPrintf(report->log, "event report failed: %s\n", report->dir);
+    HostAtomicSet(&report->written, 1);
+    return 0;
+  }
+  char path[160];
+  (void)snprintf(path, sizeof path, "%s/shot.ppm", report->dir);
+  FILE *shot = fopen(path, "wb");
+  if (shot) {
+    fprintf(shot, "P6\n%d %d\n255\n", report->width, report->height);
+    fwrite(report->rgb, 1, (size_t)report->width * (size_t)report->height * 3u,
+           shot);
+    fclose(shot);
+  }
+  /* The logs stay where they are: the console refuses to open a file that
+   * another handle is writing. perf.log's event lines name this folder. */
+  CopyReportFile(report->state, report->dir, "state.sav");
+  fprintf(stdout, "report written: %s\n", report->dir);
+  if (report->log) SwitchLogPrintf(report->log, "event report written: %s\n", report->dir);
+  HostAtomicSet(&report->written, 1);
+  return 0;
+}
+
+/* Arms the capture of the next presented frame unless a report is still
+ * being written. */
+static void StartSwitchReport(SwitchReport *report, Dkc2SdlPresenter *presenter,
+                              const char *state, unsigned long long frame) {
+  if (report->rgb) return;
+  int width = 0, height = 0;
+  Dkc2SdlPresenterDrawableSize(presenter, &width, &height);
+  if (width <= 0 || height <= 0) return;
+  report->rgb = malloc((size_t)width * (size_t)height * 3u);
+  if (!report->rgb) return;
+  const time_t now = time(NULL);
+  char stamp[32] = "unknown";
+  const struct tm *local = localtime(&now);
+  if (local) (void)strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", local);
+  (void)snprintf(report->dir, sizeof report->dir, "saves/bugs/%s-f%llu", stamp,
+                 frame);
+  report->width = width;
+  report->height = height;
+  (void)snprintf(report->state, sizeof report->state, "%s", state);
+  Dkc2SdlPresenterArmCapture(presenter, report->rgb, width, height);
+}
+
+/* Hands a captured frame to the writer thread. */
+static void FinishSwitchReport(SwitchReport *report, Dkc2SdlPresenter *presenter) {
+  if (!report->rgb || report->thread || !presenter->capture_done) return;
+  Dkc2SdlPresenterArmCapture(presenter, NULL, 0, 0);
+  HostAtomicSet(&report->written, 0);
+  report->thread = SDL_CreateThread(WriteSwitchReport, "report", report);
+  if (!report->thread) {
+    free(report->rgb);
+    report->rgb = NULL;
+  }
+}
+
+/* Frees the last report once its thread is done; waits for it at exit. */
+static void ReapSwitchReport(SwitchReport *report, bool wait) {
+  if (!report->thread) return;
+  if (!wait && !HostAtomicGet(&report->written)) return;
+  SDL_WaitThread(report->thread, NULL);
+  report->thread = NULL;
+  free(report->rgb);
+  report->rgb = NULL;
+}
+#endif
 
 /* Rebuilds the compositor with its configuration so edited and new pack
  * files show up without a restart. Called between frames only: the last
@@ -801,6 +1712,9 @@ static void ReloadHdWhenAsked(SdlHost *host) {
     host->hd_reload = false;
     return;
   }
+#ifndef __SWITCH__
+  /* Packs are edited on the desktop; on the console the stat of the pack
+   * folder stalls the game thread on the SD card. */
   if (host->hd_config.pack_dir && ++host->hd_pack_check >= 60) {
     host->hd_pack_check = 0;
     const time_t time = PackFolderTime(host->hd_config.pack_dir);
@@ -808,10 +1722,12 @@ static void ReloadHdWhenAsked(SdlHost *host) {
       host->hd_reload = true;
     host->hd_pack_time = time;
   }
+#endif
   if (!host->hd_reload) return;
   host->hd_reload = false;
   DestroyHd(host);
   host->hd = Dkc2HdCreate(&host->hd_config, host->rom, host->rom_size);
+  if (host->hd) LoadHdPack(host);
   if (host->hd)
     fprintf(stdout, "HD pack reloaded\n");
   else
@@ -905,6 +1821,7 @@ static void UpdateHd(SdlHost *host) {
   if (!enabled) return;
   host->hd = Dkc2HdCreate(&config, host->rom, host->rom_size);
   if (host->hd) {
+    LoadHdPack(host);
     fprintf(stdout, "HD presentation: %dx\n", config.scale);
   } else {
     fprintf(stderr, "warning: HD presentation could not be initialized\n");
@@ -1119,6 +2036,10 @@ static int RunGame(const char *rom_path,
     ShowError("snesrecomp rejected the verified ROM");
     return 3;
   }
+  SramSaved sram_saved = {0};
+#ifdef __SWITCH__
+  SwitchReport report = {0};
+#endif
   if (sram_enabled) {
     if (EnsureSaveDirectory()) RtlReadSram();
     else sram_enabled = false;
@@ -1230,9 +2151,12 @@ static int RunGame(const char *rom_path,
       fprintf(stderr, "warning: %s; using flat\n", host.presenter.crt_error);
   }
   host.overlay = Dkc2DesktopOverlayCreate(settings);
+  /* The Switch deko3d renderer has no OpenGL context for the overlay: it
+   * runs without the in-game menu, which stays closed. */
   if (!host.overlay ||
-      !Dkc2DesktopOverlayInitSdl(
-          host.overlay, host.presenter.window, host.presenter.gl_context)) {
+      (host.presenter.gl_context &&
+       !Dkc2DesktopOverlayInitSdl(
+           host.overlay, host.presenter.window, host.presenter.gl_context))) {
     free(rom);
     ShutdownHost(&host);
     ShowError("Unable to initialize the in-game overlay");
@@ -1333,6 +2257,12 @@ static int RunGame(const char *rom_path,
     }
   }
 #endif
+#ifdef __SWITCH__
+  SwitchPerf perf;
+  SwitchPerfOpen(&perf, host.presenter.backend,
+                 host.presenter.gl_context != NULL, host.hd_gpu,
+                 test_frame_limit != 0);
+#endif
   Dkc2DesktopFpsCounter fps_counter;
   uint64_t deadline = SDL_GetPerformanceCounter();
   uint64_t frequency = SDL_GetPerformanceFrequency();
@@ -1389,6 +2319,9 @@ static int RunGame(const char *rom_path,
   unsigned test_overlay_ticks = 0;
   bool runtime_failure = false;
   uint32_t previous_state_actions = 0;
+#ifdef __SWITCH__
+  uint32_t previous_back_buttons = 0;
+#endif
   SdlSpeedMode previous_mode = kSdlSpeedNormal;
   bool previous_overlay_open = false;
   Dkc2InputRecorder input_recorder = {0};
@@ -1431,6 +2364,7 @@ static int RunGame(const char *rom_path,
   if (host.hd_environment) {
     host.hd = Dkc2HdCreate(&host.hd_config, rom, rom_size);
     if (host.hd) {
+      LoadHdPack(&host);
       fprintf(stdout, "HD presentation: %dx\n", host.hd_config.scale);
     } else {
       ShowError("HD presentation could not be initialized");
@@ -1443,6 +2377,9 @@ static int RunGame(const char *rom_path,
 #ifdef __APPLE__
     const double stage_top = Dkc2MacHostSeconds();
 #endif
+#ifdef __SWITCH__
+    const uint64_t perf_events_start = SDL_GetPerformanceCounter();
+#endif
     PumpEvents(&host);
     ReloadHdWhenAsked(&host);
     UpdateHdInspector(&host);
@@ -1450,6 +2387,9 @@ static int RunGame(const char *rom_path,
       host.hd_copy_name = false;
       if (host.hd_inspected[0]) (void)SDL_SetClipboardText(host.hd_inspected);
     }
+#ifdef __SWITCH__
+    perf.events += SDL_GetPerformanceCounter() - perf_events_start;
+#endif
 #ifdef __APPLE__
     const double stage_pumped = Dkc2MacHostSeconds();
     double stage_paced = stage_pumped;
@@ -1498,6 +2438,31 @@ static int RunGame(const char *rom_path,
     }
     UpdateHaptics(&host);
     SdlControls controls = ReadControls(&host);
+    platform_host_actions |= controls.state_actions;
+#ifdef __SWITCH__
+    if (controls.back_buttons != previous_back_buttons && controls.back_buttons &&
+        perf.events_log)
+      SwitchLogPrintf(perf.events_log,
+                      "event %lld minus held, pad buttons %08x, chord %s at frame %llu\n",
+                      (long long)time(NULL), (unsigned)controls.back_buttons,
+                      controls.state_actions & kDkc2HostSaveState ? "save"
+                      : controls.state_actions & kDkc2HostLoadState ? "load"
+                                                                    : "none",
+                      host_frame);
+    previous_back_buttons = controls.back_buttons;
+    if (controls.quit) {
+      /* The cartridge save is written on the way out, as for any exit. */
+      if (perf.events_log)
+        SwitchLogPrintf(perf.events_log, "event %lld quit at frame %llu\n",
+                        (long long)time(NULL), host_frame);
+      host.running = false;
+    }
+    perf.pad_buttons |= controls.controller;
+    perf.pads = 0;
+    for (int i = 0; i < kMaximumControllers; i++)
+      perf.pads += host.controllers[i] &&
+                   SDL_GameControllerGetAttached(host.controllers[i]);
+#endif
     if (test_overlay_requested && !test_overlay_completed &&
         host_frame >= 30) {
       if (test_overlay_ticks == 0) {
@@ -1571,6 +2536,21 @@ static int RunGame(const char *rom_path,
                            : DKC2_PRODUCT_TITLE " - Slot %d save failed",
                      slot + 1);
       Dkc2SdlPresenterSetTitle(&host.presenter, status);
+#ifdef __SWITCH__
+      /* No menu draws on the console yet: a long rumble says it saved. */
+      fprintf(stdout, "state slot %d %s at frame %llu\n", slot + 1,
+              saved ? "saved" : "save failed", host_frame);
+      const bool rumbled = saved && PulseHaptics(&host, 1u, true);
+      if (perf.events_log)
+        SwitchLogPrintf(perf.events_log, "event %lld state slot %d %s at frame %llu, rumble %s\n",
+                        (long long)time(NULL), slot + 1,
+                        saved ? "saved" : "save failed", host_frame,
+                        rumbled ? "on" : "off");
+      if (saved) {
+        report.log = perf.events_log;
+        StartSwitchReport(&report, &host.presenter, path, host_frame);
+      }
+#endif
     }
     if (pressed_state_actions & kDkc2HostLoadState) {
       int slot = Dkc2DesktopOverlaySelectedSlot(host.overlay);
@@ -1583,6 +2563,15 @@ static int RunGame(const char *rom_path,
         char status[80];
         (void)snprintf(status, sizeof status, "Slot %d loaded.", slot + 1);
         Dkc2DesktopOverlaySetStatus(host.overlay, status, true);
+#ifdef __SWITCH__
+        fprintf(stdout, "state slot %d loaded at frame %llu\n", slot + 1,
+                host_frame);
+        const bool rumbled = PulseHaptics(&host, 1u, true);
+        if (perf.events_log)
+          SwitchLogPrintf(perf.events_log, "event %lld state slot %d loaded at frame %llu, rumble %s\n",
+                          (long long)time(NULL), slot + 1, host_frame,
+                          rumbled ? "on" : "off");
+#endif
         ResetAudio(&host);
         audio_fraction = 0.0;
         deadline = SDL_GetPerformanceCounter();
@@ -1603,6 +2592,11 @@ static int RunGame(const char *rom_path,
                        "Slot %d could not be loaded.", slot + 1);
         Dkc2DesktopOverlaySetStatus(
             host.overlay, status, false);
+#ifdef __SWITCH__
+        if (perf.events_log)
+          SwitchLogPrintf(perf.events_log, "event %lld state slot %d load failed at frame %llu\n",
+                          (long long)time(NULL), slot + 1, host_frame);
+#endif
       }
     }
     if (test_fast_forward_requested && !test_fast_forward_completed &&
@@ -1665,7 +2659,22 @@ static int RunGame(const char *rom_path,
 #ifdef __APPLE__
         const uint64_t emulate_start = SDL_GetPerformanceCounter();
 #endif
+#ifdef __SWITCH__
+        const uint64_t perf_run_start = SDL_GetPerformanceCounter();
+        const uint64_t apu_clock_start = g_snes->apu->portClock;
+#endif
         (void)RtlRunFrame(controls.controller);
+#ifdef __SWITCH__
+        const uint64_t perf_run = SDL_GetPerformanceCounter() - perf_run_start;
+        perf.run += perf_run;
+        if (perf_run > perf.run_max) perf.run_max = perf_run;
+        /* A recompiled-CPU frame longer than a display frame, to find what
+         * the game did then (a level load runs in one host frame). */
+        if (perf.file && perf_run > perf.frequency / 60u)
+          fprintf(stdout, "slow run: frame %llu, %.1f ms, apu %llu cycles\n",
+                  host_frame, 1000.0 * (double)perf_run / (double)perf.frequency,
+                  (unsigned long long)(g_snes->apu->portClock - apu_clock_start));
+#endif
         PulseHaptics(&host, Dkc2CoopTakeStompEvents(), false);
         if (g_fail || !Dkc2LastLleResult()) {
           fprintf(stderr, "Runtime stopped at frame %llu (resume PC $%06x).\n",
@@ -1675,30 +2684,43 @@ static int RunGame(const char *rom_path,
           break;
         }
         host_frame++;
+        if (sram_enabled) SaveSramWhenChanged(&sram_saved, host_frame);
         rewind_capture_counter++;
         if (rewind_available &&
             rewind_capture_counter >= kRewindSnapshotInterval) {
           rewind_capture_counter = 0;
+#ifdef __SWITCH__
+          const uint64_t perf_rewind_start = SDL_GetPerformanceCounter();
+#endif
           if (RtlSaveSnapshotToMemory(rewind_scratch, rewind_snapshot_size) !=
                   rewind_snapshot_size ||
               !Dkc2RewindHistoryPush(&rewind_history, rewind_scratch))
             rewind_available = false;
+#ifdef __SWITCH__
+          perf.rewind += SDL_GetPerformanceCounter() - perf_rewind_start;
+#endif
         }
-        DrawFrame(&host);
-        frame_ready = true;
-#ifdef __APPLE__
-        emulate_seconds += (double)(SDL_GetPerformanceCounter() - emulate_start) /
-                           (double)frequency;
+        /* The frame's audio is queued before it is drawn, so a slow draw
+         * cannot hold back samples the queue is already waiting for. */
+#ifdef __SWITCH__
+        const uint64_t perf_audio_start = SDL_GetPerformanceCounter();
 #endif
         audio_fraction += (double)kAudioRate / kVideoRate;
         int audio_frames = (int)audio_fraction;
         audio_fraction -= audio_frames;
         RtlRenderAudio(frame_audio, audio_frames, kAudioChannels);
         Dkc2MusicMix(frame_audio, audio_frames, 32040);
+        const double queued_audio = AudioQueuedFrames(&host);
+#ifdef __SWITCH__
+        if (mode == kSdlSpeedNormal && host.audio_available)
+          SwitchPerfAudio(&perf, frame_audio,
+                          (size_t)audio_frames * kAudioChannels,
+                          1000.0 * queued_audio / kAudioRate,
+                          host.audio_primed);
+#endif
         if (mode == kSdlSpeedNormal) {
           host.audio_fill_average = Dkc2AudioFillAverage(
-              host.audio_fill_average, AudioQueuedFrames(&host),
-              kAudioFillWeight);
+              host.audio_fill_average, queued_audio, kAudioFillWeight);
           audio_ratio = host.audio_primed
               ? Dkc2AudioRateRatio(host.audio_fill_average,
                                    AudioTargetFrames(&host),
@@ -1709,6 +2731,33 @@ static int RunGame(const char *rom_path,
             host.audio_available = false;
           }
         }
+#ifdef __SWITCH__
+        const uint64_t perf_draw_start = SDL_GetPerformanceCounter();
+        perf.audio += perf_draw_start - perf_audio_start;
+        perf.emulated++;
+#endif
+        DrawFrame(&host);
+        frame_ready = true;
+#ifdef __SWITCH__
+        perf.draw += SDL_GetPerformanceCounter() - perf_draw_start;
+        perf.ppu += host.perf_ppu_end - perf_draw_start;
+        Dkc2HdTimings hd_timings;
+        Dkc2HdTakeTimings(host.hd, &hd_timings);
+        perf.hd.prepare += hd_timings.prepare;
+        perf.hd.pixels += hd_timings.pixels;
+        perf.hd.art += hd_timings.art;
+        perf.hd.tiles += hd_timings.tiles;
+        perf.hd.sprites += hd_timings.sprites;
+        perf.hd.load += hd_timings.load;
+        perf.hd.reads += hd_timings.reads;
+        perf.hd.filtered_inframe += hd_timings.filtered_inframe;
+        perf.hd.filtered_async += hd_timings.filtered_async;
+        perf.cache_bytes = Dkc2HdCacheBytes(host.hd);
+#endif
+#ifdef __APPLE__
+        emulate_seconds += (double)(SDL_GetPerformanceCounter() - emulate_start) /
+                           (double)frequency;
+#endif
         if (test_frame_limit && host_frame >= test_frame_limit) {
           host.running = false;
           break;
@@ -1784,6 +2833,9 @@ static int RunGame(const char *rom_path,
                                        dh);
         }
       }
+#ifdef __SWITCH__
+      const uint64_t perf_present_start = SDL_GetPerformanceCounter();
+#endif
       bool presented = false;
       if (host.hd_scene) {
         presented = Dkc2SdlPresenterPresentHd(&host.presenter, host.hd_scene,
@@ -1813,6 +2865,12 @@ static int RunGame(const char *rom_path,
         runtime_failure = true;
         break;
       }
+#ifdef __SWITCH__
+      perf.present += SDL_GetPerformanceCounter() - perf_present_start;
+      SwitchPerfPresented(&perf, host.hd ? host.hd_config.scale : 0);
+      ReapSwitchReport(&report, false);
+      FinishSwitchReport(&report, &host.presenter);
+#endif
 #ifdef __APPLE__
       if (pacing_log) {
         if (!display_paced) (void)Dkc2MacDisplayLinkLatest(&tick);
@@ -1862,11 +2920,27 @@ static int RunGame(const char *rom_path,
         Dkc2SdlPresenterArmCapture(&host.presenter, NULL, 0, 0);
       }
     }
-    if (should_pace &&
+#ifdef __SWITCH__
+    /* A vsynced swap has already waited for the display; a second wait on
+     * the host clock only delays the next frame after a late one. */
+    const bool swap_paced =
+        frame_ready && Dkc2SdlPresenterVsyncStatus(&host.presenter) ==
+                           kDkc2DesktopVsyncEnabled;
+#else
+    const bool swap_paced = false;
+#endif
+    if (should_pace && !swap_paced &&
         (!Dkc2SdlPresenterUsesSoftwarePacing(&host.presenter) ||
-         !frame_ready))
+         !frame_ready)) {
+#ifdef __SWITCH__
+      const uint64_t perf_pace_start = SDL_GetPerformanceCounter();
+#endif
       PaceFrame(&host, &deadline, &deadline_fraction);
-    else if (!should_pace) {
+#ifdef __SWITCH__
+      perf.pace += SDL_GetPerformanceCounter() - perf_pace_start;
+#endif
+    }
+    else if (!should_pace || swap_paced) {
       deadline = SDL_GetPerformanceCounter();
       deadline_fraction = 0.0;
     }
@@ -1894,6 +2968,13 @@ static int RunGame(const char *rom_path,
   Dkc2MacDisplayLinkStop();
   if (pacing_log) fclose(pacing_log);
 #endif
+#ifdef __SWITCH__
+  ReapSwitchReport(&report, true);
+  SwitchLogClose(perf.file);
+  SwitchLogClose(perf.spikes);
+  tier2_capture_set_journal_writer(NULL, NULL);
+  SwitchLogClose(perf.journal);
+#endif
   if (test_rewind_requested && !test_rewind_completed) runtime_failure = true;
   if (test_fast_forward_requested && !test_fast_forward_completed)
     runtime_failure = true;
@@ -1918,6 +2999,7 @@ static int RunGame(const char *rom_path,
       !WriteFramePpm(frame_output, host.pixels))
     completed = false;
   if (sram_enabled && completed) RtlWriteSram();
+  free(sram_saved.copy);
   Dkc2DesktopOverlayGetSettings(host.overlay, settings);
   if (aspect_override_active || widescreen_override_active) {
     settings->aspect_index = persisted_aspect;
@@ -1951,8 +3033,20 @@ static int RunGame(const char *rom_path,
   return completed ? 0 : 5;
 }
 
-int main(int argc, char **argv) {
+static int HostMain(int argc, char **argv) {
   SDL_SetMainReady();
+#ifdef __SWITCH__
+  SwitchBench bench;
+  if (!SwitchParseBench(&argc, argv, &bench)) {
+    fprintf(stderr,
+            "Usage: %s [--renderer deko3d|gl] [--bench SECONDS [--hd 0|2-8] "
+            "[--aspect 4:3|16:10|16:9|21:9] [--shot F1,F2,...] "
+            "[--return APP.nro]] [ROM.smc]\n",
+            argv[0]);
+    return 2;
+  }
+  (void)setenv("DKC2_RENDERER", bench.renderer, 1);
+#endif
   bool force_launcher = false;
   int rom_argument = 1;
   if (argc >= 2 && strcmp(argv[1], "--launcher") == 0) {
@@ -1978,6 +3072,15 @@ int main(int argc, char **argv) {
     return 2;
   }
   Dkc2LauncherSetAssetsPath(assets_path);
+#elif defined(__SWITCH__)
+  /* The .nro and the installed title share one data folder on the SD card;
+   * an installed title starts with no useful working directory. */
+  (void)DKC2_MKDIR(kSwitchDataDirectory);
+  if (chdir(kSwitchDataDirectory) != 0)
+    fprintf(stderr, "warning: cannot enter %s\n", kSwitchDataDirectory);
+  /* Nothing shows the console streams; keep them beside perf.log. */
+  if (freopen("stdout.log", "w", stdout)) setvbuf(stdout, NULL, _IOLBF, 0);
+  (void)freopen("stderr.log", "w", stderr);
 #else
   (void)snesrecomp_anchor_to_exe_dir();
 #endif
@@ -1989,10 +3092,33 @@ int main(int argc, char **argv) {
   Dkc2LauncherSettingsLoad(&settings);
   if (!rom_path[0])
     (void)Dkc2LauncherReadRomCache(rom_path, sizeof rom_path);
+#ifdef __SWITCH__
+  /* The console has no file picker: the ROM sits in the data folder. */
+  if (!rom_path[0])
+    (void)snprintf(rom_path, sizeof rom_path, "%s", "dkc2.smc");
+  if (bench.seconds) {
+    SwitchApplyBench(&bench);
+    SwitchClockStart(Dkc2LauncherSwitchCpuMhz());
+    const int result = RunGame(rom_path, &settings);
+    SwitchClockStop();
+    fprintf(stdout, "bench: done result=%d\n", result);
+    if (bench.return_path &&
+        (!envHasNextLoad() ||
+         R_FAILED(envSetNextLoad(bench.return_path, bench.return_path))))
+      fprintf(stderr, "warning: cannot return to %s\n", bench.return_path);
+    fflush(stdout);
+    return result;
+  }
+#endif
   bool suppress_launcher = EnvironmentEnabled("SNESRECOMP_NO_LAUNCHER") ||
                            EnvironmentEnabled("DKC2_DESKTOP_TEST_HIDDEN");
+#ifdef __SWITCH__
+  /* The ROM is always known, and the launcher is only for --launcher. */
+  bool show_launcher = !suppress_launcher && force_launcher;
+#else
   bool show_launcher = !suppress_launcher &&
       (force_launcher || !settings.skip_launcher || !rom_path[0]);
+#endif
   if (show_launcher) {
     char selected_rom[kPathCapacity] = {0};
     int action = Dkc2LauncherRun(&settings, rom_path, selected_rom,
@@ -2007,7 +3133,54 @@ int main(int argc, char **argv) {
     return 0;
   }
   (void)Dkc2LauncherWriteRomCache(rom_path);
+#ifdef __SWITCH__
+  SwitchClockStart(Dkc2LauncherSwitchCpuMhz());
+#endif
   int result = RunGame(rom_path, &settings);
+#ifdef __SWITCH__
+  SwitchClockStop();
+  /* Quitting goes back to the homebrew that launched the game, or to the
+   * loader's menu when none was named. */
+  if (bench.return_path &&
+      (!envHasNextLoad() ||
+       R_FAILED(envSetNextLoad(bench.return_path, bench.return_path))))
+    fprintf(stderr, "warning: cannot return to %s\n", bench.return_path);
+#endif
   (void)Dkc2LauncherSettingsSave(&settings);
   return result;
 }
+
+#ifdef __SWITCH__
+/* Mesa's GLSL preprocessor recurses deeply and overflows the 1 MiB stack the
+ * loader gives the main thread, so the host runs on a larger one. */
+enum { kSwitchHostStackSize = 8 * 1024 * 1024 };
+
+typedef struct {
+  int argc;
+  char **argv;
+  int result;
+} SwitchHostArguments;
+
+static void *SwitchHostThread(void *context) {
+  SwitchHostArguments *arguments = context;
+  arguments->result = HostMain(arguments->argc, arguments->argv);
+  return NULL;
+}
+
+int main(int argc, char **argv) {
+  SwitchHostArguments arguments = {argc, argv, 2};
+  pthread_attr_t attributes;
+  pthread_t thread;
+  if (pthread_attr_init(&attributes) != 0 ||
+      pthread_attr_setstacksize(&attributes, kSwitchHostStackSize) != 0 ||
+      pthread_create(&thread, &attributes, SwitchHostThread, &arguments) != 0) {
+    fprintf(stderr, "fatal: cannot start the host thread\n");
+    return 2;
+  }
+  (void)pthread_attr_destroy(&attributes);
+  (void)pthread_join(thread, NULL);
+  return arguments.result;
+}
+#else
+int main(int argc, char **argv) { return HostMain(argc, argv); }
+#endif

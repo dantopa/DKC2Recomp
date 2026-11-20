@@ -325,7 +325,7 @@ can replace it with a slider without changing the state format.
 
 The game-window title updates once per second with the number of completed
 presentations, for example
-`DKC2 Recomp Alpha Pre-Release (FPS: 60)`. Press `F`, or set
+`Donkey Kong Country 2 HD (FPS: 60)`. Press `F`, or set
 `DKC2_DESKTOP_PERF=1` before launch, to create `performance.log` beside the
 executable. Each one-second sample reports average input, emulation, rewind,
 PPU, audio, presentation, pacing, and untracked time, plus the fraction of

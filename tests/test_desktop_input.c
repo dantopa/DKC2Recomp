@@ -121,6 +121,13 @@ int main(void) {
     (void)fputs("custom gamepad binding failed\n", stderr);
     return EXIT_FAILURE;
   }
+  /* Up on the left stick past the deadzone, with no direction bound. */
+  const Dkc2GamepadState stick = {.left_y = 20000};
+  if (Dkc2MapGamepadBindings(&stick, 7849, 30, pad_bindings) !=
+      UINT32_C(1) << 4) {
+    (void)fputs("left stick steering failed\n", stderr);
+    return EXIT_FAILURE;
+  }
 
   int assist_keys[RECOMP_LAUNCHER_MAX_ASSIST_BINDINGS] = {0};
   int assist_pads[RECOMP_LAUNCHER_MAX_ASSIST_BINDINGS] = {0};

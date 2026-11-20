@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "dkc2_hdma.h"
 #include "snes/ppu.h"
@@ -27,7 +28,10 @@ extern "C" {
  *    a hash of the palette's colors 1-15) in the pack directory, for
  *    externally produced art; the same art applies whichever palette slot
  *    the game assigns;
- *  - else a pack file "<graphic>_<slot>.rgba" (one digit: the palette slot);
+ *  - else a pack file "<graphic>_<slot>.rgba" (one digit: the palette slot),
+ *    the slot aliases.txt names for the content key when it lists one
+ *    ("<graphic>_p<palette> -> <graphic>_<slot>" per line), else the
+ *    record's own slot;
  *  - the runtime filter applied to the ROM frame (no external data), or
  *    the learned filter when its table loads.
  *
@@ -161,11 +165,44 @@ enum { kDkc2HdTileMath = 0x80 };
  *     order, each output pixel hidden when, for the occlusion R, G, B of its
  *     1x pixel, rank <= R, or G && G >= rank, or B && B - 1 > index.
  * Valid until the next frame call or Dkc2HdDestroy.
+ *
+ * An unresolved scene (inputs set) leaves base, tile_mask, occlusion and
+ * layer NULL: the executor derives them per pixel from inputs, as
+ * Dkc2HdEndFrameScene does on the CPU for a resolved one.
  */
+typedef struct Dkc2HdSceneInputs {
+  const uint32_t *frame; /* the rendered frame, ARGB (alpha ignored) */
+  /* BG1-BG3 and object captures: alpha the composition rank, 0 where the
+   * layer is absent. */
+  const uint32_t *bg[3];
+  const uint32_t *obj;
+  const uint32_t *native; /* a record's own pixel where owner is set */
+  const uint8_t *owner;   /* the sprite-table record + 1 there, or 0 */
+  const uint8_t *loose;   /* nonzero where a loose object claims it */
+  /* kDkc2HdRecordEntries, by owner value: byte 0 1 when the record is
+   * replaced, byte 1 its draw-order position + 1. */
+  const uint32_t *records;
+  /* One per row: the BGR555 fixed color a BG2 (low half) or BG3 (high
+   * half) panorama adds on that line and joins the tile mask with, or 0. */
+  const uint32_t *lines;
+  /* 256 entries: byte 0 the first brightness level showing channel value
+   * i (31 when none does), byte 1 the PPU brightness table at i (its last
+   * entry past 62). */
+  const uint32_t *math;
+  int shown_first, shown_end; /* the columns the PPU shows */
+  /* Columns where screen art lifts BG1's rank to at least 1 (empty when
+   * the scene shows none). */
+  int screen_first, screen_end;
+} Dkc2HdSceneInputs;
+
+enum { kDkc2HdRecordEntries = 256, kDkc2HdMathEntries = 256 };
+
 typedef struct Dkc2HdScene {
   uint64_t serial; /* differs for every scene */
   int width, height, scale;
   Dkc2HdFilter background;
+  const Dkc2HdSceneInputs *inputs; /* unresolved scenes only */
+  bool layered; /* the BG1 layer is drawn (layer set when resolved) */
   const uint32_t *base;
   const Dkc2HdQuad *tiles;
   unsigned tile_count;
@@ -204,10 +241,66 @@ Dkc2Hd *Dkc2HdCreate(const Dkc2HdConfig *config, const uint8_t *rom,
                      size_t rom_size);
 void Dkc2HdDestroy(Dkc2Hd *hd);
 
+/* Reads a pack's play art ahead so play never waits on storage: create on
+ * the main thread, step on one other thread until a step returns false (all
+ * read, or budget bytes of pixels spent), then hand the art to a compositor
+ * on the same pack with Dkc2HdAdoptPack on the main thread. Art not read
+ * ahead loads on first sight. NULL without a pack or budget. */
+typedef struct Dkc2HdPackReader Dkc2HdPackReader;
+Dkc2HdPackReader *Dkc2HdPackReaderCreate(const char *pack_dir, size_t budget);
+bool Dkc2HdPackReaderStep(Dkc2HdPackReader *reader);
+/* Thousandths of the reading done, for the thread that steps. */
+unsigned Dkc2HdPackReaderProgress(const Dkc2HdPackReader *reader);
+void Dkc2HdAdoptPack(Dkc2Hd *hd, Dkc2HdPackReader *reader);
+void Dkc2HdPackReaderDestroy(Dkc2HdPackReader *reader);
+
+/* Sprite frames filtered on another thread. Once enabled, a sprite frame
+ * missing from the cache shows unfiltered and joins the open batch. The
+ * main thread takes the batch between frames, another thread runs it, and
+ * the main thread adopts it before building the next scene; one batch is
+ * out at a time, and it must be adopted before the compositor is
+ * destroyed or batches are disabled. */
+typedef struct Dkc2HdFilterBatch Dkc2HdFilterBatch;
+void Dkc2HdSetFilterBatches(Dkc2Hd *hd, bool enabled);
+/* NULL when no batch is open with frames or one is still out. */
+Dkc2HdFilterBatch *Dkc2HdTakeFilterBatch(Dkc2Hd *hd);
+void Dkc2HdRunFilterBatch(Dkc2HdFilterBatch *batch);
+void Dkc2HdAdoptFilterBatch(Dkc2Hd *hd, Dkc2HdFilterBatch *batch);
+
+/* Filtered sprite frames kept on storage between sessions: the batches'
+ * results are appended to the file at path (from the batch thread, after
+ * running a batch) and read back into the cache when a session starts. */
+FILE *Dkc2HdOpenSpriteCache(const Dkc2Hd *hd, const char *path);
+void Dkc2HdSaveFilterBatch(const Dkc2HdFilterBatch *batch, FILE *file);
+void Dkc2HdLoadSpriteCache(Dkc2Hd *hd, const char *path);
+
+/* CPU time spent building scenes since the last Dkc2HdTakeTimings, in ticks
+ * of the clock given to Dkc2HdSetClock (without one nothing is measured). */
+typedef struct Dkc2HdTimings {
+  uint64_t prepare; /* OAM, sprite states and loose objects */
+  uint64_t pixels;  /* the per-pixel base, occlusion and tile mask */
+  uint64_t art;     /* BG1 terrain or screen art, and BG1's rank */
+  uint64_t tiles;   /* tile quads */
+  uint64_t sprites; /* sprite and loose-object quads */
+  uint64_t load;    /* pack files read, part of the phases above */
+  uint64_t reads;   /* pack files read from storage (a count, not time) */
+  /* Sprite frames filtered on a cache miss (counts): inside the scene, or
+   * by a filter batch and adopted. */
+  uint64_t filtered_inframe;
+  uint64_t filtered_async;
+} Dkc2HdTimings;
+void Dkc2HdSetClock(Dkc2Hd *hd, uint64_t (*now)(void));
+/* Copies the timings into *timings (zeros for a NULL hd) and clears them. */
+void Dkc2HdTakeTimings(Dkc2Hd *hd, Dkc2HdTimings *timings);
+/* Bytes the filtered sprite frame cache holds (0 for a NULL hd). */
+size_t Dkc2HdCacheBytes(const Dkc2Hd *hd);
+
 /* Call before Dkc2DrawPpuFrame with the width it renders (256 plus both
- * widescreen margins). Routes the frame through the HD path when the scene
- * is supported; otherwise leaves the PPU untouched. */
-void Dkc2HdBeginFrame(Dkc2Hd *hd, Ppu *ppu, int frame_width);
+ * widescreen margins) and the registers the previous frame's scanlines were
+ * drawn with (NULL: none yet). Routes the frame through the HD path when the
+ * scene is supported; otherwise leaves the PPU untouched. */
+void Dkc2HdBeginFrame(Dkc2Hd *hd, Ppu *ppu, int frame_width,
+                      const Dkc2HdmaLines *previous_lines);
 
 /* Call after Dkc2DrawPpuFrame with the BGRA frame it rendered (pitch in
  * bytes) and the registers its scanlines were drawn with (NULL: no tile
@@ -219,12 +312,14 @@ const uint32_t *Dkc2HdEndFrame(Dkc2Hd *hd, const Ppu *ppu, const uint8_t *ram,
                                const uint8_t *frame, size_t frame_pitch,
                                int *width, int *height);
 
-/* The same frame as a scene for an external executor, or NULL as above. */
+/* The same frame as a scene for an external executor, or NULL as above.
+ * Unless resolve is set (or the frame rows are not tightly packed) the
+ * per-pixel maps are left to the executor (Dkc2HdScene.inputs). */
 const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
                                        const uint8_t *ram,
                                        const Dkc2HdmaLines *lines,
                                        const uint8_t *frame,
-                                       size_t frame_pitch);
+                                       size_t frame_pitch, bool resolve);
 
 /* Fills *probe for pixel (x, y) of the last composed frame. False when the
  * last frame was not composed or the pixel is outside it. */

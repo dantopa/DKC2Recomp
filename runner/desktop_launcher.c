@@ -105,12 +105,18 @@ void Dkc2LauncherSetCrt(const Dkc2CrtSettings *crt) {
 }
 
 /* HD presentation (dkc2_hd.h), on by default at 4x with smooth sprites and
- * background and the HD pack's art. */
+ * background and the HD pack's art. The Switch defaults to 2x: its screen
+ * is 720p (1080p docked), where 4x adds cost without visible detail. */
 static int s_hd_enabled = 1;
+#ifdef __SWITCH__
+static int s_hd_scale = 2;
+#else
 static int s_hd_scale = 4;
+#endif
 static int s_hd_sprites = kDkc2HdFilterSmooth;
 static int s_hd_background = kDkc2HdFilterSmooth;
 static int s_hd_art = 1;
+static int s_switch_cpu_mhz = 1785;
 int Dkc2LauncherHdEnabled(void) { return s_hd_enabled; }
 void Dkc2LauncherSetHdEnabled(int enabled) { s_hd_enabled = enabled != 0; }
 int Dkc2LauncherHdScale(void) { return s_hd_scale; }
@@ -128,6 +134,10 @@ void Dkc2LauncherSetHdBackground(int filter) {
 }
 int Dkc2LauncherHdArt(void) { return s_hd_art; }
 void Dkc2LauncherSetHdArt(int enabled) { s_hd_art = enabled != 0; }
+int Dkc2LauncherSwitchCpuMhz(void) { return s_switch_cpu_mhz; }
+void Dkc2LauncherSetSwitchCpuMhz(int mhz) {
+  s_switch_cpu_mhz = mhz <= 0 ? 0 : ClampInt(mhz, 1020, 1785);
+}
 
 int Dkc2LauncherWidescreenEdge(void) {
   return s_widescreen_edge;
@@ -157,6 +167,13 @@ void Dkc2LauncherSettingsDefault(RecompLauncherCSettings *settings) {
   settings->deadzone[0] = 24;
   settings->deadzone[1] = 24;
   settings->assist_tools = 0;
+#ifdef __SWITCH__
+  /* A 16:9 screen with no launcher: start the game straight away and fill
+   * it. The in-game menu still changes everything. */
+  settings->widescreen = 1;
+  settings->aspect_index = kDkc2VideoAspect16x9;
+  settings->skip_launcher = 1;
+#endif
   const int keyboard[kDkc2BindingCount] = {
       SDL_SCANCODE_UP, SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT,
       SDL_SCANCODE_RIGHT, SDL_SCANCODE_X, SDL_SCANCODE_Z,
@@ -236,6 +253,8 @@ void Dkc2LauncherSettingsLoad(RecompLauncherCSettings *settings) {
       Dkc2LauncherSetHdBackground(value);
     else if (strcmp(key, "HdArt") == 0)
       Dkc2LauncherSetHdArt(value);
+    else if (strcmp(key, "SwitchCpuMhz") == 0)
+      Dkc2LauncherSetSwitchCpuMhz(value);
     else if (strcmp(key, "HapticsEnabled") == 0)
       Dkc2LauncherSetHaptics(value);
     else if (strcmp(key, "Upscaler") == 0)
@@ -335,7 +354,7 @@ bool Dkc2LauncherSettingsSave(const RecompLauncherCSettings *settings) {
                     "WidescreenEdge=%d\n"
                     "CoopMode=%d\n"
                     "HdEnabled=%d\nHdScale=%d\nHdSprites=%d\n"
-                    "HdBackground=%d\nHdArt=%d\n"
+                    "HdBackground=%d\nHdArt=%d\nSwitchCpuMhz=%d\n"
                     "Upscaler=%d\nReconstructMode=%d\n"
                     "ReconstructStrength=%d\n"
                     "ReconstructSoftness=%d\nReconstructShading=%d\n"
@@ -363,7 +382,7 @@ bool Dkc2LauncherSettingsSave(const RecompLauncherCSettings *settings) {
                     s_widescreen_edge,
                     s_coop_mode,
                     s_hd_enabled, s_hd_scale, s_hd_sprites, s_hd_background,
-                    s_hd_art,
+                    s_hd_art, s_switch_cpu_mhz,
                     s_upscaler, s_reconstruct_mode, s_reconstruct_strength,
                     s_reconstruct_softness, s_reconstruct_shading,
                     s_haptics_enabled,

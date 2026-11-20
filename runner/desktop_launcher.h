@@ -7,7 +7,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define DKC2_PRODUCT_TITLE "DKC2 Recomp Alpha Pre-Release"
+#define DKC2_PRODUCT_TITLE "Donkey Kong Country 2 HD"
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,6 +33,10 @@ void Dkc2LauncherSetHdBackground(int filter);
 /* Whether the HD pack's art is used (otherwise only the filters draw). */
 int Dkc2LauncherHdArt(void);
 void Dkc2LauncherSetHdArt(int enabled);
+/* The CPU clock in MHz the console runs the game at (0 leaves the clock as
+ * the system set it). */
+int Dkc2LauncherSwitchCpuMhz(void);
+void Dkc2LauncherSetSwitchCpuMhz(int mhz);
 /* Upscaler choice (kDkc2Upscaler*), remembered with the launcher settings;
  * the Reconstruct experiment's mode (0..3) and strength (0..100). */
 int Dkc2LauncherHaptics(void);

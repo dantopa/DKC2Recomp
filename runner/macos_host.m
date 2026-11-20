@@ -158,7 +158,7 @@ void Dkc2MacInstallMenu(void) {
     s_menu_controller = [[Dkc2MacMenuController alloc] init];
     NSMenu *bar = [[NSMenu alloc] initWithTitle:@""];
 
-    NSMenu *app = [[NSMenu alloc] initWithTitle:@"DKC2Recomp"];
+    NSMenu *app = [[NSMenu alloc] initWithTitle:@"Donkey Kong Country 2 HD"];
     NSMenuItem *about = [[NSMenuItem alloc]
         initWithTitle:@"About DKC2Recomp"
                action:@selector(orderFrontStandardAboutPanel:)
@@ -189,7 +189,7 @@ void Dkc2MacInstallMenu(void) {
     [app addItem:[NSMenuItem separatorItem]];
     AddCommand(app, @"Quit DKC2Recomp", kDkc2MacCommandQuit, @"q",
                NSEventModifierFlagCommand, kDkc2MacItemCount);
-    AddSubmenu(bar, @"DKC2Recomp", app);
+    AddSubmenu(bar, @"Donkey Kong Country 2 HD", app);
 
     NSMenu *game = [[NSMenu alloc] initWithTitle:@"Game"];
     AddCommand(game, @"Pause / Settings", kDkc2MacCommandToggleOverlay,

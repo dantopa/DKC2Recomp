@@ -6697,3 +6697,278 @@ pack had art for four of the eight walk frames (graphics 0f94-0fb0, palette
 802096c5). The other four were generated (one Gemini image, about US$0.13)
 from the pixel frames with the existing four as the style reference, keyed
 out of a green background at 64x64 like the rest.
+
+## 2026-10-29 - Switch homebrew build
+
+The SDL host builds for Switch homebrew with the devkitPro toolchain
+(`devkitpro/devkita64` Docker image: libnx, switch-sdl2 2.28, Mesa 20.1).
+The recompiled game and the PPU compiled for aarch64 unchanged; only host
+and desktop pieces needed attention:
+
+- newlib hides POSIX declarations under `-std=c11`, so the Switch build
+  defines `_GNU_SOURCE`, and clears `CMAKE_DL_LIBS` (no libdl);
+- `uname()` is missing: the target uses the headless host-report adapter;
+- tinyfiledialogs needs termios: it is dropped and `runner/switch_host.c`
+  answers the dialogs as cancelled; the ROM defaults to `dkc2.smc` in the
+  working directory, which the homebrew loader sets to the `.nro` folder;
+- ImGui's desktop GL loader needs dlopen: the launcher and overlay use the
+  OpenGL ES 2 configuration recomp-ui already has for Android; ImGui's shell
+  helpers (fork/exec) are disabled;
+- the presenter's GL 2.1 fixed-function calls are not exported by the
+  static Mesa GLES library; `switch_host.c` resolves them from the context;
+- no POSIX signal delivery: the crash-signal handler is not installed;
+- no file mapping: MSU-1 tracks are reported unavailable.
+
+An installable `.nsp` is packed with hacBrewPack from the same ELF
+(`assets/switch/DKC2Recomp.npdm.json`, the hacBrewPack template with the
+current npdmtool field names and debug flags off). An installed title starts
+without a useful working directory, so the Switch host always enters
+`sdmc:/switch/DKC2Recomp`, shared with the `.nro`.
+
+First run on hardware crashed (Data Abort, 2168-0002) while compiling the
+first GLSL shader: Mesa's GLSL preprocessor overflowed the 1 MiB main-thread
+stack (backtrace glcpp_parser_parse -> vsnprintf). On Switch `main()` now
+runs the host on an 8 MiB thread.
+
+With the HD pack on the SD card, HD at 2x fell to 24-32 fps on the Switch
+(drawing 20-31 ms, composition on the GPU). Pack images were read four bytes
+per `fread`, a million calls for a 4 MiB image, and art loads the first time
+each graphic appears, so the cost spread over play. One read per image and
+an in-place conversion load the whole Mac pack in 0.41 s instead of 3.58 s
+(same pixels); the console gap is larger.
+
+After the fix HD 2x runs at 37-60 fps on hardware with spikes in drawing
+(up to 12 ms). To measure without a person at the controls, the Switch host
+takes `--bench SECONDS [--hd S]`: no launcher, no saves, the recorded route
+in `bench.input`, the per-stage lines on stdout (nxlink `-s` receives them)
+and `bench: done`. The arguments set the existing desktop test controls and
+the in-memory HD options, which the bench does not save. Drawing is split
+into the PPU frame and the HD scene.
+
+The installed title showed "?" on the HOME menu: the control data had only
+an English icon, libnx's default. The HOME menu uses the console language's
+icon, so the NSP now carries `assets/switch/icon.jpg` (original art made
+with Gemini, as a 256x256 baseline JPEG with EXIF removed) under every language; the `.nro` uses
+the same icon. Not yet checked on hardware.
+
+## 2026-10-29 - Missing enemy and object art
+
+Of the graphics whose palette a dump has seen, 199 still had no pack art
+for at least one palette (inventory of 2026-10-24, rechecked against the
+pack). Leaving the Kongs aside, the 120 others form 15 grids by character
+type. Five were not sent: 8x8 dark debris, tiny Kong icons with broken
+colors, and white smoke, which the cut cannot separate from the white
+background; the filter keeps drawing them. The other ten (Squawks, Zinger,
+the ghost crocodile pirate, the DK coin, plain, star and plus barrels, the
+fused shell enemy, the pirate flag, Diddy flying) went in one Gemini batch,
+two variants each, with prompts naming the subject (about US$1.30).
+
+Every variant was cut into a trial pack and the one with the better mean
+silhouette overlap (0.83-0.96) kept, then checked by eye. 54 frames entered
+the private pack (none replaced; list in
+`private/hdpack_backup_20261029_enemies.installed.txt`); the flag sheet's
+rope ladder and two coin frames were rejected by the cut. The Pirate Panic
+route runs through with the pack; these graphics appear elsewhere, so they
+are not yet seen in play.
+
+The 93 missing Kong frames were mostly not worth sending: loose sprite
+pieces, Dixie poses seen with Diddy's palette and the reverse, Diddy with
+the cap apart and no face (a missing sprite part the model would invent),
+and unidentifiable boxes. 13 clean Diddy poses (standing, blowing gum) and
+5 Dixie poses went in a second batch with the approved references. All 13
+Diddy frames cut (overlap 0.90); for Dixie the model changed three poses
+and the cut rejected them, so 2 entered. The installed list now holds 69
+frames.
+
+The bench gained `--aspect` (to compare with the 4:3 runs) and `--return`,
+which calls libnx `envSetNextLoad` so the homebrew loader starts a test
+runner instead of the menu. Over nxlink `-s` the bench sent nothing in
+150 s while the game ran; since the runner reads the SD card, the streams
+now always go to `stdout.log` and `stderr.log` and the nxlink redirection
+is gone.
+
+## 2026-10-29 - Switch HD frame cost
+
+On hardware the HD 2x route falls from 40-46 fps to 22-24 fps in its last
+stretch, with 24-27 ms drawing (16-20 ms of it the HD scene) and 13 ms
+presenting. Three cheap costs went first. After a vsynced swap the loop
+also waited for the next 60.0988 Hz host deadline; on the Switch it now
+re-anchors that deadline instead. Each HD quad set eight uniforms through
+helpers that looked their locations up by name; the locations are now read
+once per pass. The recompiled bus called `getenv` for its diagnostic
+switches on APU port accesses and yields; snesrecomp now caches them.
+
+Each HD quad is still its own immediate-mode draw with its own uniforms
+and texture bind, which costs driver CPU time under Mesa on the Tegra. To
+measure it, `perf.log` now adds the draw calls, texture uploads and
+uploaded kilobytes per presented frame. HD pack textures stay resident and
+upload once; per frame the scene uploads its native-size base, occlusion,
+layer and tile mask. Nothing reads pixels back during a frame except an
+armed screenshot, and the HD targets are built once per size.
+
+## 2026-10-29 - Switch deko3d renderer
+
+The counters answered the question: in the slow last stretch of the bench
+route the HD scene issues about 300 draw calls a frame and spends 16-24 ms
+on them, some 55-65 microseconds each, which is Mesa's CPU cost per
+immediate-mode quad with its uniforms and texture bind. Patricio chose to
+leave OpenGL on the console rather than batch around the driver.
+
+`runner/switch_present_deko3d.c` draws with deko3d. The presenter entry
+points delegate to it when `DKC2_RENDERER=deko3d` (the bench's
+`--renderer deko3d`); OpenGL stays the default until it reaches parity.
+The device keeps deko3d's upper-left origin, so fragment row 0, memory row
+0 and texture coordinate 0 are the top row everywhere: the HD passes,
+written for targets whose row 0 is texture coordinate 0, port line for
+line to GLSL 460 (`runner/switch_shaders/`, compiled by `uam` and embedded
+with `bin2s`), and the presented image needs no flip. One vertex shader
+draws every rectangle from a pushed uniform block, so a quad costs a
+texture bind, a 128-byte push and a draw, all plain writes into command
+memory.
+
+Three frames are recorded ahead, each with its own command memory,
+staging buffer, 1x scene inputs and fence. HD pack images are uploaded
+once into 32 MB pool blocks and described by their table slot; when the
+table or the pool fills, the GPU finishes and every image starts over.
+Every image a scene uses is made resident before its passes are recorded,
+so a flush never splits a pass.
+
+The renderer owns the console's default window. SDL only takes that window
+when it creates its own, and its event pump still calls `appletMainLoop`
+without one, so HOME and suspend keep working. The in-game menu draws with
+ImGui on OpenGL and stays out for now; the host leaves the overlay
+uninitialized when there is no OpenGL context. The output follows SDL's
+choice at start: 1920x1080 docked, 1280x720 handheld.
+
+`--shot F1,F2,...` maps onto the existing screenshot controls, and the
+deko3d capture copies the presented image to a buffer, so the two
+renderers can be compared on the console. `perf.log` gained `run_max_ms`,
+the slowest recompiled-CPU frame of each window, since the mean hid the
+frames that miss the deadline without HD.
+
+Verified so far: the Switch build compiles without new warnings and the
+shaders compile with `uam`. The renderer has not run on hardware yet.
+
+A correction to the reading above: `perf.log`'s `scene_ms` is not the GPU
+draws. It is `Dkc2HdEndFrameScene` on the CPU, building the scene; the GL
+draws run inside `present_ms`. So the 16-24 ms that grows with the quad
+count in the last stretch is scene building, which deko3d does not touch.
+`Dkc2HdSetClock` and `Dkc2HdTakeTimings` now time its phases with the
+host's clock (only the Switch host passes one): sprite preparation, the
+per-pixel base, occlusion and tile mask, BG1 art and rank, tile quads,
+sprite quads, and the pack reads inside them. `perf.log` reports each in
+milliseconds per emulated frame, to find which one to move or cut.
+
+First hardware run (4f4fa89): present fell from 8.5 ms to under 1 ms and
+HD 2x 4:3 gained 5-8 fps, but the picture was wrong. The capture came out
+upside down and every HD quad as vertical streaks. The upper-left origin
+only moves the window origin: clip-space y still grows upward, so the
+vertex shader put pixel row 0 at the bottom while `gl_FragCoord.y` counted
+from the top. Whole-target passes hid it (they read only `gl_FragCoord`),
+the final flat draw flipped the frame, and the quad passes looked up their
+image rows from the wrong place and clamped to an edge row. `rect_vsh`
+now negates clip-space y. Not yet run on hardware.
+
+## 2026-10-30 - HD per-pixel maps on the GPU
+
+The Switch's HD frame spends most of its CPU time building the scene, and
+deko3d did not touch that. Timing the phases on the Mac with the console's
+pack (the four pack indexes hash the same) put the cost in per-pixel work:
+in Pirate Panic's last stretch about 60% of `hd_tiles` is the panorama's
+fixed-color mask (a search of the brightness table per channel of every
+pixel on lines with color math), plus the base/occlusion/tile-mask loop and
+BG1's rank. Cell matching (decode, hash, pack lookup) is the remainder and
+stays on the CPU.
+
+Those maps depend only on the captures and a few tables, so an executor
+that can run shaders now resolves them: `Dkc2HdEndFrameScene` takes a
+`resolve` flag, and without it fills `Dkc2HdSceneInputs` (captures as they
+are, owner and loose-claim bytes, and per-record, per-line and per-value
+tables) instead of the maps. The resolve program writes base, occlusion,
+tile mask and BG1 layer into four 1x RGBA8 targets, one pass each (no
+multiple render targets, so GL 2.1 framebuffer objects suffice); the
+composition passes read those targets instead of uploads. The tables keep
+the shader free of the brightness search: one lookup gives a channel's
+level, a second the value with the fixed color added.
+
+A first parity run differed only on the Pirate Panic title screen: screen
+art lifts BG1's rank to 1 over the native area (so the art covers the
+backdrop), which the inputs now carry as a column range.
+
+Verified on the Mac: `hd_gpu_parity.py` with the panorama pack on the
+Pirate Panic route (frames 600, 1300, 2400, 3000, 3200, 3400, 3550) matches
+the CPU executor exactly (largest channel difference 1); the suite passes.
+The deko3d port compiles; it has not run on hardware yet. Uploads grow from
+about 1 MB to 1.8 MB per frame at 16:9.
+
+## 2026-10-30 - Switch audio counters, APU polls and the HD pack in memory
+
+Audio on the Switch broke up whenever emulation fell below 60 fps:
+`RtlRenderAudio` is tied to the emulated frame, so a slow frame is a short
+queue. `perf.log` now counts underruns (an empty queue after priming), the
+queue's lowest and highest fill and clipped samples, plus the emulated
+frame rate, and the frame's audio is queued before it is drawn. A skipped
+draw was tried and removed: `Dkc2DrawPpuFrame` also runs the per-line HDMA
+and the vblank OAM reload, and skipping it made sprites vanish, while the
+hardware runs showed no gain.
+
+Slow recompiled-CPU frames came from the SPC upload routines polling the
+APU ports mid-loop after a frame-deadline yield. Each poll bumps the
+continuous-read epoch, so the bridge's 64-entry quiescence scan could
+never match yet ran on every step; it now runs only when neither epoch has
+moved since the previous step, and the cooperative-loop detectors read
+their opcode bytes only when they can fire. On hardware: 411 slow runs to
+208 at 1020 MHz, 5-10 at 1785 MHz.
+
+The remaining HD dips lined up with pack art read from the SD card on
+first sight. A `Dkc2HdPackReader` lists the pack's play art (not screens or
+panoramas, which creation reads), a worker thread reads it within a byte
+budget, and `Dkc2HdAdoptPack` hands the images to the compositor, whose
+listing keeps each until a table asks for it. Images read on the worker
+get no id: the id sequence stays on the main thread, assigned on adoption.
+Reading during the intro left 150-260 ms hitches at the handover and
+competed with emulation at 1020 MHz, so the host now waits behind a
+progress bar whenever HD starts. The budget is 1 GB, and none in Switch
+applet mode.
+
+On hardware (1785 MHz, 160 MB pack): the loading screen takes about 8 s;
+`hd_pack_reads` is 0 in every window; HD 2x runs at 60 fps at 4:3 with no
+underruns and 59.7-60 at 16:9 with 5. At 1020 MHz HD still drops to 38-52
+fps with hundreds of underruns: interpreter slow runs and the HD scene's
+CPU cost remain. `hd_gpu_parity.py` passes against its golden frames with
+the pack they were made from; the golden frames predate the current pack.
+The six co-op integration tests fail with and without these changes.
+
+## 2026-10-31 - Palette-slot aliases, mode 5 lines and console chords
+
+Patricio saw Zingers switch between HD and the original. A bot replayed
+the routes of 39 levels and counted, per frame, sprites drawn without art
+whose graphic had art under another key: 409 in Parrot Chute Panic, 171 in
+Glimmer's Galleon and 112 in Rambi Rumble. Most came from 1088 files keyed
+by palette slot (`<graphic>_<slot>`): the game puts the same palette in
+another slot when more objects are on screen. The runtime already looked
+art up by palette content first; `aliases.txt` now maps each content key
+seen with a slot-keyed file to that file, resolved once per key and served
+from the image already loaded, so no art is duplicated in memory. 394
+aliases came from the routes. The rest were real color variants with no
+art (a yellow Kutlass, a pink Krusha, black smoke); 17 frames were
+recolored from the existing art, moving each pixel by the difference
+between the target color and the art's mean color for its palette index.
+After: 0 over 33,032 frames and 55,918 drawn sprites.
+
+The Rare logo showed a sliver of garbage and the Nintendo logo stayed
+pixelated. "Nintendo Presents" switches to mode 5 by HDMA at line 151,
+and the fast renderer, which handles modes 1, 2, 3 and 7, drew those lines
+through its mode 7 branch; they now take the scalar renderer. The frame
+also ended in mode 5, so HD judged the next frame by it; the mode of the
+previous frame's first line decides instead. Checked against Mesen 2.1.1
+over 80 frames of the Rare logo and frames 10-145 of the Nintendo logo.
+
+On the console the bug report could not copy the logs (an open file
+cannot be read there), so it writes only the screenshot and the state, and
+events go to `perf.log`. Minus with Plus quits back to the launching
+homebrew.
+
+The six co-op tests and `hd_gpu_parity` still fail, as before these
+changes.
+

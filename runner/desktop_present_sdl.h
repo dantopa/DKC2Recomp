@@ -36,7 +36,13 @@ enum {
   kDkc2HdPassUpscale = 0,   /* a 1x input to the output scale */
   kDkc2HdPassQuad = 1,      /* an art, tile or sprite image over a rectangle */
   kDkc2HdPassComposite = 2, /* the BG1 layer over the output */
-  kDkc2HdPassCount = 3,
+  kDkc2HdPassResolve = 3,   /* an unresolved scene's 1x maps */
+  kDkc2HdPassCount = 4,
+  /* 1x textures per input set: a resolved scene's maps, then an unresolved
+   * scene's inputs (desktop_present_sdl.c numbers them). */
+  kDkc2HdInputCount = 15,
+  /* An unresolved scene's maps: base, occlusion, tile mask, BG1 layer. */
+  kDkc2HdResolvedMaps = 4,
   /* Uploaded HD images kept (a scene draws up to ~2900 tiles, sprites and
    * art quads), in an open-addressed table of a power-of-two size kept at
    * most three quarters full. */
@@ -109,11 +115,12 @@ typedef struct Dkc2SdlPresenter {
   bool capture_done;
   /* HD scenes drawn on the GPU. hd_program[0] is 0 when unavailable, with
    * the reason in hd_error. The 1x inputs (base, occlusion, BG1 layer, tile
-   * mask) are uploaded per scene; hd_output holds the composed frame of
-   * scene hd_serial, which the display chain then shows like an uploaded
-   * frame. */
+   * mask, or the captures they are resolved from into hd_resolved) are
+   * uploaded per scene; hd_output holds the composed frame of scene
+   * hd_serial, which the display chain then shows like an uploaded frame. */
   unsigned int hd_program[kDkc2HdPassCount];
-  unsigned int hd_input[kDkc2HdInputSets][4];
+  unsigned int hd_input[kDkc2HdInputSets][kDkc2HdInputCount];
+  Dkc2GlTarget hd_resolved[kDkc2HdResolvedMaps];
   int hd_input_width[kDkc2HdInputSets];
   unsigned int hd_input_set; /* the set the next scene fills */
   Dkc2GlTarget hd_layer;
@@ -122,6 +129,11 @@ typedef struct Dkc2SdlPresenter {
   Dkc2GlHdImage hd_images[kDkc2HdImageSlots]; /* id 0: free slot */
   unsigned int hd_image_count;
   char hd_error[160];
+#ifdef __SWITCH__
+  /* The deko3d renderer (switch_present_deko3d.h), when it replaces
+   * OpenGL: window and gl_context stay NULL. */
+  struct Dkc2Deko3d *deko3d;
+#endif
 } Dkc2SdlPresenter;
 
 typedef void (*Dkc2SdlOverlayDraw)(void *user, int width, int height);
@@ -195,6 +207,16 @@ void *Dkc2SdlPresenterNativeWindow(const Dkc2SdlPresenter *presenter);
 
 bool Dkc2SdlPresenterUsesSoftwarePacing(
     const Dkc2SdlPresenter *presenter);
+
+/* GL work issued by the presenters since the last call: draw calls and
+ * texture uploads (glTexImage2D/glTexSubImage2D with data). Copies the
+ * counts into stats and clears them, for per-frame profiling. */
+typedef struct Dkc2SdlPresenterGlStats {
+  unsigned draws;
+  unsigned uploads;
+  uint64_t upload_bytes;
+} Dkc2SdlPresenterGlStats;
+void Dkc2SdlPresenterTakeGlStats(Dkc2SdlPresenterGlStats *stats);
 void Dkc2SdlPresenterDestroy(Dkc2SdlPresenter *presenter);
 
 #endif

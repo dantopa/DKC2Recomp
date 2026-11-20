@@ -373,7 +373,12 @@ recomp-ui launcher as the Win32 host. The 4:3 viewport calculation and launcher
 settings/ROM-cache persistence are project-owned host-neutral modules rather
 than duplicated platform behavior. The portable presenter requests an OpenGL
 2.1 compatibility context so the game and recomp-ui overlay share one
-deterministic swap boundary. Its visible context requests SDL swap interval
+deterministic swap boundary. On the Switch the same presenter entry points
+can delegate to a deko3d renderer instead (`runner/switch_present_deko3d.c`,
+selected by `DKC2_RENDERER=deko3d`): it owns the console's window, presents
+and composes HD scenes with the OpenGL presenter's passes ported to GLSL 460,
+and has no OpenGL context, so the overlay stays uninitialized there until it
+gains a deko3d drawer. Its visible context requests SDL swap interval
 one on Windows and reports the accepted state through the same diagnostic
 backend field; hidden automation disables the interval. Visible macOS instead
 uses interval zero and paces on the display itself. The window's display link
@@ -1850,3 +1855,16 @@ scene element. The scanline register record (`Dkc2HdmaLineState`) carries
 CGWSEL, CGADSUB and the fixed color; on lines that add the fixed color to
 the panorama layer the tile mask also takes that layer's pixels with the
 color added (flag `kDkc2HdTileMath`), and the quads add it to the art.
+
+Unresolved scenes (2026-10-30): the per-pixel maps (base, tile mask,
+occlusion, BG1 layer) are pure functions of the captures, so a GPU
+executor derives them itself. `Dkc2HdEndFrameScene(..., resolve)` with
+resolve off skips the per-pixel loop, BG1's rank and the panorama mask, and
+hands over `Dkc2HdSceneInputs` instead: the frame, the BG1-BG3 and object
+captures, the sprite-table owner, record pixel and loose-object claim per
+pixel, and three small tables (per record: replaced and draw position; per
+line: the panorama's added fixed color; per channel value: its brightness
+level and the brightness table). A resolve program draws the four maps at
+1x from them, one pass per map, before the composition passes; GL and
+deko3d share the GLSL. The CPU executor keeps resolving on the CPU, and
+the parity test compares the two.

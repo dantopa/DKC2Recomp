@@ -2,6 +2,80 @@
 
 ## Unreleased (fork: HD presentation)
 
+- HD packs may carry `aliases.txt`: `<graphic>_p<palette content> ->
+  <graphic>_<slot>` lines draw art made for a palette slot whatever slot
+  the game puts that palette in, with no copy of the file. Art keyed by
+  slot alone showed only while the sprite kept its slot (Zingers and
+  balloons switched between HD and the original).
+- HD starts each frame in the mode of the previous frame's first line, so
+  "Nintendo Presents" (mode 1 above a mode 5 band set by HDMA) is drawn in
+  HD; snesrecomp now sends mode 0, 4, 5 and 6 lines to the scalar renderer,
+  which removes the sliver over the Rare logo.
+- Filtered sprite frames are decoded unlit and the scene applies the
+  screen brightness, so a frame first filtered during a fade is cached
+  right.
+- `hd_pack.py cut` cleans light halos the model leaves over transparent
+  parts of a frame, keeping eyes and teeth.
+- Switch: Minus with L saves the state (also written as a bug report with
+  `shot.ppm` and `state.sav`), Minus with R loads it, and Minus with Plus
+  quits back to the homebrew that launched the game. Save states, loads,
+  reports and quits are `event` lines in `perf.log`; frames over budget go
+  to `spikes.log`; log files are written by a thread of their own.
+- Switch: the cartridge save is written once a second when the game
+  changed it, through a temporary file, so a killed process keeps the last
+  complete save; snesrecomp's `RtlWriteSram` and `RtlSaveSnapshot` replace
+  files atomically on the SD card.
+- Switch: sprite frames missing from the HD cache are filtered by a worker
+  thread in batches and kept in `hdcache.bin` between sessions; deko3d is
+  the default renderer (`--renderer gl` for the menu); `SwitchCpuMhz` in
+  `launcher.cfg` sets the clock (1020-1785, default 1785); the left stick
+  steers.
+- Headless: `DKC2_BOT_SERVER` serves a search bot's trials over stdin from
+  one process.
+
+- The game is now titled "Donkey Kong Country 2 HD" (window, macOS menu
+  and bundle, Switch HOME menu); data folders keep the DKC2Recomp name.
+- HD pack art is read into memory behind a loading screen with a progress
+  bar whenever HD starts, so play never waits on storage (about 8 s for a
+  160 MB pack on the Switch at 1785 MHz). The Switch reads ahead only as an
+  application, with a 1 GB budget; past it, and in applet mode, art loads
+  on first sight as before. `perf.log` counts pack files read during play
+  (`hd_pack_reads`).
+- Switch: `perf.log` also records audio queue underruns, its lowest and
+  highest fill, clipped samples and the emulated frame rate; audio is now
+  queued before the frame is drawn.
+- The interpreter bridge skips its quiescence scan while the APU port
+  handshake is polling, which halved the slow recompiled-CPU frames on the
+  Switch (411 to 208 at 1020 MHz).
+- Switch: the game starts without the launcher, and a new configuration
+  defaults to 16:9 with HD at 2x.
+- Switch: `--bench SECONDS [--hd S] [--aspect A] [--return APP.nro]`
+  replays `bench.input` and writes the per-stage timings (drawing now split
+  into PPU frame and HD scene) to `stdout.log`; the `.nro` and `.nsp` carry
+  an original icon in every HOME menu language.
+- Switch: an experimental deko3d renderer for the bench
+  (`--renderer deko3d`): flat presentation and the HD composition on the
+  console's native graphics API, without the in-game menu yet. `--shot`
+  saves chosen frames to compare it with OpenGL, and `perf.log` adds the
+  slowest recompiled-CPU frame of each window (`run_max_ms`) and the HD
+  scene building by phase (`hd_*_ms`).
+- HD on the GPU (OpenGL and the Switch deko3d renderer) now derives the
+  per-pixel base, occlusion, tile mask and BG1 layer on the GPU from the
+  layer captures; the CPU no longer builds them for the GPU path, which
+  was most of the HD scene time on the Switch (panorama lines with color
+  math above all).
+- Switch: `perf.log` also counts GL draw calls, texture uploads and
+  uploaded kilobytes per frame; after a vsynced swap the loop no longer
+  waits again on the 60.0988 Hz host clock. The HD quad passes look up
+  their uniforms once per pass, and the recompiled bus reads its
+  diagnostic environment switches once.
+- HD pack images load with one read instead of one per pixel: about 9x
+  faster on the Mac, and the main HD slowdown on the Switch, where art loads
+  from the SD card as it first appears.
+- Added an experimental Nintendo Switch homebrew build of the SDL host
+  (`dkc2_snesrecomp_sdl_nro`, built with the devkitPro Docker image). It
+  reads `dkc2.smc` beside the `.nro`; MSU-1 PCM is unavailable there. Not yet
+  run on hardware.
 - Added an experimental HD compositor: Mode 1 frames are re-composed at 2x-8x
   from PPU layer captures with the console's priority rules, with HD sprite
   art, per-block terrain art and full-screen art (title) loaded from a local

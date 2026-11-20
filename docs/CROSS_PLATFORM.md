@@ -94,6 +94,106 @@ and macOS acceptance must deliberately exercise this recovery path as well as
 normal clean-exit reporting. Reports exclude ROM paths/data and all saves, but
 include loaded-module paths and basic machine/OS information.
 
+## Nintendo Switch homebrew build (experimental)
+
+The SDL host also builds as a homebrew `.nro` for a console running
+Atmosphere, with devkitPro's libnx, `switch-sdl2` and Mesa. The official
+`devkitpro/devkita64` image has every dependency, so no host install is
+needed:
+
+```sh
+docker run --rm -v "$PWD":/src -w /src devkitpro/devkita64 bash -lc '
+  cmake -S . -B build/switch -G Ninja \
+    -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/cmake/Switch.cmake \
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+    -DDKC2_BUILD_SNESRECOMP=ON -DSNESRECOMP_SDL_BACKEND=SDL2 &&
+  cmake --build build/switch --target dkc2_snesrecomp_sdl_nro'
+```
+
+Copy `build/switch/DKC2Recomp.nro` and `build/switch/assets/` to
+`sdmc:/switch/DKC2Recomp/` and put the ROM there as `dkc2.smc`. The host
+always works in that folder, so `rom.cfg`, `launcher.cfg` and `saves/` stay
+there. Launch the `.nro` through a game's title override (hold R while
+starting a game): the album applet leaves too little memory.
+
+An installable title (`.nsp`, program id `01d2c20000000000`) runs from the
+same folder with full application memory. It needs hacBrewPack (the original
+repository is gone; `rlaphoenix/hacBrewPack` mirrors it) and the `prod.keys`
+dumped from your own console with Lockpick_RCM, at `~/.switch/prod.keys`.
+Inside the same image, from a work directory:
+
+```sh
+elf2nso build/switch/DKC2Recomp.elf exefs/main
+npdmtool assets/switch/DKC2Recomp.npdm.json exefs/main.npdm
+cp build/switch/DKC2Recomp.nacp control/control.nacp
+for language in AmericanEnglish BritishEnglish Japanese French German \
+    LatinAmericanSpanish Spanish Italian Dutch CanadianFrench Portuguese \
+    Russian Korean TraditionalChinese SimplifiedChinese BrazilianPortuguese; do
+  cp assets/switch/icon.jpg control/icon_$language.dat
+done
+hacbrewpack -k ~/.switch/prod.keys --titleid 01d2c20000000000 \
+  --titlename DKC2Recomp --titlepublisher Flat2VR --noromfs --nologo \
+  --exefsdir exefs --controldir control --nspdir nsp
+```
+
+The HOME menu shows the icon of the console language, so every language
+gets one; it must be a 256x256 baseline JPEG without EXIF data, or the menu
+shows "?". `assets/switch/icon.jpg` is the Switch icon in that form (original art
+generated for this port; the `.nro` uses it too).
+
+Installing it requires sigpatches and an installer such as DBI. Never commit
+or share the keys or the packed title.
+
+Platform differences:
+
+- the launcher and overlay use OpenGL ES 2 (as recomp-ui does on Android);
+  the presenter keeps its GL 2.1 context, and the fixed-function calls the
+  static Mesa library does not export are resolved from that context
+  (`runner/switch_host.c`);
+- the game starts without the launcher (`--launcher` still opens it); a new
+  configuration defaults to 16:9 and HD at 2x, which the 720p screen (1080p
+  docked) shows in full, and the in-game menu changes either;
+- file dialogs report a cancel, so paths come from the ROM default above and
+  the saved configuration;
+- MSU-1 PCM tracks are unavailable (Horizon cannot map files and the set does
+  not fit in memory); the SPC soundtrack plays;
+- no POSIX crash-signal handler or machine report: Atmosphere records crashes.
+- `perf.log` in the data folder records, every 300 presented frames, the
+  frame rate, the mean milliseconds of the recompiled CPU, drawing (split
+  into the PPU frame and the HD scene), audio and presentation, the GL
+  draw calls, texture uploads and uploaded kilobytes per frame, the HD
+  scene building split into its phases (sprite preparation, the per-pixel
+  base and masks, BG1 art, tile quads, sprite quads, and the pack reads
+  inside them), the GL
+  renderer and the HD composition path; after a vsynced swap the loop does
+  not wait again on the host clock; `stdout.log` and `stderr.log` beside
+  it keep the console streams.
+
+Benchmark: `--bench SECONDS [--hd 0|2-8] [--aspect 4:3|16:10|16:9|21:9]
+[--renderer gl|deko3d] [--shot F1,F2,...] [--return APP.nro]` starts
+without the launcher, replays the route recorded in `bench.input` in the
+data folder, writes the `perf.log` lines to `stdout.log` too, ends it with
+`bench: done result=N` and quits. `--hd` and `--aspect` apply to that run
+only (`--hd 0` turns HD off); saves and options are not written.
+`--renderer deko3d` draws with deko3d instead of OpenGL (falling back to
+OpenGL when it cannot start). `--shot` writes the presented image of each
+listed frame to `shot-<renderer>-<frame>.ppm`, to compare the renderers.
+`--return` asks the homebrew loader to start that `.nro` next instead of
+the menu.
+
+The deko3d renderer (`runner/switch_present_deko3d.c`, shaders in
+`runner/switch_shaders/` compiled with `uam` and embedded) owns the
+console's default window, so no SDL window or OpenGL context exists beside
+it and the in-game menu is not drawn yet: it is for the bench until that
+lands. It presents flat (nearest or bilinear) at 1920x1080 docked or
+1280x720 handheld, chosen at start, and composes HD scenes with the
+OpenGL presenter's three passes (one draw per quad, uniforms pushed in the
+command buffer, pack images uploaded once into pooled GPU memory).
+
+The build boots on hardware (firmware 23.0.1) and holds 60 fps without HD
+(about 2 ms recompiled CPU and 3.6 ms drawing per frame at 1785 MHz). HD at
+2x/4x drops to 43-59 fps: drawing grows to 9-13 ms.
+
 ## Native acceptance required
 
 Before checking off either operating system, run these checks on that system:

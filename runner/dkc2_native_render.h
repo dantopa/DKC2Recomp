@@ -115,6 +115,10 @@ typedef struct Dkc2NativeSpriteFrame {
 bool Dkc2NativeDecodeSpriteFrame(const Ppu *ppu,
                                  const Dkc2NativeSprite *sprite,
                                  Dkc2NativeSpriteFrame *frame);
+/* The same frame at full screen brightness, whatever the screen's. */
+bool Dkc2NativeDecodeSpriteFrameUnlit(const Ppu *ppu,
+                                      const Dkc2NativeSprite *sprite,
+                                      Dkc2NativeSpriteFrame *frame);
 
 /* Screen position of an unflipped frame pixel (frame_x, frame_y), honoring
  * the sprite's flips. */

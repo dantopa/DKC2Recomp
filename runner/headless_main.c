@@ -591,6 +591,58 @@ static int ArmTracePath(const char *text) {
   return 1;
 }
 
+/* DKC2_BOT_SERVER: one process serves a search bot's trials over stdin, so
+ * no trial pays for starting the emulator. One command per line, each
+ * answered with one line ("ok", "err", or the peeked words in hex):
+ *   load <state>                  restore a savestate
+ *   play <mask>*<count> ...       run frames with those inputs, no video
+ *   save <state>                  write a savestate
+ *   peek <address> ...            16-bit WRAM words, addresses in hex */
+static int RunBotServer(void) {
+  static char line[65536];
+  while (fgets(line, sizeof line, stdin)) {
+    char *argument = strchr(line, ' ');
+    if (argument) *argument++ = '\0';
+    else argument = line + strlen(line);
+    argument[strcspn(argument, "\r\n")] = '\0';
+    line[strcspn(line, "\r\n")] = '\0';
+    if (strcmp(line, "load") == 0) {
+      puts(RtlLoadSnapshot(argument) ? "ok" : "err");
+    } else if (strcmp(line, "save") == 0) {
+      puts(RtlSaveSnapshot(argument) ? "ok" : "err");
+    } else if (strcmp(line, "play") == 0) {
+      bool valid = true;
+      for (char *cursor = argument; *cursor && valid;) {
+        char *end = NULL;
+        const unsigned long mask = strtoul(cursor, &end, 16);
+        valid = end != cursor && *end == '*';
+        if (!valid) break;
+        cursor = end + 1;
+        const long count = strtol(cursor, &end, 10);
+        valid = end != cursor && count > 0;
+        for (long i = 0; valid && i < count; i++) RtlRunFrame((uint32_t)mask);
+        cursor = end;
+        while (*cursor == ' ') cursor++;
+      }
+      puts(valid ? "ok" : "err");
+    } else if (strcmp(line, "peek") == 0) {
+      for (char *cursor = argument; *cursor;) {
+        char *end = NULL;
+        const unsigned long address = strtoul(cursor, &end, 16);
+        if (end == cursor || address + 1 >= 0x20000) break;
+        printf("%04x ", ReadWram16(address));
+        cursor = end;
+        while (*cursor == ' ') cursor++;
+      }
+      putchar('\n');
+    } else {
+      puts("err");
+    }
+    fflush(stdout);
+  }
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc < 2 || argc > 3) {
     fprintf(stderr, "usage: dkc2_snesrecomp_headless <rom.sfc> [frames]\n");
@@ -686,6 +738,11 @@ int main(int argc, char **argv) {
     fprintf(stderr, "unable to load exact savestate: %s\n", savestate_input);
     free(rom);
     return 14;
+  }
+  if (getenv("DKC2_BOT_SERVER")) {
+    const int status = RunBotServer();
+    free(rom);
+    return status;
   }
 
 #if SNESRECOMP_TRACE
@@ -1071,7 +1128,7 @@ int main(int argc, char **argv) {
     }
     if (native_diff)
       NativeDiffBeginFrame(native_diff);
-    Dkc2HdBeginFrame(hd, g_ppu, Dkc2VideoWidth());
+    Dkc2HdBeginFrame(hd, g_ppu, Dkc2VideoWidth(), Dkc2GetFrameLines());
     Dkc2DrawPpuFrame();
     if (native_diff)
       NativeDiffEndFrame(native_diff, frame, rom, rom_size);

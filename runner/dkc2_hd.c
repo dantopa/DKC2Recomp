@@ -23,8 +23,13 @@ enum {
   /* Graphic ids are 4-byte directory offsets below $35A0. */
   kGraphicSlots = 0x35a0 / 4,
   kPalettes = 8,
-  kCacheSlots = 1024,
+  /* Filtered sprite frames stay cached for the whole session: the cache is
+   * flushed only when it passes kCacheFlush entries or kCacheBudget bytes,
+   * which play does not reach. */
+  kCacheSlots = 16384,
   kCacheFlush = kCacheSlots * 3 / 4,
+  /* Sprite frames one filter batch carries. */
+  kFilterBatchMax = 64,
   /* Smooth upscale taps reach two source pixels past either edge. */
   kTapReach = 2,
   kPathMax = 1024,
@@ -50,6 +55,9 @@ enum {
   kLearnedWindows = 1 << 16,
   kLearnedOutputs = 5,
   kLearnedRow = kLearnedScale * kLearnedScale * kLearnedOutputs,
+  kLearnedSubpixels = kLearnedScale * kLearnedScale,
+  /* Softmax weights remembered by window, a power of two. */
+  kLearnedMemoSlots = 1024,
   kLearnedHeader = 8,
   /* Sprite quads: every sprite-table record and every OAM entry as its own
    * loose group. */
@@ -98,6 +106,9 @@ typedef enum PackState {
 typedef struct CacheEntry {
   uint64_t key;
   HdImage *image;
+  /* The image is the unfiltered frame standing in until a filter batch
+   * brings the filtered one; queued once its frame is in a batch. */
+  bool stand_in, queued;
 } CacheEntry;
 
 /* Pack art and dump state of one terrain block or sprite frame. */
@@ -106,7 +117,17 @@ typedef struct PackEntry {
   HdImage *image;
   uint8_t state;  /* PackState */
   bool dumped;
+  /* Sprite art without its own file: the palette slot whose slot-keyed
+   * art stands in (aliases.txt, else the record's own slot). */
+  uint8_t fallback;
 } PackEntry;
+
+/* An aliases.txt line: sprite art key (see SpriteArtKey) drawn with the
+ * slot-keyed art of palette slot "palette". */
+typedef struct SpriteAlias {
+  uint64_t key;
+  uint8_t palette;
+} SpriteAlias;
 
 typedef struct ScreenEntry {
   uint64_t key;
@@ -179,20 +200,78 @@ typedef struct SpriteState {
   int left, top, width, height;
 } SpriteState;
 
+typedef struct PackFile {
+  uint64_t hash; /* of the name */
+  /* Art a pack reader read ahead (Dkc2HdAdoptPack), until a table takes
+   * it; play then never waits on storage for it. */
+  HdImage *image;
+  bool asked; /* a table asked for it, so it is not adopted afterwards */
+} PackFile;
+
+/* A play art file read ahead; names longer than the loaders' are never
+ * asked for. */
+typedef struct PackRead {
+  char name[32];
+  HdImage *image;
+} PackRead;
+
+struct Dkc2HdPackReader {
+  char pack_dir[kPathMax];
+  PackRead *files;
+  size_t count, capacity;
+  size_t next;   /* the file the next step reads */
+  size_t budget; /* bytes of pixels left to read */
+};
+
+/* The softmax weights of every subpixel of a learned-filter cell, which
+ * depend only on its four pattern windows: sprites repeat windows across
+ * flat areas and between frames, and the exponentials dominate the
+ * filter's cost. */
+typedef struct LearnedWeights {
+  uint64_t windows; /* the four 16-bit window indices, when set */
+  bool set;
+  /* Each pixel's share, weight / total; the fifth output is transparent
+   * and only takes weight away. */
+  float share[kLearnedSubpixels][4];
+} LearnedWeights;
+
+/* The bytes of filtered sprite frames the cache may hold. */
+static const size_t kCacheBudget = (size_t)768 << 20;
+
+/* Sprite frames filtered on another thread (see Dkc2HdTakeFilterBatch). */
+typedef struct FilterJob {
+  uint64_t key;
+  Dkc2NativeSpriteFrame frame;
+  HdImage *image; /* the result, without an id */
+} FilterJob;
+
+struct Dkc2HdFilterBatch {
+  const int8_t *learned; /* the learned table, or NULL */
+  LearnedWeights *memo;  /* the learned memo, the batch thread's alone */
+  int filter, scale;
+  bool running; /* taken by the host and not adopted yet */
+  unsigned count;
+  FilterJob jobs[kFilterBatchMax];
+};
+
 struct Dkc2Hd {
   int scale;
   Dkc2HdFilter filter;
   Dkc2HdFilter background;
   int8_t *learned;  /* the learned filter's table, when that filter is on */
+  LearnedWeights *learned_memo; /* kLearnedMemoSlots, with learned */
+  Dkc2HdFilterBatch *batch; /* NULL: sprite frames are filtered in place */
   /* Smooth background: first source tap and four Catmull-Rom weights for
    * each output phase of a source pixel. */
   int tap_offset[kDkc2HdMaxScale];
   float tap_weight[kDkc2HdMaxScale][4];
   char pack_dir[kPathMax];
-  /* Name hash of every file in the pack directory, sorted: art is opened
+  /* Every file in the pack directory, sorted by name hash: art is opened
    * only when listed, so keys without art never reach the file system. */
-  uint64_t *pack_files;
+  PackFile *pack_files;
   size_t pack_file_count;
+  SpriteAlias *aliases; /* sorted by key */
+  size_t alias_count;
   char dump_dir[kPathMax];
   const uint8_t *rom;
   size_t rom_size;
@@ -218,6 +297,7 @@ struct Dkc2Hd {
   unsigned sprite_art_count;
   CacheEntry cache[kCacheSlots];
   unsigned cache_count;
+  size_t cache_bytes;
   uint32_t base[kMaxPixels];
   /* BG1 art: when the pack lists terrain blocks or screens, BG1 leaves the
    * rendered frame and is composed here, art where the pack has it and the
@@ -292,7 +372,15 @@ struct Dkc2Hd {
   size_t tile_layout_length;
   bool tile_layout_new;
   uint8_t tile_mask[kMaxPixels];
+  /* An unresolved scene's tables (see Dkc2HdSceneInputs). */
+  uint32_t record_info[kDkc2HdRecordEntries];
+  uint32_t panorama_lines[kHeight];
+  uint32_t math[kDkc2HdMathEntries];
+  Dkc2HdSceneInputs inputs;
+  bool resolve; /* this frame fills the per-pixel maps */
   Dkc2HdScene scene;
+  uint64_t (*clock)(void); /* NULL: scene building is not timed */
+  Dkc2HdTimings timings;
   uint32_t *output;
 };
 
@@ -374,6 +462,51 @@ static bool CopyPath(char *destination, const char *source) {
 
 static HdImage *LoadImage(const char *path);
 static bool ListPack(Dkc2Hd *hd);
+
+static int CompareAlias(const void *a, const void *b) {
+  const uint64_t x = ((const SpriteAlias *)a)->key,
+                 y = ((const SpriteAlias *)b)->key;
+  return (x > y) - (x < y);
+}
+
+/* Reads aliases.txt: "<graphic>_p<palette content> -> <graphic>_<slot>"
+ * per line, so art made for a palette slot follows that palette into any
+ * slot without a copy of the file. */
+static void LoadAliases(Dkc2Hd *hd) {
+  char path[kPathMax + 32];
+  snprintf(path, sizeof path, "%s/aliases.txt", hd->pack_dir);
+  FILE *index = fopen(path, "r");
+  if (!index)
+    return;
+  size_t capacity = 0;
+  unsigned graphic, content, target, palette;
+  int fields;
+  while ((fields = fscanf(index, "%4x_p%8x -> %4x_%1u", &graphic, &content,
+                          &target, &palette)) == 4) {
+    if (graphic != target || palette >= kPalettes || graphic == 0) {
+      fprintf(stderr, "warning: DKC2_HD_PACK alias %04x_p%08x is invalid\n",
+              graphic, content);
+      continue;
+    }
+    if (hd->alias_count == capacity) {
+      const size_t grown = capacity ? capacity * 2 : 512;
+      SpriteAlias *aliases =
+          (SpriteAlias *)realloc(hd->aliases, grown * sizeof *aliases);
+      if (!aliases)
+        break;
+      hd->aliases = aliases;
+      capacity = grown;
+    }
+    hd->aliases[hd->alias_count++] =
+        (SpriteAlias){(uint64_t)content << 16 | graphic, (uint8_t)palette};
+  }
+  if (fields != EOF)
+    fprintf(stderr, "warning: DKC2_HD_PACK aliases.txt stops at line %zu\n",
+            hd->alias_count + 1);
+  fclose(index);
+  if (hd->alias_count)
+    qsort(hd->aliases, hd->alias_count, sizeof *hd->aliases, CompareAlias);
+}
 
 /* Reads screens.txt: one 16-digit hex key per line, each with a native BG1
  * reference "s_<key>.ref" (as the dump writes it) and art "s_<key>.rgba". */
@@ -470,7 +603,13 @@ Dkc2Hd *Dkc2HdCreate(const Dkc2HdConfig *config, const uint8_t *rom,
                             ? kDkc2HdPixelFilterTable
                             : kDkc2HdDefaultFilterTable;
     hd->learned = LoadLearnedTable(table);
-    if (!hd->learned) {
+    hd->learned_memo =
+        hd->learned ? (LearnedWeights *)calloc(kLearnedMemoSlots,
+                                               sizeof *hd->learned_memo)
+                    : NULL;
+    if (!hd->learned_memo) {
+      free(hd->learned);
+      hd->learned = NULL;
       fprintf(stderr,
               "warning: HD sprite filter table %s is missing or invalid; "
               "using the smooth filter\n",
@@ -506,6 +645,7 @@ Dkc2Hd *Dkc2HdCreate(const Dkc2HdConfig *config, const uint8_t *rom,
     hd->layer_pack = index != NULL;
     if (index)
       fclose(index);
+    LoadAliases(hd);
     LoadScreens(hd);
     hd->layer_pack |= hd->screen_count > 0;
     snprintf(path, sizeof path, "%s/backgrounds.txt", hd->pack_dir);
@@ -534,10 +674,10 @@ Dkc2Hd *Dkc2HdCreate(const Dkc2HdConfig *config, const uint8_t *rom,
 static void FlushCache(Dkc2Hd *hd) {
   for (unsigned i = 0; i < kCacheSlots; i++) {
     free(hd->cache[i].image);
-    hd->cache[i].image = NULL;
-    hd->cache[i].key = 0;
+    hd->cache[i] = (CacheEntry){0};
   }
   hd->cache_count = 0;
+  hd->cache_bytes = 0;
 }
 
 void Dkc2HdDestroy(Dkc2Hd *hd) {
@@ -561,18 +701,47 @@ void Dkc2HdDestroy(Dkc2Hd *hd) {
     free(hd->panoramas[i].art);
   free(hd->layer);
   free(hd->rows);
+  for (size_t i = 0; i < hd->pack_file_count; i++)
+    free(hd->pack_files[i].image);
   free(hd->pack_files);
+  free(hd->aliases);
   free(hd->learned);
+  free(hd->learned_memo);
+  free(hd->batch);
   free(hd->output);
   free(hd);
 }
 
-void Dkc2HdBeginFrame(Dkc2Hd *hd, Ppu *ppu, int frame_width) {
+void Dkc2HdSetClock(Dkc2Hd *hd, uint64_t (*now)(void)) {
+  if (hd) hd->clock = now;
+}
+
+size_t Dkc2HdCacheBytes(const Dkc2Hd *hd) {
+  return hd ? hd->cache_bytes : 0;
+}
+
+void Dkc2HdTakeTimings(Dkc2Hd *hd, Dkc2HdTimings *timings) {
+  if (!hd) {
+    memset(timings, 0, sizeof *timings);
+    return;
+  }
+  *timings = hd->timings;
+  memset(&hd->timings, 0, sizeof hd->timings);
+}
+
+void Dkc2HdBeginFrame(Dkc2Hd *hd, Ppu *ppu, int frame_width,
+                      const Dkc2HdmaLines *previous_lines) {
   if (!hd || !ppu)
     return;
+  /* The mode the picture starts in. HDMA can change it before the first
+   * line: "Nintendo Presents" ends every frame in mode 5 yet shows mode 1
+   * above its last band, so the previous frame's first line decides. */
+  const unsigned top_mode = previous_lines
+                                ? previous_lines->line[1].bgmode & 7u
+                                : ppu->bgmode & 7u;
   static const PpuOverlaySource kBgSources[kBgLayers] = {
       kPpuOverlaySource_Bg1, kPpuOverlaySource_Bg2, kPpuOverlaySource_Bg3};
-  hd->active = (ppu->bgmode & 7) == 1 && frame_width >= kNativeWidth &&
+  hd->active = top_mode == 1 && frame_width >= kNativeWidth &&
                frame_width <= kMaxWidth &&
                (frame_width - kNativeWidth) % 2 == 0;
   hd->width = frame_width;
@@ -610,19 +779,33 @@ void Dkc2HdBeginFrame(Dkc2Hd *hd, Ppu *ppu, int frame_width) {
   PpuSetOverlayOamRange(ppu, 0, 128);
 }
 
-static HdImage *NewImage(int width, int height) {
+static uint64_t NextImageId(void) {
   static uint64_t last_id;
+  return ++last_id;
+}
+
+/* An image without an id: a pack reader's thread leaves it to the main
+ * thread, which owns the id sequence. */
+static HdImage *AllocImage(int width, int height) {
   HdImage *image = (HdImage *)malloc(
       sizeof(HdImage) + sizeof(uint32_t) * (size_t)width * (size_t)height);
   if (image) {
-    image->id = ++last_id;
+    image->id = 0;
     image->width = width;
     image->height = height;
   }
   return image;
 }
 
-static HdImage *LoadImage(const char *path) {
+static HdImage *NewImage(int width, int height) {
+  HdImage *image = AllocImage(width, height);
+  if (image)
+    image->id = NextImageId();
+  return image;
+}
+
+/* Reads a DKHD file into an image without an id. */
+static HdImage *ReadImage(const char *path) {
   FILE *file = fopen(path, "rb");
   if (!file)
     return NULL;
@@ -633,19 +816,30 @@ static HdImage *LoadImage(const char *path) {
     const int width = header[4] | header[5] << 8;
     const int height = header[6] | header[7] << 8;
     if (width > 0 && height > 0)
-      image = NewImage(width, height);
-    for (int i = 0; image && i < width * height; i++) {
-      uint8_t rgba[4];
-      if (fread(rgba, 1, sizeof rgba, file) != sizeof rgba) {
-        free(image);
-        image = NULL;
-        break;
-      }
+      image = AllocImage(width, height);
+    /* One read for the whole image, converted in place: art loads on first
+     * sight during play, and per-pixel reads cost several times more (most
+     * on the console's SD card). */
+    const size_t count = (size_t)width * (size_t)height;
+    if (image &&
+        fread(image->pixels, sizeof *image->pixels, count, file) != count) {
+      free(image);
+      image = NULL;
+    }
+    for (size_t i = 0; image && i < count; i++) {
+      const uint8_t *rgba = (const uint8_t *)&image->pixels[i];
       image->pixels[i] = (uint32_t)rgba[3] << 24 | (uint32_t)rgba[0] << 16 |
                          (uint32_t)rgba[1] << 8 | rgba[2];
     }
   }
   fclose(file);
+  return image;
+}
+
+static HdImage *LoadImage(const char *path) {
+  HdImage *image = ReadImage(path);
+  if (image)
+    image->id = NextImageId();
   return image;
 }
 
@@ -656,66 +850,215 @@ static uint64_t NameHash(const char *name) {
   return hash;
 }
 
-static int CompareHash(const void *a, const void *b) {
-  const uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+static int ComparePackFile(const void *a, const void *b) {
+  const uint64_t x = ((const PackFile *)a)->hash,
+                 y = ((const PackFile *)b)->hash;
   return (x > y) - (x < y);
 }
 
-static bool AddPackFile(Dkc2Hd *hd, size_t *capacity, const char *name) {
+/* Art that play loads by name: screens and panoramas are read at creation
+ * anyway. */
+static bool PlayArt(const char *name) {
+  const size_t length = strlen(name);
+  return length > 5 && strcmp(name + length - 5, ".rgba") == 0 &&
+         strncmp(name, "s_", 2) != 0 && strncmp(name, "l_", 2) != 0;
+}
+
+typedef struct PackList {
+  Dkc2Hd *hd;
+  size_t capacity;
+} PackList;
+
+static bool AddPackFile(void *context, const char *name) {
+  PackList *list = (PackList *)context;
+  Dkc2Hd *hd = list->hd;
+  size_t *capacity = &list->capacity;
   if (hd->pack_file_count == *capacity) {
     const size_t grown = *capacity ? *capacity * 2 : 1024;
-    uint64_t *files =
-        (uint64_t *)realloc(hd->pack_files, grown * sizeof *files);
+    PackFile *files =
+        (PackFile *)realloc(hd->pack_files, grown * sizeof *files);
     if (!files)
       return false;
     hd->pack_files = files;
     *capacity = grown;
   }
-  hd->pack_files[hd->pack_file_count++] = NameHash(name);
+  PackFile *file = &hd->pack_files[hd->pack_file_count++];
+  file->hash = NameHash(name);
+  file->image = NULL;
+  file->asked = false;
   return true;
+}
+
+/* Calls add with each name in directory; a missing directory has none.
+ * False once add fails (out of memory). */
+static bool ListDirectory(const char *directory_path,
+                          bool (*add)(void *context, const char *name),
+                          void *context) {
+  bool ok = true;
+#ifdef _WIN32
+  char pattern[kPathMax + 4];
+  snprintf(pattern, sizeof pattern, "%s/*", directory_path);
+  struct _finddata_t entry;
+  const intptr_t find = _findfirst(pattern, &entry);
+  if (find != -1) {
+    do
+      ok = add(context, entry.name);
+    while (ok && _findnext(find, &entry) == 0);
+    _findclose(find);
+  }
+#else
+  DIR *directory = opendir(directory_path);
+  if (directory) {
+    const struct dirent *entry;
+    while (ok && (entry = readdir(directory)) != NULL)
+      ok = add(context, entry->d_name);
+    closedir(directory);
+  }
+#endif
+  return ok;
 }
 
 /* Lists the pack directory once. A missing directory lists nothing, which
  * loads no art, as opening each file would. False when out of memory. */
 static bool ListPack(Dkc2Hd *hd) {
-  size_t capacity = 0;
-  bool ok = true;
-#ifdef _WIN32
-  char pattern[kPathMax + 4];
-  snprintf(pattern, sizeof pattern, "%s/*", hd->pack_dir);
-  struct _finddata_t entry;
-  const intptr_t find = _findfirst(pattern, &entry);
-  if (find != -1) {
-    do
-      ok = AddPackFile(hd, &capacity, entry.name);
-    while (ok && _findnext(find, &entry) == 0);
-    _findclose(find);
-  }
-#else
-  DIR *directory = opendir(hd->pack_dir);
-  if (directory) {
-    const struct dirent *entry;
-    while (ok && (entry = readdir(directory)) != NULL)
-      ok = AddPackFile(hd, &capacity, entry->d_name);
-    closedir(directory);
-  }
-#endif
+  PackList list = {hd, 0};
+  const bool ok = ListDirectory(hd->pack_dir, AddPackFile, &list);
   if (hd->pack_file_count)
     qsort(hd->pack_files, hd->pack_file_count, sizeof *hd->pack_files,
-          CompareHash);
+          ComparePackFile);
   return ok;
 }
 
-/* Pack file `name`, read only when the pack listing has it. */
-static HdImage *LoadPackImage(const Dkc2Hd *hd, const char *name) {
-  const uint64_t hash = NameHash(name);
-  if (!hd->pack_file_count ||
-      !bsearch(&hash, hd->pack_files, hd->pack_file_count,
-               sizeof *hd->pack_files, CompareHash))
+static bool AddPackRead(void *context, const char *name) {
+  Dkc2HdPackReader *reader = (Dkc2HdPackReader *)context;
+  if (!PlayArt(name) || strlen(name) >= sizeof reader->files->name)
+    return true;
+  if (reader->count == reader->capacity) {
+    const size_t grown = reader->capacity ? reader->capacity * 2 : 1024;
+    PackRead *files =
+        (PackRead *)realloc(reader->files, grown * sizeof *files);
+    if (!files)
+      return false;
+    reader->files = files;
+    reader->capacity = grown;
+  }
+  PackRead *file = &reader->files[reader->count++];
+  memcpy(file->name, name, strlen(name) + 1);
+  file->image = NULL;
+  return true;
+}
+
+Dkc2HdPackReader *Dkc2HdPackReaderCreate(const char *pack_dir,
+                                         size_t budget) {
+  if (!pack_dir || !*pack_dir || !budget)
     return NULL;
+  Dkc2HdPackReader *reader =
+      (Dkc2HdPackReader *)calloc(1, sizeof *reader);
+  if (!reader)
+    return NULL;
+  if (!CopyPath(reader->pack_dir, pack_dir) ||
+      !ListDirectory(reader->pack_dir, AddPackRead, reader)) {
+    Dkc2HdPackReaderDestroy(reader);
+    return NULL;
+  }
+  reader->budget = budget;
+  return reader;
+}
+
+bool Dkc2HdPackReaderStep(Dkc2HdPackReader *reader) {
+  if (reader->next >= reader->count || !reader->budget)
+    return false;
+  PackRead *file = &reader->files[reader->next++];
+  char path[kPathMax + 32];
+  snprintf(path, sizeof path, "%s/%s", reader->pack_dir, file->name);
+  HdImage *image = ReadImage(path);
+  const size_t bytes =
+      image ? sizeof(uint32_t) * (size_t)image->width * (size_t)image->height
+            : 0;
+  if (bytes > reader->budget) {
+    /* Past the budget the rest loads on first sight. */
+    free(image);
+    reader->budget = 0;
+    return false;
+  }
+  reader->budget -= bytes;
+  file->image = image;
+  return true;
+}
+
+unsigned Dkc2HdPackReaderProgress(const Dkc2HdPackReader *reader) {
+  return reader->count && reader->budget
+             ? (unsigned)(reader->next * 1000u / reader->count)
+             : 1000u;
+}
+
+void Dkc2HdAdoptPack(Dkc2Hd *hd, Dkc2HdPackReader *reader) {
+  const bool same_pack = hd && strcmp(hd->pack_dir, reader->pack_dir) == 0;
+  for (size_t i = 0; i < reader->count; i++) {
+    PackRead *read = &reader->files[i];
+    if (!read->image)
+      continue;
+    const PackFile key = {NameHash(read->name), NULL, false};
+    PackFile *file =
+        same_pack && hd->pack_file_count
+            ? (PackFile *)bsearch(&key, hd->pack_files, hd->pack_file_count,
+                                  sizeof *hd->pack_files, ComparePackFile)
+            : NULL;
+    /* Art play already loaded keeps its first copy. */
+    if (file && !file->asked && !file->image) {
+      file->image = read->image;
+      file->image->id = NextImageId();
+    } else {
+      free(read->image);
+    }
+    read->image = NULL;
+  }
+}
+
+void Dkc2HdPackReaderDestroy(Dkc2HdPackReader *reader) {
+  if (!reader)
+    return;
+  for (size_t i = 0; i < reader->count; i++)
+    free(reader->files[i].image);
+  free(reader->files);
+  free(reader);
+}
+
+static uint64_t Now(const Dkc2Hd *hd) {
+  return hd->clock ? hd->clock() : 0;
+}
+
+/* Adds the time since start to *phase and returns the time now. */
+static uint64_t Lap(const Dkc2Hd *hd, uint64_t *phase, uint64_t start) {
+  const uint64_t now = Now(hd);
+  *phase += now - start;
+  return now;
+}
+
+/* Pack file `name`, handed over from a pack reader, else read when the pack
+ * listing has it. The caller keeps it: each name is asked for once. */
+static HdImage *LoadPackImage(Dkc2Hd *hd, const char *name) {
+  const PackFile key = {NameHash(name), NULL, false};
+  PackFile *file =
+      hd->pack_file_count
+          ? (PackFile *)bsearch(&key, hd->pack_files, hd->pack_file_count,
+                                sizeof *hd->pack_files, ComparePackFile)
+          : NULL;
+  if (!file)
+    return NULL;
+  file->asked = true;
+  HdImage *image = file->image;
+  if (image) {
+    file->image = NULL;
+    return image;
+  }
   char path[kPathMax + 32];
   snprintf(path, sizeof path, "%s/%s", hd->pack_dir, name);
-  return LoadImage(path);
+  const uint64_t start = Now(hd);
+  image = LoadImage(path);
+  (void)Lap(hd, &hd->timings.load, start);
+  hd->timings.reads++;
+  return image;
 }
 
 static bool WriteFrameImage(const char *path,
@@ -780,12 +1123,14 @@ static uint64_t SpriteArtKey(const Ppu *ppu, const SpriteState *state) {
 }
 
 /* Pack art for a sprite record: "<graphic>_p<palette content>.rgba", else
- * "<graphic>_<palette slot>.rgba". */
+ * "<graphic>_<palette slot>.rgba" of the slot aliases.txt names for that
+ * content, else of the record's own slot. */
 static const HdImage *PackImage(Dkc2Hd *hd, const Ppu *ppu,
                                 const SpriteState *state) {
   if (!hd->pack_dir[0])
     return NULL;
   const uint64_t key = SpriteArtKey(ppu, state);
+  unsigned palette = (state->sprite.properties >> 9) & 7u;
   PackEntry *entry =
       PackFind(hd->sprite_art, kSpriteArtSlots, &hd->sprite_art_count, key);
   if (entry && entry->state == kPackUnknown) {
@@ -794,11 +1139,20 @@ static const HdImage *PackImage(Dkc2Hd *hd, const Ppu *ppu,
              (unsigned)(key >> 16));
     entry->image = LoadPackImage(hd, name);
     entry->state = entry->image ? kPackLoaded : kPackMissing;
+    const SpriteAlias wanted = {key, 0};
+    const SpriteAlias *alias =
+        hd->alias_count
+            ? (const SpriteAlias *)bsearch(&wanted, hd->aliases,
+                                           hd->alias_count, sizeof *hd->aliases,
+                                           CompareAlias)
+            : NULL;
+    entry->fallback = alias ? alias->palette : (uint8_t)palette;
   }
   if (entry && entry->image)
     return entry->image;
+  if (entry)
+    palette = entry->fallback;
   const unsigned slot = state->sprite.graphic_id / 4u;
-  const unsigned palette = (state->sprite.properties >> 9) & 7u;
   if (hd->pack_state[slot][palette] == kPackUnknown) {
     char name[32];
     snprintf(name, sizeof name, "%04x_%x.rgba", slot * 4u, palette);
@@ -860,7 +1214,7 @@ static HdImage *SmoothImage(const Dkc2NativeSpriteFrame *frame, int scale) {
 
 /* The decoded frame itself, opaque where it has color. */
 static HdImage *FrameImage(const Dkc2NativeSpriteFrame *frame) {
-  HdImage *image = NewImage(frame->width, frame->height);
+  HdImage *image = AllocImage(frame->width, frame->height);
   if (!image)
     return NULL;
   for (int i = 0; i < frame->width * frame->height; i++)
@@ -869,10 +1223,46 @@ static HdImage *FrameImage(const Dkc2NativeSpriteFrame *frame) {
   return image;
 }
 
+/* The weights of the cell with these window indices, from memo or
+ * computed into it. */
+static const LearnedWeights *LearnedCellWeights(const int8_t *table,
+                                                LearnedWeights *memo,
+                                                const unsigned index[]) {
+  uint64_t windows = 0;
+  for (int t = 0; t < kLearnedPatterns; t++)
+    windows = windows << 16 | index[t];
+  LearnedWeights *entry =
+      &memo[(windows * 0x9e3779b97f4a7c15ull) >> 54 & (kLearnedMemoSlots - 1)];
+  if (entry->set && entry->windows == windows)
+    return entry;
+  const int8_t *rows[kLearnedPatterns];
+  for (int t = 0; t < kLearnedPatterns; t++)
+    rows[t] = table + ((size_t)t * kLearnedWindows + index[t]) * kLearnedRow;
+  for (int sub = 0; sub < kLearnedSubpixels; sub++) {
+    float logit[kLearnedOutputs], top = -1e30f;
+    for (int k = 0; k < kLearnedOutputs; k++) {
+      int sum = 0;
+      for (int t = 0; t < kLearnedPatterns; t++)
+        sum += rows[t][sub * kLearnedOutputs + k];
+      logit[k] = (float)sum / kLearnedLogitScale;
+      top = logit[k] > top ? logit[k] : top;
+    }
+    float weight[kLearnedOutputs], total = 0;
+    for (int k = 0; k < kLearnedOutputs; k++)
+      total += weight[k] = expf(logit[k] - top);
+    for (int n = 0; n < 4; n++)
+      entry->share[sub][n] = weight[n] / total;
+  }
+  entry->windows = windows;
+  entry->set = true;
+  return entry;
+}
+
 /* The learned filter (see dkc2_hd.h) at its table's scale, premultiplied
  * inside, straight alpha out. NULL when the frame has more than 15 colors
- * (it then takes the smooth filter). */
-static HdImage *LearnedImage(const int8_t *table,
+ * (it then takes the smooth filter). memo holds kLearnedMemoSlots entries
+ * kept between calls with the same table. */
+static HdImage *LearnedImage(const int8_t *table, LearnedWeights *memo,
                              const Dkc2NativeSpriteFrame *frame) {
   const int width = frame->width, height = frame->height;
   const int pixel_count = width * height;
@@ -924,19 +1314,24 @@ static HdImage *LearnedImage(const int8_t *table,
    * subpixels sit half a pixel down and right of its top-left pixel. */
   for (int cell_y = -1; cell_y < height; cell_y++) {
     for (int cell_x = -1; cell_x < width; cell_x++) {
-      const int8_t *rows[kLearnedPatterns];
+      unsigned index[kLearnedPatterns];
+      unsigned any = 0;
       for (int t = 0; t < kLearnedPatterns; t++) {
-        unsigned index = 0;
+        index[t] = 0;
         for (int n = 0; n < 4; n++) {
           const int y = cell_y + kLearnedPattern[t][n][0];
           const int x = cell_x + kLearnedPattern[t][n][1];
           const unsigned rank = y >= 0 && y < height && x >= 0 && x < width
                                     ? ranks[y * width + x]
                                     : 0u;
-          index = index << 4 | rank;
+          index[t] = index[t] << 4 | rank;
         }
-        rows[t] = table + ((size_t)t * kLearnedWindows + index) * kLearnedRow;
+        any |= index[t];
       }
+      /* With every pixel around it transparent the cell's subpixels are
+       * transparent too. */
+      const LearnedWeights *weights =
+          any ? LearnedCellWeights(table, memo, index) : NULL;
       float cell[4][4];  /* premultiplied RGBA of the cell's pixels */
       for (int n = 0; n < 4; n++) {
         const int y = cell_y + kLearnedPattern[0][n][0];
@@ -955,29 +1350,20 @@ static HdImage *LearnedImage(const int8_t *table,
         if (out_y < 0 || out_y >= height * scale || out_x < 0 ||
             out_x >= width * scale)
           continue;
-        float logit[kLearnedOutputs], top = -1e30f;
-        for (int k = 0; k < kLearnedOutputs; k++) {
-          int sum = 0;
-          for (int t = 0; t < kLearnedPatterns; t++)
-            sum += rows[t][sub * kLearnedOutputs + k];
-          logit[k] = (float)sum / kLearnedLogitScale;
-          top = logit[k] > top ? logit[k] : top;
-        }
-        float weight[kLearnedOutputs], total = 0;
-        for (int k = 0; k < kLearnedOutputs; k++)
-          total += weight[k] = expf(logit[k] - top);
-        /* The fifth output is transparent: it only takes weight away. */
-        float rgba[4] = {0, 0, 0, 0};
-        for (int n = 0; n < 4; n++)
-          for (int c = 0; c < 4; c++)
-            rgba[c] += weight[n] / total * cell[n][c];
         uint32_t result = 0;
-        if (rgba[3] * 255.0f >= 0.5f) {
-          result = (uint32_t)(rgba[3] * 255.0f + 0.5f) << 24;
-          for (int c = 0; c < 3; c++) {
-            float value = rgba[c] / rgba[3] * 255.0f;
-            value = value < 0 ? 0 : value > 255 ? 255 : value;
-            result |= (uint32_t)(value + 0.5f) << (16 - 8 * c);
+        if (weights) {
+          const float *share = weights->share[sub];
+          float rgba[4] = {0, 0, 0, 0};
+          for (int n = 0; n < 4; n++)
+            for (int c = 0; c < 4; c++)
+              rgba[c] += share[n] * cell[n][c];
+          if (rgba[3] * 255.0f >= 0.5f) {
+            result = (uint32_t)(rgba[3] * 255.0f + 0.5f) << 24;
+            for (int c = 0; c < 3; c++) {
+              float value = rgba[c] / rgba[3] * 255.0f;
+              value = value < 0 ? 0 : value > 255 ? 255 : value;
+              result |= (uint32_t)(value + 0.5f) << (16 - 8 * c);
+            }
           }
         }
         image->pixels[out_y * width * scale + out_x] = result;
@@ -989,7 +1375,7 @@ static HdImage *LearnedImage(const int8_t *table,
 
 static uint64_t PaletteKey(const Ppu *ppu, const SpriteState *state) {
   const unsigned palette = (state->sprite.properties >> 9) & 7u;
-  uint32_t hash = 2166136261u ^ ppu->brightnessMult[31];
+  uint32_t hash = 2166136261u;
   for (unsigned i = 0; i < 16; i++) {
     hash ^= ppu->cgram[0x80u + palette * 16u + i];
     hash *= 16777619u;
@@ -998,30 +1384,244 @@ static uint64_t PaletteKey(const Ppu *ppu, const SpriteState *state) {
          state->sprite.graphic_id;
 }
 
-/* The filtered image of the frame in hd->frame. A full cache is flushed at
- * the start of a frame (the last scene may still use its images), so a
- * probe here always meets a free slot. */
-static const HdImage *FilteredCached(Dkc2Hd *hd, uint64_t key) {
-  unsigned slot = (unsigned)((key ^ key >> 29) * 0x9e3779b97f4a7c15ull >> 54);
-  for (;; slot = (slot + 1) % kCacheSlots) {
-    if (!hd->cache[slot].image)
-      break;
-    if (hd->cache[slot].key == key)
-      return hd->cache[slot].image;
-  }
-  HdImage *image = NULL;
-  if (hd->learned)
-    image = LearnedImage(hd->learned, &hd->frame);
+/* The frame filtered as the configuration asks, without an id. Any thread
+ * may run it with its own memo. */
+static HdImage *FilterFrame(const int8_t *learned, LearnedWeights *memo,
+                            int filter, int scale,
+                            const Dkc2NativeSpriteFrame *frame) {
+  HdImage *image = learned ? LearnedImage(learned, memo, frame) : NULL;
   if (!image)
-    image = hd->filter == kDkc2HdFilterNearest
-                ? FrameImage(&hd->frame)
-                : SmoothImage(&hd->frame, hd->scale);
-  if (image) {
-    hd->cache[slot].key = key;
-    hd->cache[slot].image = image;
-    hd->cache_count++;
-  }
+    image = filter == kDkc2HdFilterNearest ? FrameImage(frame)
+                                           : SmoothImage(frame, scale);
   return image;
+}
+
+static size_t ImageBytes(const HdImage *image) {
+  return sizeof *image + sizeof(uint32_t) * (size_t)image->width *
+                             (size_t)image->height;
+}
+
+/* Adds the frame in hd->frame to the open filter batch, if it has room. */
+static bool QueueFilter(Dkc2Hd *hd, uint64_t key) {
+  Dkc2HdFilterBatch *batch = hd->batch;
+  if (batch->running || batch->count == kFilterBatchMax)
+    return false;
+  FilterJob *job = &batch->jobs[batch->count++];
+  job->key = key;
+  job->frame = hd->frame;
+  job->image = NULL;
+  return true;
+}
+
+/* The cache entry holding key, or the free slot where it would go. A full
+ * cache is flushed at the start of a frame (the last scene may still use
+ * its images), so a probe always meets one or the other. */
+static CacheEntry *CacheSlot(Dkc2Hd *hd, uint64_t key) {
+  unsigned slot = (unsigned)((key ^ key >> 29) * 0x9e3779b97f4a7c15ull >> 32) %
+                  kCacheSlots;
+  while (hd->cache[slot].image && hd->cache[slot].key != key)
+    slot = (slot + 1) % kCacheSlots;
+  return &hd->cache[slot];
+}
+
+/* Fills the free entry with the frame in hd->frame filtered, or with the
+ * frame itself standing in while a filter batch takes it. */
+static const HdImage *CacheFrame(Dkc2Hd *hd, CacheEntry *entry,
+                                 uint64_t key) {
+  const bool stand_in = hd->batch != NULL;
+  HdImage *image = stand_in ? FrameImage(&hd->frame)
+                            : FilterFrame(hd->learned, hd->learned_memo,
+                                          hd->filter, hd->scale, &hd->frame);
+  if (!image)
+    return NULL;
+  image->id = NextImageId();
+  *entry = (CacheEntry){key, image, stand_in,
+                        stand_in && QueueFilter(hd, key)};
+  hd->cache_count++;
+  hd->cache_bytes += ImageBytes(image);
+  if (!stand_in)
+    hd->timings.filtered_inframe++;
+  return image;
+}
+
+/* The filtered image of the frame in hd->frame, by key. */
+static const HdImage *FilteredCached(Dkc2Hd *hd, uint64_t key) {
+  CacheEntry *entry = CacheSlot(hd, key);
+  if (!entry->image)
+    return CacheFrame(hd, entry, key);
+  if (entry->stand_in && !entry->queued)
+    entry->queued = QueueFilter(hd, key);
+  return entry->image;
+}
+
+/* The filtered image of a sprite-table record's frame. The frame is decoded
+ * (unlit: the scene applies the brightness) only when the cache needs it. */
+static const HdImage *SpriteCached(Dkc2Hd *hd, const Ppu *ppu,
+                                   const SpriteState *state) {
+  const uint64_t key = PaletteKey(ppu, state);
+  CacheEntry *entry = CacheSlot(hd, key);
+  if (entry->image && !(entry->stand_in && !entry->queued))
+    return entry->image;
+  if (!Dkc2NativeDecodeSpriteFrameUnlit(ppu, &state->sprite, &hd->frame))
+    return entry->image;
+  if (!entry->image)
+    return CacheFrame(hd, entry, key);
+  entry->queued = QueueFilter(hd, key);
+  return entry->image;
+}
+
+void Dkc2HdSetFilterBatches(Dkc2Hd *hd, bool enabled) {
+  if (!hd || enabled == (hd->batch != NULL))
+    return;
+  if (!enabled) {
+    free(hd->batch);
+    hd->batch = NULL;
+    return;
+  }
+  hd->batch = (Dkc2HdFilterBatch *)calloc(1, sizeof *hd->batch);
+  if (!hd->batch)
+    return;
+  hd->batch->learned = hd->learned;
+  hd->batch->memo = hd->learned_memo;
+  hd->batch->filter = hd->filter;
+  hd->batch->scale = hd->scale;
+}
+
+Dkc2HdFilterBatch *Dkc2HdTakeFilterBatch(Dkc2Hd *hd) {
+  if (!hd || !hd->batch || hd->batch->running || !hd->batch->count)
+    return NULL;
+  hd->batch->running = true;
+  return hd->batch;
+}
+
+void Dkc2HdRunFilterBatch(Dkc2HdFilterBatch *batch) {
+  for (unsigned i = 0; i < batch->count; i++) {
+    FilterJob *job = &batch->jobs[i];
+    job->image = FilterFrame(batch->learned, batch->memo, batch->filter,
+                             batch->scale, &job->frame);
+  }
+}
+
+/* The sprite cache file: a header naming the filter, then records of a key,
+ * a 16-bit width and height and the filtered pixels, appended as batches
+ * run. A file written for another filter or scale is started over. */
+enum { kSpriteCacheHeader = 8 };
+
+static void SpriteCacheHeader(const Dkc2Hd *hd,
+                              uint8_t header[kSpriteCacheHeader]) {
+  memcpy(header, "DKSC", 4);
+  header[4] = 1;
+  header[5] = (uint8_t)hd->filter;
+  header[6] = (uint8_t)hd->scale;
+  header[7] = 0;
+}
+
+FILE *Dkc2HdOpenSpriteCache(const Dkc2Hd *hd, const char *path) {
+  if (!hd || !path)
+    return NULL;
+  uint8_t header[kSpriteCacheHeader], found[kSpriteCacheHeader];
+  SpriteCacheHeader(hd, header);
+  FILE *file = fopen(path, "rb");
+  const bool same = file && fread(found, 1, sizeof found, file) ==
+                                sizeof found &&
+                    memcmp(found, header, sizeof header) == 0;
+  if (file)
+    fclose(file);
+  if (same)
+    return fopen(path, "ab");
+  file = fopen(path, "wb");
+  if (file && fwrite(header, 1, sizeof header, file) != sizeof header) {
+    fclose(file);
+    return NULL;
+  }
+  return file;
+}
+
+void Dkc2HdSaveFilterBatch(const Dkc2HdFilterBatch *batch, FILE *file) {
+  /* Past what a session loads back the file only grows. */
+  const long size = ftell(file);
+  if (size < 0 || (size_t)size >= kCacheBudget / 2)
+    return;
+  for (unsigned i = 0; i < batch->count; i++) {
+    const HdImage *image = batch->jobs[i].image;
+    if (!image)
+      continue;
+    const uint64_t key = batch->jobs[i].key;
+    uint8_t record[12];
+    for (int b = 0; b < 8; b++)
+      record[b] = (uint8_t)(key >> (8 * b));
+    record[8] = (uint8_t)image->width;
+    record[9] = (uint8_t)(image->width >> 8);
+    record[10] = (uint8_t)image->height;
+    record[11] = (uint8_t)(image->height >> 8);
+    const size_t count = (size_t)image->width * (size_t)image->height;
+    if (fwrite(record, 1, sizeof record, file) != sizeof record ||
+        fwrite(image->pixels, sizeof *image->pixels, count, file) != count)
+      return;
+  }
+  (void)fflush(file);
+}
+
+void Dkc2HdLoadSpriteCache(Dkc2Hd *hd, const char *path) {
+  if (!hd || !path)
+    return;
+  FILE *file = fopen(path, "rb");
+  if (!file)
+    return;
+  uint8_t header[kSpriteCacheHeader], found[kSpriteCacheHeader];
+  SpriteCacheHeader(hd, header);
+  bool ok = fread(found, 1, sizeof found, file) == sizeof found &&
+            memcmp(found, header, sizeof header) == 0;
+  uint8_t record[12];
+  /* Half the budget, so play still has room to add frames. */
+  while (ok && hd->cache_bytes < kCacheBudget / 2 &&
+         hd->cache_count < kCacheFlush &&
+         fread(record, 1, sizeof record, file) == sizeof record) {
+    uint64_t key = 0;
+    for (int b = 8; b-- > 0;)
+      key = key << 8 | record[b];
+    const int width = record[8] | record[9] << 8;
+    const int height = record[10] | record[11] << 8;
+    ok = width > 0 && height > 0 &&
+         width <= kDkc2NativeFrameMax * kLearnedScale &&
+         height <= kDkc2NativeFrameMax * kLearnedScale;
+    HdImage *image = ok ? AllocImage(width, height) : NULL;
+    const size_t count = (size_t)width * (size_t)height;
+    ok = image &&
+         fread(image->pixels, sizeof *image->pixels, count, file) == count;
+    CacheEntry *entry = ok ? CacheSlot(hd, key) : NULL;
+    /* A frame saved twice keeps its first copy. */
+    if (!entry || entry->image) {
+      free(image);
+      continue;
+    }
+    image->id = NextImageId();
+    *entry = (CacheEntry){key, image, false, false};
+    hd->cache_count++;
+    hd->cache_bytes += ImageBytes(image);
+  }
+  fclose(file);
+}
+
+void Dkc2HdAdoptFilterBatch(Dkc2Hd *hd, Dkc2HdFilterBatch *batch) {
+  for (unsigned i = 0; i < batch->count; i++) {
+    FilterJob *job = &batch->jobs[i];
+    if (!job->image)
+      continue;
+    CacheEntry *entry = CacheSlot(hd, job->key);
+    /* A flush since the batch was taken dropped the stand-in. */
+    if (!entry->image || !entry->stand_in) {
+      free(job->image);
+      continue;
+    }
+    hd->cache_bytes += ImageBytes(job->image) - ImageBytes(entry->image);
+    free(entry->image);
+    job->image->id = NextImageId();
+    *entry = (CacheEntry){job->key, job->image, false, false};
+    hd->timings.filtered_async++;
+  }
+  batch->count = 0;
+  batch->running = false;
 }
 
 /* The OBJ palette of OAM attributes or record properties. */
@@ -1173,14 +1773,12 @@ static void AddSprite(Dkc2Hd *hd, const Ppu *ppu, unsigned k,
   const SpriteState *state = &hd->sprites[k];
   const HdImage *image = PackImage(hd, ppu, state);
   const bool art = image != NULL;
-  const unsigned brightness = art ? ppu->brightnessMult[31] : 255u;
-  if (!image) {
-    if (!Dkc2NativeDecodeSpriteFrame(ppu, &state->sprite, &hd->frame))
-      return;
-    image = FilteredCached(hd, PaletteKey(ppu, state));
-    if (!image)
-      return;
-  }
+  /* Art and filtered frames are both unlit. */
+  const unsigned brightness = ppu->brightnessMult[31];
+  if (!image)
+    image = SpriteCached(hd, ppu, state);
+  if (!image)
+    return;
   const int scale = hd->scale;
   snprintf(hd->quad_name[hd->quad_count], sizeof hd->quad_name[0],
            "%04x_p%08x", state->sprite.graphic_id,
@@ -1199,6 +1797,19 @@ static void AddSprite(Dkc2Hd *hd, const Ppu *ppu, unsigned k,
   quad->brightness = (uint8_t)brightness;
   quad->rank = state->rank;
   quad->index = (uint8_t)position;
+}
+
+/* Object color at full brightness of palette pixel in an OAM palette. */
+static uint32_t ObjColorUnlit(const Ppu *ppu, const LooseEntry *entry,
+                              uint8_t pixel) {
+  const uint16_t color =
+      ppu->cgram[0x80u + ((entry->oam.attributes >> 9) & 7u) * 16u + pixel];
+  uint32_t result = 0xff000000u;
+  for (int c = 0; c < 3; c++) {
+    const unsigned level = (color >> (5 * c)) & 0x1fu;
+    result |= (uint32_t)(level << 3 | level >> 2) << (16 - 8 * c);
+  }
+  return result;
 }
 
 /* Object color (brightness applied) of palette pixel in an OAM palette. */
@@ -1349,7 +1960,7 @@ static void PrepareLoose(Dkc2Hd *hd, const Ppu *ppu) {
   }
 }
 
-/* Decodes loose group g into hd->frame (brightness applied) and returns its
+/* Decodes loose group g into hd->frame (unlit) and returns its
  * key: its size and raw palette colors, so the same art follows the object
  * through fades and wherever OAM, VRAM or the palette slot put it. */
 static uint64_t DecodeLoose(Dkc2Hd *hd, const Ppu *ppu, unsigned g) {
@@ -1374,7 +1985,7 @@ static uint64_t DecodeLoose(Dkc2Hd *hd, const Ppu *ppu, unsigned g) {
         const size_t i =
             (size_t)(entry->oam.y + y - group->top) * (size_t)frame->width +
             (size_t)(entry->oam.x + x - group->left);
-        frame->pixels[i] = ObjColor(ppu, entry, pixel);
+        frame->pixels[i] = ObjColorUnlit(ppu, entry, pixel);
         hd->loose_raw[i] =
             ppu->cgram[0x80u + palette * 16u + pixel] & 0x7fffu;
       }
@@ -1427,9 +2038,10 @@ static void AddLoose(Dkc2Hd *hd, const Ppu *ppu, unsigned g,
   }
   const HdImage *image = entry ? entry->image : NULL;
   const bool art = image != NULL;
-  const unsigned brightness = art ? ppu->brightnessMult[31] : 255u;
+  /* Art and filtered frames are both unlit. */
+  const unsigned brightness = ppu->brightnessMult[31];
   if (!image)
-    image = FilteredCached(hd, key ^ (uint64_t)ppu->brightnessMult[31] << 48);
+    image = FilteredCached(hd, key);
   if (!image)
     return;
   const int scale = hd->scale;
@@ -2060,6 +2672,13 @@ static void AddPanoramaLines(Dkc2Hd *hd, const Ppu *ppu,
   uint8_t rank = (uint8_t)(layer + 1);
   if (add) {
     rank |= kDkc2HdTileMath;
+    const unsigned shift = (layer - kTileFirstLayer) * 16u;
+    for (int y = first; y < end; y++)
+      hd->panorama_lines[y] =
+          (hd->panorama_lines[y] & ~(0xffffu << shift)) |
+          (uint32_t)add << shift;
+  }
+  if (add && hd->resolve) {
     for (int y = first; y < end; y++) {
       for (int x = 0; x < hd->width; x++) {
         const size_t i = (size_t)y * (size_t)hd->width + (size_t)x;
@@ -2128,6 +2747,7 @@ static void ProcessTiles(Dkc2Hd *hd, const Ppu *ppu,
   hd->tile_count = 0;
   hd->tile_layout_length = 0;
   hd->tile_layout_new = false;
+  memset(hd->panorama_lines, 0, sizeof hd->panorama_lines);
   if (!lines || !hd->tile_pass)
     return;
   for (unsigned layer = kTileFirstLayer; layer < kBgLayers; layer++) {
@@ -2311,17 +2931,59 @@ static void BuildBg1Rank(Dkc2Hd *hd) {
   }
 }
 
+/* An unresolved scene's inputs: the captures as they are, and the tables
+ * the per-pixel loop above reads from the frame state. */
+static void PrepareInputs(Dkc2Hd *hd, const Ppu *ppu, const uint8_t *frame,
+                          int shown_first, int shown_end, bool screen) {
+  for (unsigned owner = 0; owner < kDkc2HdRecordEntries; owner++) {
+    const unsigned k = owner - 1u;
+    hd->record_info[owner] =
+        owner && k < hd->sprite_count
+            ? (hd->sprites[k].replaced ? 1u : 0u) |
+                  (uint32_t)(uint8_t)(hd->record_position[k] + 1u) << 8
+            : 0;
+  }
+  for (unsigned value = 0; value < kDkc2HdMathEntries; value++) {
+    unsigned level = 0;
+    while (level < 31u && ppu->brightnessMult[level] != value)
+      level++;
+    const size_t last = sizeof ppu->brightnessMult - 1u;
+    hd->math[value] = level |
+                      (uint32_t)ppu->brightnessMult[value < last ? value
+                                                                 : last]
+                          << 8;
+  }
+  hd->inputs = (Dkc2HdSceneInputs){
+      .frame = (const uint32_t *)(const void *)frame,
+      .bg = {hd->bg[0], hd->bg[1], hd->bg[2]},
+      .obj = hd->obj,
+      .native = hd->native,
+      .owner = hd->owner,
+      .loose = hd->loose_owner,
+      .records = hd->record_info,
+      .lines = hd->panorama_lines,
+      .math = hd->math,
+      .shown_first = shown_first,
+      .shown_end = shown_end,
+      .screen_first = screen ? hd->origin : 0,
+      .screen_end = screen ? hd->origin + kNativeWidth : 0,
+  };
+}
+
 const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
                                        const uint8_t *ram,
                                        const Dkc2HdmaLines *lines,
                                        const uint8_t *frame,
-                                       size_t frame_pitch) {
+                                       size_t frame_pitch, bool resolve) {
   static uint64_t last_serial;
   if (!hd || !hd->active || !ppu || !ram || !frame ||
       frame_pitch < (size_t)hd->width * 4u)
     return NULL;
+  /* An executor reads the frame as packed rows. */
+  hd->resolve = resolve || frame_pitch != (size_t)hd->width * 4u;
   hd->origin = (hd->width - kNativeWidth) / 2 - ppu->wsPresentationXBias;
-  if (hd->cache_count >= kCacheFlush)
+  uint64_t lap = Now(hd);
+  if (hd->cache_count >= kCacheFlush || hd->cache_bytes >= kCacheBudget)
     FlushCache(hd);
   /* The displayed OAM was built from the previous game update. */
   PrepareOam(hd, ppu);
@@ -2329,6 +2991,7 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
   PrepareLoose(hd, ppu);
   memcpy(hd->previous_wram, ram, sizeof hd->previous_wram);
   hd->has_previous = true;
+  lap = Lap(hd, &hd->timings.prepare, lap);
 
   /* With terrain art BG1 is not in the frame: objects are restored by rank
    * against BG2/BG3 and the HD BG1 layer is drawn by priority afterwards. */
@@ -2338,7 +3001,7 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
   const int extra = (hd->width - kNativeWidth) / 2;
   const int shown_first = extra - ppu->extraLeftCur;
   const int shown_end = extra + kNativeWidth + ppu->extraRightCur;
-  for (int y = 0; y < kHeight; y++) {
+  for (int y = 0; y < kHeight && hd->resolve; y++) {
     for (int x = 0; x < hd->width; x++) {
       const size_t i = (size_t)y * (size_t)hd->width + (size_t)x;
       const uint8_t *bgra = frame + (size_t)y * frame_pitch + (size_t)x * 4u;
@@ -2390,9 +3053,10 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
         hd->layer_source[i] = Opaque(hd->bg[0][i]);
     }
   }
+  lap = Lap(hd, &hd->timings.pixels, lap);
   hd->art_count = 0;
   const ScreenEntry *screen = layered ? MatchScreen(hd) : NULL;
-  if (layered)
+  if (layered && hd->resolve)
     BuildBg1Rank(hd);
   if (screen)
     AddScreenArt(hd, screen, ppu->brightnessMult[31]);
@@ -2400,12 +3064,14 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
     ProcessTerrain(hd, ppu, ram);
   if (hd->dump_dir[0])
     DumpScreen(hd, ppu, ram);
-  if (layered) {
+  if (layered && hd->resolve) {
     for (size_t i = 0; i < (size_t)hd->width * kHeight; i++)
       if (hd->bg1_rank[i] > hd->base_rank[i])
         hd->occlusion[i] |= 0xff000000u;
   }
+  lap = Lap(hd, &hd->timings.art, lap);
   ProcessTiles(hd, ppu, lines);
+  lap = Lap(hd, &hd->timings.tiles, lap);
   hd->quad_count = 0;
   for (unsigned position = 0; position < hd->order_count; position++) {
     const DrawItem item = hd->order[position];
@@ -2416,18 +3082,24 @@ const Dkc2HdScene *Dkc2HdEndFrameScene(Dkc2Hd *hd, const Ppu *ppu,
       AddSprite(hd, ppu, item.item, position);
     }
   }
+  (void)Lap(hd, &hd->timings.sprites, lap);
+  if (!hd->resolve)
+    PrepareInputs(hd, ppu, frame, shown_first, shown_end, screen != NULL);
+  const bool resolved = hd->resolve;
   hd->scene = (Dkc2HdScene){
       .serial = ++last_serial,
       .width = hd->width,
       .height = kHeight,
       .scale = hd->scale,
       .background = hd->background,
-      .base = hd->base,
+      .inputs = resolved ? NULL : &hd->inputs,
+      .layered = layered,
+      .base = resolved ? hd->base : NULL,
       .tiles = hd->tiles,
       .tile_count = hd->tile_count,
-      .tile_mask = hd->tile_mask,
-      .occlusion = hd->occlusion,
-      .layer = layered ? hd->layer_source : NULL,
+      .tile_mask = resolved ? hd->tile_mask : NULL,
+      .occlusion = resolved ? hd->occlusion : NULL,
+      .layer = resolved && layered ? hd->layer_source : NULL,
       .art = hd->art,
       .art_count = hd->art_count,
       .sprites = hd->quads,
@@ -2441,7 +3113,7 @@ const uint32_t *Dkc2HdEndFrame(Dkc2Hd *hd, const Ppu *ppu, const uint8_t *ram,
                                const uint8_t *frame, size_t frame_pitch,
                                int *width, int *height) {
   const Dkc2HdScene *scene =
-      Dkc2HdEndFrameScene(hd, ppu, ram, lines, frame, frame_pitch);
+      Dkc2HdEndFrameScene(hd, ppu, ram, lines, frame, frame_pitch, true);
   if (!scene)
     return NULL;
   Upscale(hd, scene->base, hd->output);

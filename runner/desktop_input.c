@@ -150,6 +150,12 @@ uint32_t Dkc2MapGamepadBindings(
                               axis_threshold))
       input |= UINT32_C(1) << kLogicalPackedBits[logical];
   }
+  /* The left stick steers too, whatever the directions are bound to
+   * (logical up, down, left, right). */
+  if (gamepad->left_y > deadzone) input |= UINT32_C(1) << kLogicalPackedBits[0];
+  if (gamepad->left_y < -deadzone) input |= UINT32_C(1) << kLogicalPackedBits[1];
+  if (gamepad->left_x < -deadzone) input |= UINT32_C(1) << kLogicalPackedBits[2];
+  if (gamepad->left_x > deadzone) input |= UINT32_C(1) << kLogicalPackedBits[3];
   return input;
 }
 
