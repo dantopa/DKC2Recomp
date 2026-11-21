@@ -10,9 +10,12 @@ include(CTest)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
-if(NINTENDO_SWITCH)
-    # newlib hides POSIX declarations (strdup, strtok_r, realpath) under -std=c11.
+if(NINTENDO_SWITCH OR (UNIX AND NOT APPLE))
+    # newlib and glibc hide POSIX declarations (strdup, strtok_r, realpath,
+    # readlink, clock_gettime, popen, gmtime_r) under -std=c11.
     add_compile_definitions(_GNU_SOURCE)
+endif()
+if(NINTENDO_SWITCH)
     # Horizon has no libdl; everything links statically.
     set(CMAKE_DL_LIBS "")
 endif()
