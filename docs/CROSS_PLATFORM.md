@@ -48,20 +48,24 @@ include `build-essential`, `cmake`, `ninja-build`, `python3`, `cargo`,
 
 ```sh
 git submodule update --init --recursive
-./build_macos.sh /private/path/dkc2.sfc
-open build/macos/DKC2Recomp.app
+python3 scripts/generate_snesrecomp.py --rom /private/path/dkc2.sfc
+cmake -S . -B build-release -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DDKC2_BUILD_SNESRECOMP=ON
+cmake --build build-release --target dkc2_snesrecomp_sdl
+./build-release/DKC2Recomp /private/path/dkc2.sfc
 ```
 
-`build_macos.sh` generates ignored private sources when necessary, creates the
-native `DKC2Recomp.app`, bundles the linked SDL3 dylib, fixes its install name,
-ad-hoc signs and verifies the bundle, and registers it with LaunchServices. The
-Mac host stores mutable files under
-`~/Library/Application Support/Flat2VR/DKC2Recomp`; nothing private is copied
-into the app. Set `DKC2_MACOS_DEPLOYMENT_TARGET` to override the default 14.0
-deployment floor. If the installed SDL3 dylib requires a newer system, the
-script raises the effective target to that dependency's declared minimum and
-reports it rather than producing a bundle with conflicting version claims.
-Ad-hoc signing is suitable for local testing only and is not notarization.
+The generated sources are required: without them CMake stops with "No
+private generated sources found". The ROM must be the USA v1.0 dump the
+generator checks by SHA-256; other revisions are refused. The host needs a
+display (`DISPLAY` or Wayland); started over SSH without one, SDL reports
+"No available video device".
+
+On a Steam Deck, build inside a distrobox container (SteamOS keeps its root
+read-only), run the binary from desktop mode once, then add it to Steam as a
+non-Steam game to play from game mode; set `DKC2_HD_PACK` in its launch
+options to use an HD pack.
 
 ## macOS build
 
